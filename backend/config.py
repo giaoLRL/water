@@ -1,0 +1,96 @@
+"""全局配置：环境变量覆盖，适配分布式智慧灯杆监控系统。"""
+import os
+from pathlib import Path
+
+
+def _env(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    return _env(key, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+# ---------- 数据库 ----------
+DB_HOST = _env("IOT_DB_HOST", "127.0.0.1")
+DB_PORT = _env_int("IOT_DB_PORT", 3306)
+DB_USER = _env("IOT_DB_USER", "iot_user")
+DB_PASSWORD = _env("IOT_DB_PASSWORD", "iot_pass_2026")
+DB_NAME = _env("IOT_DB_NAME", "iot_system")
+DB_POOL_SIZE = _env_int("IOT_DB_POOL_SIZE", 5)
+
+# ---------- 采集 ----------
+SAMPLE_INTERVAL = _env_float("LAMP_SAMPLE_INTERVAL", 2.0)
+
+# ---------- 灯杆列表 ----------
+# 每个灯杆作为独立监控单元；rtsp_url 为空时使用模拟视频画面。
+LAMP_POSTS = [
+    {
+        "id": "01",
+        "name": "灯杆01",
+        "location": "东门主干道",
+        "rtsp_url": "rtsp://admin:123456@192.168.31.201/stream0",
+        "sensor_url": "http://192.168.31.100/api/data",  # ESP32 + DHT11 真实温湿度
+    },
+    {
+        "id": "02",
+        "name": "灯杆02",
+        "location": "南门广场",
+        "rtsp_url": "",
+    },
+    {
+        "id": "03",
+        "name": "灯杆03",
+        "location": "西侧停车场",
+        "rtsp_url": "",
+    },
+]
+
+# ---------- 人员智能识别接口（YOLO） ----------
+INFER_URL = _env("LAMP_INFER_URL", "http://127.0.0.1:5000/infer")
+INFER_TIMEOUT = _env_float("LAMP_INFER_TIMEOUT", 60.0)
+PERSON_DETECT_INTERVAL = _env_float("LAMP_PERSON_DETECT_INTERVAL", 5.0)
+
+# ---------- 告警阈值默认值 ----------
+DEFAULT_THRESHOLDS = {
+    "temp_max": 38.0,
+    "temp_min": -5.0,
+    "humidity_max": 85.0,
+    "humidity_min": 20.0,
+    "luminance_max": 80000.0,
+    "luminance_min": 0.0,
+    # 人员数量告警规则：识别到人数 >= person_alert_min 时告警
+    "person_alert_min": 3.0,
+    "person_alert_enabled": 1.0,
+}
+
+# ---------- 路径 ----------
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = Path(_env("IOT_FRONTEND_DIR", str(BASE_DIR.parent / "frontend")))
+
+
+def db_dsn() -> dict:
+    """返回 PyMySQL 连接参数字典。"""
+    return {
+        "host": DB_HOST,
+        "port": DB_PORT,
+        "user": DB_USER,
+        "password": DB_PASSWORD,
+        "database": DB_NAME,
+        "charset": "utf8mb4",
+        "autocommit": True,
+    }

@@ -1,0 +1,515 @@
+/* 灯杆详情视图：实时监控 + 历史数据 + 告警 + 人员监测 + 操作日志。 */
+window.ViewLampDetail = {
+  name: "LampDetailView",
+  props: {
+    lampId: { type: String, required: true },
+  },
+  emits: ["back"],
+  data() {
+    return {
+      tab: "monitor",
+      lamp: {},
+      thresholds: {},
+      // 历史
+      histPoints: [],
+      histRangeKey: "1h",
+      histType: "all",
+      stats: {},
+      customStart: "",
+      customEnd: "",
+      // 实时趋势（仪表盘迷你曲线累积缓冲）
+      trend: { temperature: [], humidity: [], luminance: [] },
+      // 告警
+      alarms: [],
+      // 人员监测
+      detections: [],
+      curDetect: null,       // 持续自动识别最新结果
+      ruleEnabled: 1,        // 人数告警规则：是否启用
+      ruleMin: 3,            // 人数告警阈值
+      detailImages: null,
+      detailInfo: null,
+      // 日志
+      logs: [],
+      timer: null,
+    };
+  },
+  computed: {
+    videoUrl() {
+      return API.videoUrl(this.lampId);
+    },
+    detectVideoUrl() {
+      return API.detectVideoUrl(this.lampId);
+    },
+    sensorTag() {
+      if (this.lamp.sensor_source === "esp32") {
+        return this.lamp.sensor_online === false ? "传感器离线·模拟回退" : "真实温湿度(ESP32)";
+      }
+      return "模拟数据";
+    },
+    luxTag() {
+      if (this.lamp.sensor_source === "esp32") {
+        return this.lamp.light_online === false ? "光照离线·模拟回退" : "真实光照(GY-302)";
+      }
+      return "模拟数据";
+    },
+  },
+  mounted() {
+    this.loadAll();
+    this.timer = setInterval(() => {
+      this.fetchLamp();
+      this.fetchDetectCurrent();
+    }, 2000);
+  },
+  beforeUnmount() {
+    if (this.timer) clearInterval(this.timer);
+  },
+  methods: {
+    fmt(s) {
+      const d = new Date(s);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    },
+    rangeEnd() { return this.fmt(new Date()); },
+    rangeStart(key) {
+      const hours = { "1h": 1, "6h": 6, "24h": 24 }[key] || 1;
+      return this.fmt(new Date(Date.now() - hours * 3600 * 1000));
+    },
+    async loadAll() {
+      this.fetchLamp();
+      this.fetchHistory("1h");
+      this.fetchStats("1h");
+      this.fetchAlarms();
+      this.fetchDetections();
+      this.fetchLogs();
+      this.fetchDetectCurrent();
+      try {
+        this.thresholds = (await API.alarmConfigGet()).thresholds || {};
+        this.applyRuleFromThresholds();
+      } catch (e) { /* silent */ }
+    },
+    async fetchLamp() {
+      try {
+        this.lamp = await API.lamp(this.lampId);
+        const t = this.trend;
+        const push = (arr, v) => { arr.push(v); if (arr.length > 60) arr.shift(); };
+        push(t.temperature, this.lamp.temperature || 0);
+        push(t.humidity, this.lamp.humidity || 0);
+        push(t.luminance, this.lamp.luminance || 0);
+        this.renderSparks();
+        this.renderGauges();
+      } catch (e) { /* silent */ }
+    },
+    async fetchHistory(key, start, end) {
+      this.histRangeKey = key || this.histRangeKey;
+      let s, e;
+      if (key === "custom" && start && end) {
+        s = String(start).replace("T", " ");
+        e = String(end).replace("T", " ");
+      } else {
+        s = this.rangeStart(this.histRangeKey);
+        e = this.rangeEnd();
+      }
+      try {
+        const d = await API.history(this.lampId, s, e);
+        this.histPoints = d.points || [];
+        if (!this.trend.temperature.length && this.histPoints.length) {
+          this.trend.temperature = this.histPoints.map((p) => p.temperature).slice(-60);
+          this.trend.humidity = this.histPoints.map((p) => p.humidity).slice(-60);
+          this.trend.luminance = this.histPoints.map((p) => p.luminance).slice(-60);
+        }
+        this.renderChart();
+      } catch (err) { /* silent */ }
+    },
+    async fetchStats(key) {
+      const s = this.rangeStart(key || this.histRangeKey);
+      const e = this.rangeEnd();
+      try {
+        this.stats = await API.stats(this.lampId, s, e);
+      } catch (err) { /* silent */ }
+    },
+    async fetchAlarms() {
+      try {
+        this.alarms = (await API.alarms(this.lampId)).alarms || [];
+        this.renderAlarmChart();
+      } catch (e) { /* silent */ }
+    },
+    async fetchDetections() {
+      try {
+        this.detections = (await API.detections(this.lampId)).detections || [];
+        this.renderDetectionChart();
+      } catch (e) { /* silent */ }
+    },
+    async fetchLogs() {
+      try {
+        this.logs = (await API.logs(this.lampId)).logs || [];
+      } catch (e) { /* silent */ }
+    },
+    setTab(t) {
+      this.tab = t;
+      if (t === "alarm") this.fetchAlarms();
+      if (t === "detections") this.fetchDetections();
+      if (t === "logs") this.fetchLogs();
+      if (t === "history") this.fetchHistory(this.histRangeKey);
+      setTimeout(() => window.Charts.resizeAll(), 120);
+    },
+    async doControl(action) {
+      try {
+        const d = await API.control(this.lampId, action);
+        this.lamp = d;
+      } catch (e) {
+        alert(e.message);
+      }
+    },
+    async fetchDetectCurrent() {
+      try {
+        this.curDetect = await API.detectCurrent(this.lampId);
+      } catch (e) { /* silent */ }
+    },
+    applyRuleFromThresholds() {
+      const min = parseFloat(this.thresholds.person_alert_min);
+      if (!isNaN(min)) this.ruleMin = min;
+      this.ruleEnabled = this.thresholds.person_alert_enabled ? 1 : 0;
+    },
+    async savePersonRule() {
+      const min = parseFloat(this.ruleMin);
+      if (isNaN(min) || min < 1) { alert("人数阈值必须是 >= 1 的数字"); return; }
+      try {
+        const cfg = { person_alert_enabled: this.ruleEnabled ? 1 : 0, person_alert_min: min };
+        this.thresholds = (await API.alarmConfigSet(cfg)).thresholds || {};
+        alert("人数告警规则已保存");
+      } catch (e) {
+        alert(e.message);
+      }
+    },
+    async viewDetection(id) {
+      try {
+        const d = await API.detection(id);
+        this.detailImages = { original: d.original_image, processed: d.processed_image };
+        this.detailInfo = d;
+      } catch (e) { /* silent */ }
+    },
+    closeDetail() {
+      this.detailImages = null;
+      this.detailInfo = null;
+    },
+    pickHistType(t) { this.histType = t; this.renderChart(); },
+    renderChart() {
+      const el = document.getElementById("detail-hist-chart");
+      if (!el || !window.echarts) return;
+      const pts = this.histPoints || [];
+      const times = pts.map((p) => p.ts);
+
+      if (this.histType === "all") {
+        window.Charts.init("detail-hist-chart", {
+          tooltip: { trigger: "axis", backgroundColor: "#1a222d", borderColor: "#2a3442", textStyle: { color: "#d7e0ea" } },
+          legend: { top: 0, textStyle: { color: "#7d8b99" } },
+          grid: { left: 56, right: 58, top: 36, bottom: 66 },
+          xAxis: { type: "category", data: times, boundaryGap: false, ...window.Charts.axisStyle },
+          yAxis: [
+            { type: "value", name: "温度℃ / 湿度%", ...window.Charts.axisStyle, nameTextStyle: { color: "#7d8b99" } },
+            { type: "value", name: "光照 lx", nameTextStyle: { color: "#7d8b99" }, axisLabel: { color: "#7d8b99" }, splitLine: { show: false }, axisLine: { lineStyle: { color: "#2a3442" } } },
+          ],
+          dataZoom: [
+            { type: "inside" },
+            { type: "slider", height: 16, bottom: 8, borderColor: "#262f3b", backgroundColor: "#151b24", fillerColor: "rgba(45,212,191,0.14)", handleStyle: { color: "#2dd4bf" }, textStyle: { color: "#7d8b99" } },
+          ],
+          series: [
+            window.Charts.lineSeries("环境温度", pts.map((p) => p.temperature), "#2dd4bf", 0),
+            window.Charts.lineSeries("空气湿度", pts.map((p) => p.humidity), "#38bdf8", 0),
+            window.Charts.lineSeries("光照强度", pts.map((p) => p.luminance), "#fbbf24", 1),
+          ],
+        });
+        return;
+      }
+      let data, name, color, unit;
+      if (this.histType === "humidity") {
+        data = pts.map((p) => p.humidity); name = "空气湿度"; color = "#38bdf8"; unit = "%";
+      } else if (this.histType === "luminance") {
+        data = pts.map((p) => p.luminance); name = "光照强度"; color = "#fbbf24"; unit = "lx";
+      } else {
+        data = pts.map((p) => p.temperature); name = "环境温度"; color = "#2dd4bf"; unit = "℃";
+      }
+      window.Charts.init("detail-hist-chart", {
+        ...window.Charts.baseOption(times, unit),
+        series: [window.Charts.lineSeries(name, data, color)],
+      });
+    },
+    renderSparks() {
+      const defs = [
+        ["spark-temp", "temperature", "#2dd4bf"],
+        ["spark-hum", "humidity", "#38bdf8"],
+        ["spark-lux", "luminance", "#fbbf24"],
+      ];
+      defs.forEach(([id, key, color]) => {
+        const data = this.trend[key];
+        if (!Array.isArray(data) || data.length < 2) return;
+        window.Charts.init(id, {
+          grid: { left: 2, right: 2, top: 5, bottom: 2 },
+          xAxis: { type: "category", show: false, data },
+          yAxis: { type: "value", show: false, min: "dataMin", max: "dataMax" },
+          series: [{
+            type: "line", data, showSymbol: false, smooth: true,
+            lineStyle: { width: 1.5, color },
+            areaStyle: { color, opacity: 0.12 },
+          }],
+        });
+      });
+    },
+    renderGauges() {
+      const defs = [
+        ["gauge-temp", this.lamp.temperature || 0, -10, 60, "℃", "#2dd4bf"],
+        ["gauge-hum", this.lamp.humidity || 0, 0, 100, "%", "#38bdf8"],
+        ["gauge-lux", Math.min(this.lamp.luminance || 0, 100000), 0, 100000, "lx", "#fbbf24"],
+      ];
+      defs.forEach(([id, v, min, max, unit, color]) => {
+        if (!document.getElementById(id)) return;
+        window.Charts.init(id, window.Charts.gaugeOption(v, min, max, unit, color), false);
+      });
+    },
+    renderDetectionChart() {
+      const els = document.getElementById("detect-stat-chart");
+      if (!els) return;
+      const rows = (this.detections || []).slice(0, 20).reverse();
+      window.Charts.init("detect-stat-chart", {
+        ...window.Charts.barOption(rows.map((d) => (d.ts || "").slice(11, 19)), "人数"),
+        series: [window.Charts.barSeries("检出人数", rows.map((d) => d.person_count || 0), "#2dd4bf")],
+      });
+    },
+    renderAlarmChart() {
+      const els = document.getElementById("alarm-stat-chart");
+      if (!els) return;
+      const agg = {};
+      (this.alarms || []).forEach((a) => {
+        const name = this.typeName(a.type) || a.type;
+        agg[name] = (agg[name] || 0) + 1;
+      });
+      const names = Object.keys(agg);
+      window.Charts.init("alarm-stat-chart", {
+        ...window.Charts.barOption(names, "次数"),
+        series: [window.Charts.barSeries("告警次数", names.map((n) => agg[n]), "#f87171")],
+      });
+    },
+    typeName(t) {
+      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量" }[t] || t;
+    },
+  },
+  template: `
+    <div class="view-page">
+      <div class="detail-head">
+        <button class="btn-ghost" @click="$emit('back')">← 返回列表</button>
+        <h2>{{ lamp.name || '灯杆' + lampId }}</h2>
+        <span class="desc">{{ lamp.location }}</span>
+        <span class="lamp-dot" :class="lamp.light_state === 'on' ? 'on' : 'off'"></span>
+        <div class="detail-controls">
+          <button class="btn" :class="{on: lamp.light_state === 'on'}" @click="doControl('on')">开灯</button>
+          <button class="btn" :class="{off: lamp.light_state === 'off'}" @click="doControl('off')">关灯</button>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <span class="tab" :class="{ active: tab === 'monitor' }" @click="setTab('monitor')">实时监控</span>
+        <span class="tab" :class="{ active: tab === 'history' }" @click="setTab('history')">历史数据</span>
+        <span class="tab" :class="{ active: tab === 'alarm' }" @click="setTab('alarm')">告警记录</span>
+        <span class="tab" :class="{ active: tab === 'detections' }" @click="setTab('detections')">人员监测</span>
+        <span class="tab" :class="{ active: tab === 'logs' }" @click="setTab('logs')">操作日志</span>
+      </div>
+
+      <!-- 实时监控 -->
+      <div v-show="tab === 'monitor'">
+        <div class="grid-3" style="margin-bottom:14px;">
+          <div class="metric gauge-box">
+            <div class="label">环境温度 <span class="desc">{{ sensorTag }} · 阈值 {{ thresholds.temp_min ?? '--' }}~{{ thresholds.temp_max ?? '--' }}℃</span></div>
+            <div class="gauge" id="gauge-temp"></div>
+            <div class="spark" id="spark-temp"></div>
+          </div>
+          <div class="metric gauge-box">
+            <div class="label">空气湿度 <span class="desc">阈值 {{ thresholds.humidity_min ?? '--' }} ~ {{ thresholds.humidity_max ?? '--' }} %</span></div>
+            <div class="gauge" id="gauge-hum"></div>
+            <div class="spark" id="spark-hum"></div>
+          </div>
+          <div class="metric gauge-box">
+            <div class="label">光照强度 <span class="desc">{{ luxTag }}</span></div>
+            <div class="gauge" id="gauge-lux"></div>
+            <div class="spark" id="spark-lux"></div>
+          </div>
+        </div>
+        <div class="grid-2 detail-cols">
+          <div class="section" style="margin-bottom:0;">
+            <h3>视频监控 <span class="desc">{{ lamp.video_source === 'rtsp' ? '实时视频' : '模拟画面' }}</span></h3>
+            <img class="video-frame" :src="videoUrl" alt="视频流">
+          </div>
+          <div class="section" style="margin-bottom:0;">
+            <h3>人员智能监测 <span class="desc">持续自动识别</span></h3>
+            <div class="detect-summary detect-live">
+              <span class="detect-person-num">检出 <b :class="curDetect && curDetect.alarm_active ? 'alarm' : ''">{{ curDetect && curDetect.person_count != null ? curDetect.person_count : '--' }}</b> 人</span>
+              <span>置信度 {{ curDetect && curDetect.max_confidence != null ? Number(curDetect.max_confidence).toFixed(2) : '--' }}</span>
+              <span class="badge" :class="curDetect && curDetect.alarm_active ? 'danger' : 'ok'">{{ curDetect && curDetect.alarm_active ? '人流量告警' : '正常' }}</span>
+              <span class="desc">{{ curDetect && curDetect.ts ? curDetect.ts : '识别启动中…' }}</span>
+            </div>
+            <img class="video-frame" :src="detectVideoUrl" alt="标注视频流">
+            <div v-if="!curDetect || !curDetect.enabled" class="note">人数告警规则未启用或识别服务尚未返回，可在“人员监测”页配置人数阈值。</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 历史数据 -->
+      <div v-show="tab === 'history'">
+        <div class="section">
+          <h3>历史曲线</h3>
+          <div class="tabs">
+            <span class="tab" :class="{ active: histRangeKey === '1h' }" @click="fetchHistory('1h')">近1小时</span>
+            <span class="tab" :class="{ active: histRangeKey === '6h' }" @click="fetchHistory('6h')">近6小时</span>
+            <span class="tab" :class="{ active: histRangeKey === '24h' }" @click="fetchHistory('24h')">近24小时</span>
+            <span class="tab" :class="{ active: histRangeKey === 'custom' }" @click="fetchHistory('custom')">自定义</span>
+          </div>
+          <div v-if="histRangeKey === 'custom'" class="custom-range">
+            <input type="datetime-local" v-model="customStart">
+            <span>至</span>
+            <input type="datetime-local" v-model="customEnd">
+            <button class="btn-ghost" @click="fetchHistory('custom', customStart, customEnd)">查询</button>
+          </div>
+          <div class="tabs">
+            <span class="tab" :class="{ active: histType === 'all' }" @click="pickHistType('all')">全部</span>
+            <span class="tab" :class="{ active: histType === 'temperature' }" @click="pickHistType('temperature')">温度</span>
+            <span class="tab" :class="{ active: histType === 'humidity' }" @click="pickHistType('humidity')">湿度</span>
+            <span class="tab" :class="{ active: histType === 'luminance' }" @click="pickHistType('luminance')">光照</span>
+          </div>
+          <div class="chart" id="detail-hist-chart"></div>
+        </div>
+        <div class="grid-4" style="margin-bottom:14px;">
+          <div class="metric"><div class="label">平均温度</div><div class="value">{{ stats.avg_temp ?? '--' }}<span class="unit">℃</span></div></div>
+          <div class="metric"><div class="label">最高温度</div><div class="value">{{ stats.max_temp ?? '--' }}<span class="unit">℃</span></div></div>
+          <div class="metric"><div class="label">平均湿度</div><div class="value">{{ stats.avg_humidity ?? '--' }}<span class="unit">%</span></div></div>
+          <div class="metric"><div class="label">最高光照</div><div class="value">{{ stats.max_luminance ?? '--' }}<span class="unit">lx</span></div></div>
+        </div>
+        <div class="section">
+          <div class="table-actions">
+            <h3 style="margin-bottom:0;">数据明细（最近 50 条）</h3>
+            <span class="desc">{{ histPoints.length }} 个采样点</span>
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead><tr><th>时间</th><th>温度 ℃</th><th>湿度 %</th><th>光照 lx</th><th>灯光</th></tr></thead>
+              <tbody>
+                <tr v-for="(p, i) in histPoints.slice(-50).reverse()" :key="i">
+                  <td>{{ p.ts }}</td><td>{{ p.temperature }}</td><td>{{ p.humidity }}</td><td>{{ p.luminance }}</td>
+                  <td>{{ p.light_state === 'on' ? '开' : '关' }}</td>
+                </tr>
+                <tr v-if="!histPoints.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 告警记录 -->
+      <div v-show="tab === 'alarm'">
+        <div class="section">
+          <h3>告警类型分布</h3>
+          <div class="chart" id="alarm-stat-chart"></div>
+        </div>
+        <div class="section">
+          <h3>告警记录</h3>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead><tr><th>时间</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr v-for="(a, i) in alarms" :key="i">
+                  <td>{{ a.ts }}</td>
+                  <td>{{ typeName(a.type) }}</td>
+                  <td>{{ a.value }}</td>
+                  <td>{{ a.threshold }}</td>
+                  <td>{{ a.direction === 'above' ? '超上限' : '低于下限' }}</td>
+                  <td><span class="badge" :class="a.status === 'active' ? 'danger' : 'ok'">{{ a.status === 'active' ? '告警中' : '已恢复' }}</span></td>
+                </tr>
+                <tr v-if="!alarms.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无告警记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 人员监测记录 -->
+      <div v-show="tab === 'detections'">
+        <div class="section">
+          <h3>人数告警规则 <span class="desc">可自定义 · 识别到的人数达到阈值即告警</span></h3>
+          <div class="alarm-rule">
+            <label class="rule-item">
+              <span>启用人数告警</span>
+              <input type="checkbox" v-model="ruleEnabled" :true-value="1" :false-value="0">
+            </label>
+            <label class="rule-item">
+              <span>人数告警阈值（人）</span>
+              <input type="number" v-model.number="ruleMin" min="1" step="1">
+            </label>
+            <button class="btn-primary" @click="savePersonRule">保存规则</button>
+          </div>
+        </div>
+        <div class="section">
+          <h3>人员检出趋势</h3>
+          <div class="chart" id="detect-stat-chart"></div>
+        </div>
+        <div class="section">
+          <h3>人员监测记录</h3>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead><tr><th>时间</th><th>窗口</th><th>人数</th><th>最高置信度</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="(d, i) in detections" :key="i">
+                  <td>{{ d.ts }}</td>
+                  <td>{{ d.lamp_id }}</td>
+                  <td>{{ d.person_count }}</td>
+                  <td>{{ d.max_confidence }}</td>
+                  <td><button class="btn-ghost" @click="viewDetection(d.id)">查看</button></td>
+                </tr>
+                <tr v-if="!detections.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无监测记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 操作日志 -->
+      <div v-show="tab === 'logs'">
+        <div class="section">
+          <h3>设备操作日志</h3>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead><tr><th>时间</th><th>窗口</th><th>指令</th><th>结果</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr v-for="(l, i) in logs" :key="i">
+                  <td>{{ l.ts }}</td>
+                  <td>{{ l.lamp_id }}</td>
+                  <td>{{ l.action === 'on' ? '开灯' : '关灯' }}</td>
+                  <td><span class="badge" :class="l.result === 'success' ? 'ok' : 'fail'">{{ l.result === 'success' ? '成功' : '失败' }}</span></td>
+                  <td>{{ l.detail || '' }}</td>
+                </tr>
+                <tr v-if="!logs.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无操作日志</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 记录图片详情弹层 -->
+      <div class="modal-overlay" v-if="detailImages" @click="closeDetail">
+        <div class="modal" @click.stop>
+          <div class="modal-head">
+            <h3>监测记录详情</h3>
+            <button class="close" @click="closeDetail">×</button>
+          </div>
+          <div v-if="detailInfo" class="detect-summary">
+            <span>窗口 {{ detailInfo.lamp_id }}</span>
+            <span>检测到 <b>{{ detailInfo.person_count }}</b> 人</span>
+            <span>置信度 {{ detailInfo.max_confidence }}</span>
+            <span class="desc">{{ detailInfo.ts }}</span>
+          </div>
+          <div class="detect-imgs">
+            <div class="detect-img-box"><div class="detect-img-label">原始图像</div><img :src="detailImages.original" alt="原始图像"></div>
+            <div class="detect-img-box"><div class="detect-img-label">标注图像</div><img :src="detailImages.processed" alt="标注图像"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+};

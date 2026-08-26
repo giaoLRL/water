@@ -1,0 +1,16 @@
+# 运行时数据（便携数据库、日志）——不要上传
+.runtime/
+
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 依赖目录（如有）
+node_modules/
