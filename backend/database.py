@@ -47,6 +47,30 @@ _TABLE_COLUMNS = {
     "config": {"config_key", "value"},
 }
 
+# 业务表的新增列：存在表结构时温和补列（不删表），避免丢失历史数据
+_EXTRA_COLUMNS = {
+    "alarms": {"image": "LONGTEXT NULL"},
+}
+
+
+def _ensure_extra_columns(conn: pymysql.Connection, table: str) -> None:
+    """为已存在的表温和补充新增列（不删除表，保留历史数据）。"""
+    extra = _EXTRA_COLUMNS.get(table)
+    if not extra:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name AS col FROM information_schema.columns "
+            "WHERE table_schema=%s AND table_name=%s",
+            (config.DB_NAME, table),
+        )
+        existing = {row["col"] for row in cur.fetchall()}
+    for col, ddl in extra.items():
+        if col in existing:
+            continue
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}")
+
 
 def _ensure_table_schema(conn: pymysql.Connection, table: str) -> None:
     """表结构不匹配（如旧水循环表的 control_log/alarms）时删除，由建表语句重建。"""
@@ -90,6 +114,9 @@ def init_database() -> None:
             # 清理结构不匹配的旧表（水循环系统遗留）
             for table in _TABLE_COLUMNS:
                 _ensure_table_schema(conn, table)
+            # 为已存在的表补充新增列（如 alarms.image），避免删表丢历史
+            for table in _EXTRA_COLUMNS:
+                _ensure_extra_columns(conn, table)
 
             # 灯杆传感器数据
             cur.execute(
@@ -107,7 +134,7 @@ def init_database() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 告警记录
+            # 告警记录（image：异常情况截图快照，base64 标注图）
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS alarms (
@@ -121,6 +148,7 @@ def init_database() -> None:
                     message      VARCHAR(255),
                     status       VARCHAR(16) NOT NULL DEFAULT 'active',
                     recovered_at DATETIME NULL,
+                    image        LONGTEXT NULL,
                     PRIMARY KEY (id),
                     KEY idx_alarm_lamp_ts (lamp_id, ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -253,14 +281,15 @@ def insert_alarm(
     threshold: float,
     direction: str,
     message: str,
+    image: str | None = None,
 ) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')",
-                (lamp_id, ts, type_, value, threshold, direction, message),
+                "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, status, image) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s)",
+                (lamp_id, ts, type_, value, threshold, direction, message, image),
             )
     finally:
         conn.close()
@@ -282,8 +311,10 @@ def recover_alarm(lamp_id: str, type_: str) -> None:
 def query_alarms(lamp_id: str | None, start: str | None, end: str | None,
                  type_: str | None, status: str | None) -> list[dict]:
     conn = get_pool().connection()
+    # 列表不返回体积较大的 image 列，仅标记是否有快照
     sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
-           "threshold, direction, message, status FROM alarms WHERE 1=1")
+           "threshold, direction, message, status, "
+           "(image IS NOT NULL AND image <> '') AS has_image FROM alarms WHERE 1=1")
     params: list = []
     if lamp_id:
         sql += " AND lamp_id = %s"
@@ -305,6 +336,22 @@ def query_alarms(lamp_id: str | None, start: str | None, end: str | None,
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def get_alarm(alarm_id: int) -> dict | None:
+    """返回单条告警记录（含 image 快照图）。"""
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
+                "threshold, direction, message, status, recovered_at, image "
+                "FROM alarms WHERE id=%s",
+                (alarm_id,),
+            )
+            return cur.fetchone()
     finally:
         conn.close()
 

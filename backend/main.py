@@ -11,6 +11,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import config
 import database
+import infer
 from alarm import AlarmEngine
 from api import router
 from device import LampManager
@@ -18,24 +19,39 @@ from monitor import DeviceMonitor
 from state import services
 
 
+def _collect_lamp(lamp) -> None:
+    """单灯杆一次同步采集（在线程池执行）：写历史库 + 异常告警检查。
+
+    涉及网络请求（真实传感器 HTTP）与数据库写入，均为同步阻塞操作，
+    必须在线程池中执行，避免阻塞 uvicorn 异步事件循环（否则所有视频流/接口会周期性卡顿）。
+    """
+    now = datetime.now()
+    sensors = lamp.read_sensors()
+    snap = lamp.snapshot()
+    database.insert_sensor_data(
+        lamp.id,
+        now,
+        snap["temperature"],
+        snap["humidity"],
+        snap["luminance"],
+        snap["light_state"],
+    )
+    # 异常快照：取当前视频帧（仅在触发新告警时写库）
+    frame = lamp.video.get_frame()
+    image = infer.frame_to_dataurl(frame) if frame is not None else None
+    active = services.alarm.check(lamp.id, sensors, image=image)
+    services.set_lamp_alarms(lamp.id, active)
+
+
 async def collect_loop() -> None:
-    """周期采样所有灯杆：写历史库 + 异常告警检查。"""
+    """周期采样所有灯杆：各灯杆并行投入线程池，事件循环不被同步阻塞。"""
     while True:
         try:
-            now = datetime.now()
-            for lamp in services.lamps.all():
-                sensors = lamp.read_sensors()
-                snap = lamp.snapshot()
-                database.insert_sensor_data(
-                    lamp.id,
-                    now,
-                    snap["temperature"],
-                    snap["humidity"],
-                    snap["luminance"],
-                    snap["light_state"],
-                )
-                active = services.alarm.check(lamp.id, sensors)
-                services.set_lamp_alarms(lamp.id, active)
+            lamps = list(services.lamps.all())
+            loop = asyncio.get_running_loop()
+            await asyncio.gather(
+                *(loop.run_in_executor(None, _collect_lamp, lamp) for lamp in lamps)
+            )
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(config.SAMPLE_INTERVAL)

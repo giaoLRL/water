@@ -308,6 +308,15 @@ def alarms(
     return ok({"alarms": rows})
 
 
+@router.get("/alarms/{alarm_id}")
+def alarm_detail(alarm_id: int):
+    """单条告警详情（含异常情况截图快照图）。"""
+    row = database.get_alarm(alarm_id)
+    if row is None:
+        return err(40004, "告警记录不存在")
+    return ok(row)
+
+
 # ---------- 操作日志 ----------
 @router.get("/logs")
 def logs(lamp_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=500)):

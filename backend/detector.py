@@ -63,11 +63,11 @@ class PersonDetector:
                 "alarm_active": False,
             }
 
-        # 人数告警：走统一告警引擎，规则（启用 + 人数阈值）可在前端自定义
+        # 人数告警：走统一告警引擎，规则（启用 + 人数阈值）可在前端自定义；携带 YOLO 标注图作为快照
         alarm = services.alarm
         if alarm is None:
             return
-        active = alarm.check_person(self.lamp.id, person_count)
+        active = alarm.check_person(self.lamp.id, person_count, image=processed)
         with self._lock:
             if self._last_result is not None:
                 self._last_result["alarm_active"] = any(a["type"] == "person" for a in active)

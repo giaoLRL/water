@@ -174,23 +174,32 @@ class HttpTempSensor:
 
     带短 TTL 缓存，避免高频采样时频繁请求 ESP32；HTTP 请求失败返回 (None, False)，
     由 LampDevice 降级为模拟值。
+    失败熔断：连续失败 _TRIP 次后进入冷却期（_COOLDOWN 秒内直接返回失败，不再发请求），
+    避免设备掉线时每个采样周期都被阻塞满超时时间。
     接口约定：GET {url} 返回
     {"status":"ok","temperature":25.3,"humidity":60.2,"light":320.5,"unit":{...}}
     其中 light 在光照传感器（BH1750）读不到时为 null，但温湿度仍正常返回。
     """
 
-    def __init__(self, url: str, timeout: float = 1.5, ttl: float = 3.0):
+    _TRIP = 3            # 连续失败次数达到该值触发熔断
+    _COOLDOWN = 15.0     # 熔断冷却时长（秒）
+
+    def __init__(self, url: str, timeout: float = 0.8, ttl: float = 3.0):
         self.url = url
         self.timeout = timeout
         self.ttl = ttl
         self._lock = threading.Lock()
         self._cache: dict | None = None   # {"data": {...}, "ts": float}
+        self._fail_count = 0
+        self._cooldown_until = 0.0
 
     def read(self) -> tuple[dict | None, bool]:
         now = time.time()
         with self._lock:
             if self._cache and now - self._cache["ts"] < self.ttl:
                 return self._cache["data"], True
+            if now < self._cooldown_until:
+                return None, False   # 熔断冷却期内快速失败，不发起网络请求
         try:
             with urllib.request.urlopen(self.url, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -203,8 +212,14 @@ class HttpTempSensor:
             }
             with self._lock:
                 self._cache = {"data": data, "ts": time.time()}
+                self._fail_count = 0
             return data, True
         except (urllib.error.URLError, OSError, ValueError, KeyError, json.JSONDecodeError):
+            with self._lock:
+                self._fail_count += 1
+                if self._fail_count >= self._TRIP:
+                    self._cooldown_until = time.time() + self._COOLDOWN
+                    self._fail_count = 0
             return None, False
 
 

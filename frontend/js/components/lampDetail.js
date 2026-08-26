@@ -21,6 +21,7 @@ window.ViewLampDetail = {
       trend: { temperature: [], humidity: [], luminance: [] },
       // 告警
       alarms: [],
+      alarmDetail: null,     // 单条告警详情（含异常快照图）
       // 人员监测
       detections: [],
       curDetect: null,       // 持续自动识别最新结果
@@ -187,6 +188,14 @@ window.ViewLampDetail = {
         this.detailImages = { original: d.original_image, processed: d.processed_image };
         this.detailInfo = d;
       } catch (e) { /* silent */ }
+    },
+    async viewAlarm(id) {
+      try {
+        this.alarmDetail = await API.alarm(id);
+      } catch (e) { /* silent */ }
+    },
+    closeAlarm() {
+      this.alarmDetail = null;
     },
     closeDetail() {
       this.detailImages = null;
@@ -412,7 +421,7 @@ window.ViewLampDetail = {
           <h3>告警记录</h3>
           <div style="overflow-x:auto;">
             <table>
-              <thead><tr><th>时间</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th></tr></thead>
+              <thead><tr><th>时间</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th><th>快照</th></tr></thead>
               <tbody>
                 <tr v-for="(a, i) in alarms" :key="i">
                   <td>{{ a.ts }}</td>
@@ -421,8 +430,9 @@ window.ViewLampDetail = {
                   <td>{{ a.threshold }}</td>
                   <td>{{ a.direction === 'above' ? '超上限' : '低于下限' }}</td>
                   <td><span class="badge" :class="a.status === 'active' ? 'danger' : 'ok'">{{ a.status === 'active' ? '告警中' : '已恢复' }}</span></td>
+                  <td><button class="btn-ghost" :disabled="!a.has_image" @click="viewAlarm(a.id)">{{ a.has_image ? '查看快照' : '无' }}</button></td>
                 </tr>
-                <tr v-if="!alarms.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无告警记录</td></tr>
+                <tr v-if="!alarms.length"><td colspan="7" style="text-align:center;color:#6b7a90;">暂无告警记录</td></tr>
               </tbody>
             </table>
           </div>
@@ -508,6 +518,28 @@ window.ViewLampDetail = {
             <div class="detect-img-box"><div class="detect-img-label">原始图像</div><img :src="detailImages.original" alt="原始图像"></div>
             <div class="detect-img-box"><div class="detect-img-label">标注图像</div><img :src="detailImages.processed" alt="标注图像"></div>
           </div>
+        </div>
+      </div>
+
+      <!-- 告警快照弹层 -->
+      <div class="modal-overlay" v-if="alarmDetail" @click="closeAlarm">
+        <div class="modal" @click.stop>
+          <div class="modal-head">
+            <h3>异常快照 · {{ typeName(alarmDetail.type) }}</h3>
+            <button class="close" @click="closeAlarm">×</button>
+          </div>
+          <div v-if="alarmDetail" class="detect-summary">
+            <span>窗口 {{ alarmDetail.lamp_id }}</span>
+            <span>数值 <b>{{ alarmDetail.value }}</b>（阈值 {{ alarmDetail.threshold }}）</span>
+            <span>{{ alarmDetail.direction === 'above' ? '超上限' : '低于下限' }}</span>
+            <span class="badge" :class="alarmDetail.status === 'active' ? 'danger' : 'ok'">{{ alarmDetail.status === 'active' ? '告警中' : '已恢复' }}</span>
+            <span class="desc">{{ alarmDetail.ts }}</span>
+          </div>
+          <div v-if="alarmDetail && alarmDetail.image" class="detect-img-box">
+            <div class="detect-img-label">异常截图（标记）</div>
+            <img :src="alarmDetail.image" alt="异常快照">
+          </div>
+          <div v-else class="note">该告警无截图快照。</div>
         </div>
       </div>
     </div>

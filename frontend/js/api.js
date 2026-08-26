@@ -32,6 +32,7 @@ window.API = (() => {
     detections: (lampId) => req("GET", "/api/detections" + (lampId ? `?lamp_id=${lampId}` : "")),
     detection: (id) => req("GET", `/api/detections/${id}`),
     alarms: (lampId) => req("GET", "/api/alarms" + (lampId ? `?lamp_id=${lampId}` : "")),
+    alarm: (id) => req("GET", `/api/alarms/${id}`),
     alarmConfigGet: () => req("GET", "/api/alarm/config"),
     alarmConfigSet: (cfg) => req("POST", "/api/alarm/config", cfg),
     logs: (lampId) => req("GET", "/api/logs" + (lampId ? `?lamp_id=${lampId}` : "")),
