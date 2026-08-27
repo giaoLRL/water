@@ -372,6 +372,23 @@ def get_alarm(alarm_id: int) -> dict | None:
         conn.close()
 
 
+def query_alarm_stats(lamp_id: str | None = None) -> list[dict]:
+    """按类型统计告警数量（全库或指定灯杆），供分布图使用。"""
+    conn = get_pool().connection()
+    sql = "SELECT type, COUNT(*) AS count FROM alarms"
+    params: list = []
+    if lamp_id:
+        sql += " WHERE lamp_id = %s"
+        params.append(lamp_id)
+    sql += " GROUP BY type ORDER BY count DESC"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
 # ---------- 人员监测记录 ----------
 def insert_detection(
     lamp_id: str,

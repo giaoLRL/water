@@ -3,6 +3,7 @@ window.ViewLampDetail = {
   name: "LampDetailView",
   props: {
     lampId: { type: String, required: true },
+    initialTab: { type: String, default: "monitor" },
   },
   emits: ["back"],
   data() {
@@ -76,6 +77,7 @@ window.ViewLampDetail = {
     },
   },
   mounted() {
+    this.tab = this.initialTab || "monitor";
     this.loadAll();
     this.timer = setInterval(() => {
       this.fetchLamp();

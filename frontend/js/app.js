@@ -13,11 +13,13 @@ const app = createApp({
     lampList: window.ViewLampList,
     lampDetail: window.ViewLampDetail,
     sysConfig: window.ViewSysConfig,
+    alarmCenter: window.ViewAlarmCenter,
   },
   setup() {
     const state = reactive({
       view: "list",
       currentLampId: "",
+      detailTab: "monitor",   // 从告警中心跳转时指定详情页 tab
       lamps: [],
       devices: [],
       activeAlarmCount: 0,
@@ -42,11 +44,23 @@ const app = createApp({
 
     function openDetail(id) {
       state.currentLampId = id;
+      state.detailTab = "monitor";
       state.view = "detail";
       window.scrollTo(0, 0);
     }
     function openConfig() {
       state.view = "config";
+      window.scrollTo(0, 0);
+    }
+    function openAlarmCenter() {
+      state.view = "alarmCenter";
+      window.scrollTo(0, 0);
+    }
+    function gotoLampAlarm(id) {
+      // 全站告警中心"前往灯杆"：进入详情页并停到告警记录 tab
+      state.currentLampId = id;
+      state.detailTab = "alarm";
+      state.view = "detail";
       window.scrollTo(0, 0);
     }
     function backToList() {
@@ -61,7 +75,7 @@ const app = createApp({
     setInterval(pollLamps, 2000);
     setInterval(pollSystem, 5000);
 
-    return { state, ICONS, openDetail, openConfig, backToList };
+    return { state, ICONS, openDetail, openConfig, openAlarmCenter, gotoLampAlarm, backToList };
   },
   template: `
   <div class="app-root">
@@ -76,7 +90,7 @@ const app = createApp({
       <div class="status-chips">
         <span class="chip clickable" @click="openConfig"><span v-html="ICONS.gear" style="vertical-align:-2px;"></span> 系统配置</span>
         <span class="chip"><span class="dot green"></span>在线灯杆 {{ state.lamps.length }}</span>
-        <span class="chip bell"><span v-html="ICONS.bell"></span><span class="badge" v-if="state.activeAlarmCount">{{ state.activeAlarmCount }}</span></span>
+        <span class="chip bell clickable" title="查看全站告警" @click="openAlarmCenter"><span v-html="ICONS.bell"></span><span class="badge" v-if="state.activeAlarmCount">{{ state.activeAlarmCount }}</span></span>
         <span class="chip">活跃告警 {{ state.activeAlarmCount }}</span>
         <span class="chip">{{ state.serverTime || "--" }}</span>
       </div>
@@ -84,8 +98,9 @@ const app = createApp({
 
     <main class="main">
       <lampList v-if="state.view === 'list'" :lamps="state.lamps" :devices="state.devices" @open="openDetail"></lampList>
-      <lampDetail v-else-if="state.view === 'detail'" :lamp-id="state.currentLampId" @back="backToList"></lampDetail>
-      <sysConfig v-else @back="backToList"></sysConfig>
+      <lampDetail v-else-if="state.view === 'detail'" :lamp-id="state.currentLampId" :initial-tab="state.detailTab" @back="backToList"></lampDetail>
+      <sysConfig v-else-if="state.view === 'config'" @back="backToList"></sysConfig>
+      <alarmCenter v-else @back="backToList" @goto="gotoLampAlarm"></alarmCenter>
     </main>
   </div>
   `,

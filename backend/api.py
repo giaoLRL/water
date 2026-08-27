@@ -322,6 +322,13 @@ def alarms(
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
+@router.get("/alarm/stats")
+def alarm_stats(lamp_id: str | None = Query(default=None)):
+    """按类型统计告警数量（全库或指定灯杆），供告警分布图使用。"""
+    rows = database.query_alarm_stats(lamp_id)
+    return ok({"stats": rows})
+
+
 @router.get("/alarms/{alarm_id}")
 def alarm_detail(alarm_id: int):
     """单条告警详情（含异常情况截图快照图）。"""
