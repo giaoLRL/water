@@ -1,7 +1,7 @@
 """灯杆人员持续自动识别：每个灯杆一个后台线程，周期截图 -> YOLO 识别 ->
 更新标注帧（供标注视频流播放）-> 按人数规则触发 / 恢复告警。
 
-- 识别频率由 config.PERSON_DETECT_INTERVAL 控制（默认 5 秒/灯杆）；
+- 识别频率可在"系统配置"页调整（store.person_detect_interval，默认 5 秒/灯杆）；
 - 识别到人时写入人员监测记录（含原始图与标注图），无人则不落库以免刷爆数据库；
 - 标注帧通过 /detect_video 接口实时播放，人数与告警状态通过 /detect/current 查询。
 """
@@ -9,18 +9,17 @@ import threading
 import time
 from datetime import datetime
 
-import config
 import database
 import infer
+import store
 from state import services
 
 
 class PersonDetector:
     """单灯杆持续人员识别器。"""
 
-    def __init__(self, lamp, interval: float | None = None):
+    def __init__(self, lamp):
         self.lamp = lamp
-        self.interval = interval if interval is not None else config.PERSON_DETECT_INTERVAL
         self._lock = threading.Lock()
         self._labeled_frame = None   # 最近一次标注帧（np.ndarray），用于标注视频流
         self._last_result = None     # 最近一次识别结果摘要
@@ -28,13 +27,18 @@ class PersonDetector:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def stop(self) -> None:
+        """停止识别线程（供灯杆配置变更重建时调用）。"""
+        self._running = False
+
     def _loop(self) -> None:
         while self._running:
             try:
                 self._run_once()
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(self.interval)
+            # 每轮重读识别间隔，改配置即时生效
+            time.sleep(store.person_detect_interval())
 
     def _run_once(self) -> None:
         frame = self.lamp.video.get_frame()

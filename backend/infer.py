@@ -10,7 +10,7 @@ import urllib.request
 import cv2
 import numpy as np
 
-import config
+import store
 
 
 def frame_to_dataurl(frame) -> str:
@@ -33,13 +33,13 @@ def dataurl_to_frame(dataurl):
 
 
 def call_infer(image_dataurl: str) -> dict:
-    """调用人员智能识别接口，返回原始 JSON。"""
+    """调用人员智能识别接口，返回原始 JSON。地址/超时可在系统配置页调整（每轮读取）。"""
     body = json.dumps({"image": image_dataurl}).encode("utf-8")
     req = urllib.request.Request(
-        config.INFER_URL,
+        store.infer_url(),
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=config.INFER_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=store.infer_timeout()) as resp:
         return json.loads(resp.read().decode("utf-8"))

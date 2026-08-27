@@ -37,6 +37,8 @@ window.ViewLampDetail = {
       logs: [],
       logTotal: 0, logPage: 1, logPageSize: 10,
       logKeyword: "", logStart: "", logEnd: "",
+      // 灯光滑块（请求中禁用，防连点）
+      lightBusy: false,
       // 历史明细（前端分页）
       histPage: 1, histPageSize: 10,
       timer: null,
@@ -239,6 +241,24 @@ window.ViewLampDetail = {
         alert(e.message);
       }
     },
+    async onLightToggle(e) {
+      // 滑块目标态：关→开、开→关；与当前态一致的无效操作直接忽略
+      const target = e.target.checked ? "on" : "off";
+      if (this.lamp.light_state === target) {
+        e.target.checked = this.lamp.light_state === "on";
+        return;
+      }
+      this.lightBusy = true;
+      try {
+        const d = await API.control(this.lampId, target);
+        this.lamp = d;
+      } catch (err) {
+        e.target.checked = this.lamp.light_state === "on";
+        alert(err.message);
+      } finally {
+        this.lightBusy = false;
+      }
+    },
     async fetchDetectCurrent() {
       try {
         this.curDetect = await API.detectCurrent(this.lampId);
@@ -388,8 +408,12 @@ window.ViewLampDetail = {
         <span class="desc">{{ lamp.location }}</span>
         <span class="lamp-dot" :class="lamp.light_state === 'on' ? 'on' : 'off'"></span>
         <div class="detail-controls">
-          <button class="btn" :class="{on: lamp.light_state === 'on'}" @click="doControl('on')">开灯</button>
-          <button class="btn" :class="{off: lamp.light_state === 'off'}" @click="doControl('off')">关灯</button>
+          <!-- 灯光滑块：关→只能开，开→只能关 -->
+          <label class="toggle" :class="{ on: lamp.light_state === 'on' }">
+            <input type="checkbox" :checked="lamp.light_state === 'on'" :disabled="lightBusy" @change="onLightToggle">
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+          <span class="toggle-state">{{ lamp.light_state === 'on' ? '灯光已开' : '灯光已关' }}</span>
         </div>
       </div>
 

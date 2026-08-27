@@ -625,6 +625,50 @@ td { font-variant-numeric: tabular-nums; }
 }
 .pager .btn-ghost { font-size: 12px; padding: 5px 12px; }
 .pager .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ===== 系统配置页 ===== */
+.chip.clickable { cursor: pointer; }
+.chip.clickable:hover { border-color: var(--accent); color: var(--accent); }
+.config-msg {
+  padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-size: 13px;
+  background: var(--ok-soft); color: var(--ok); border: 1px solid var(--ok);
+}
+.config-msg.error { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.cfg-input {
+  padding: 6px 8px; background: var(--bg-deep); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px; width: 100%;
+  box-sizing: border-box;
+}
+.cfg-item { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.cfg-item > span { min-width: 86px; }
+
+/* ===== 接口数据格式说明（配置页可折叠） ===== */
+.spec-toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; padding-bottom: 12px; }
+.spec-toggle:hover h3 { color: var(--accent); }
+.spec-body { border-top: 1px solid var(--border); padding-top: 12px; margin-bottom: 4px; }
+.spec-body h4 { font-size: 13px; color: var(--text-sub); margin: 14px 0 8px; }
+.spec-body pre {
+  background: var(--bg-deep); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  color: var(--text); overflow-x: auto; white-space: pre;
+}
+.spec-body pre:first-of-type { margin-top: 0; }
+
+/* ===== 灯光开关滑块 ===== */
+.toggle { position: relative; display: inline-flex; align-items: center; cursor: pointer; }
+.toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+.toggle-track {
+  width: 46px; height: 24px; border-radius: 12px; background: var(--border);
+  border: 1px solid var(--border); transition: background .18s ease; position: relative;
+}
+.toggle-thumb {
+  position: absolute; top: 1px; left: 1px; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--text-sub); transition: transform .18s ease, background .18s ease;
+}
+.toggle.on .toggle-track { background: var(--accent); border-color: var(--accent); }
+.toggle.on .toggle-thumb { transform: translateX(22px); background: #fff; }
+.toggle input:disabled + .toggle-track { opacity: .5; cursor: not-allowed; }
+.toggle-state { font-size: 13px; color: var(--text-sub); margin-left: 8px; }
 .detect-imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .detect-img-box { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .detect-img-label { font-size: 11px; color: var(--text-dim); padding: 5px 10px; background: var(--bg-deep); border-bottom: 1px solid var(--border); }

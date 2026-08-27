@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 
-import config
+import store
 
 
 def _probe_url(url: str, timeout: float = 1.5) -> bool:
@@ -52,7 +52,7 @@ class DeviceMonitor:
         import database
 
         db_ok = database.ping()
-        infer_ok = _probe_url(config.INFER_URL)
+        infer_ok = _probe_url(store.infer_url())
         with self._lock:
             self._db_online = db_ok
             self._infer_online = infer_ok

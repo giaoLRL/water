@@ -5,12 +5,14 @@ const SVG_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-
 const ICONS = {
   logo: `<svg ${SVG_ATTRS} width="18" height="18"><path d="M8 3v18M8 6h10l-4 3 4 3H8"/><path d="M4 21h18"/></svg>`,
   bell: `<svg ${SVG_ATTRS} width="14" height="14"><path d="M12 3a6 6 0 0 1 6 6c0 4.2 1.5 5.7 2 6H4c.5-.3 2-1.8 2-6a6 6 0 0 1 6-6Z"/><path d="M10 19a2.2 2.2 0 0 0 4 0"/></svg>`,
+  gear: `<svg ${SVG_ATTRS} width="14" height="14"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.09a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.09a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>`,
 };
 
 const app = createApp({
   components: {
     lampList: window.ViewLampList,
     lampDetail: window.ViewLampDetail,
+    sysConfig: window.ViewSysConfig,
   },
   setup() {
     const state = reactive({
@@ -43,10 +45,15 @@ const app = createApp({
       state.view = "detail";
       window.scrollTo(0, 0);
     }
+    function openConfig() {
+      state.view = "config";
+      window.scrollTo(0, 0);
+    }
     function backToList() {
       state.view = "list";
       state.currentLampId = "";
       pollLamps();
+      pollSystem();
     }
 
     pollLamps();
@@ -54,7 +61,7 @@ const app = createApp({
     setInterval(pollLamps, 2000);
     setInterval(pollSystem, 5000);
 
-    return { state, ICONS, openDetail, backToList };
+    return { state, ICONS, openDetail, openConfig, backToList };
   },
   template: `
   <div class="app-root">
@@ -67,6 +74,7 @@ const app = createApp({
         </div>
       </div>
       <div class="status-chips">
+        <span class="chip clickable" @click="openConfig"><span v-html="ICONS.gear" style="vertical-align:-2px;"></span> 系统配置</span>
         <span class="chip"><span class="dot green"></span>在线灯杆 {{ state.lamps.length }}</span>
         <span class="chip bell"><span v-html="ICONS.bell"></span><span class="badge" v-if="state.activeAlarmCount">{{ state.activeAlarmCount }}</span></span>
         <span class="chip">活跃告警 {{ state.activeAlarmCount }}</span>
@@ -76,7 +84,8 @@ const app = createApp({
 
     <main class="main">
       <lampList v-if="state.view === 'list'" :lamps="state.lamps" :devices="state.devices" @open="openDetail"></lampList>
-      <lampDetail v-else :lamp-id="state.currentLampId" @back="backToList"></lampDetail>
+      <lampDetail v-else-if="state.view === 'detail'" :lamp-id="state.currentLampId" @back="backToList"></lampDetail>
+      <sysConfig v-else @back="backToList"></sysConfig>
     </main>
   </div>
   `,

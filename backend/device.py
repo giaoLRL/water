@@ -151,6 +151,10 @@ class VideoStream:
         with self._lock:
             return None if self._frame is None else self._frame.copy()
 
+    def stop(self) -> None:
+        """停止视频线程（供灯杆配置变更重建时调用）。"""
+        self._running = False
+
 
 def _resize(frame: np.ndarray) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -164,21 +168,25 @@ class HttpTempSensor:
     """从 ESP32 + DHT11 + GY-302 的 HTTP 接口读取温度/湿度/光照。
 
     带短 TTL 缓存，避免高频采样时频繁请求 ESP32；HTTP 请求失败返回 (None, False)，
-    由 LampDevice 降级为模拟值。
+    由 LampDevice 降级为 0 值。
     失败熔断：连续失败 _TRIP 次后进入冷却期（_COOLDOWN 秒内直接返回失败，不再发请求），
     避免设备掉线时每个采样周期都被阻塞满超时时间。
-    接口约定：GET {url} 返回
+    字段名可通过 fields 映射（系统配置页"传感器格式"）适配不同品牌的返回格式。
+    接口约定（ESP32）：GET {url} 返回
     {"status":"ok","temperature":25.3,"humidity":60.2,"light":320.5,"unit":{...}}
-    其中 light 在光照传感器（BH1750）读不到时为 null，但温湿度仍正常返回。
+    其中 light 在光照传感器（BH1750）读不到时为 null，但温湿度仍正常返回（status: partial）。
     """
 
     _TRIP = 3            # 连续失败次数达到该值触发熔断
     _COOLDOWN = 15.0     # 熔断冷却时长（秒）
 
-    def __init__(self, url: str, timeout: float = 0.8, ttl: float = 3.0):
+    def __init__(self, url: str, timeout: float = 0.8, ttl: float = 3.0,
+                 fields: dict | None = None):
         self.url = url
         self.timeout = timeout
         self.ttl = ttl
+        self.fields = fields or {"status": "status", "temperature": "temperature",
+                                 "humidity": "humidity", "light": "light"}
         self._lock = threading.Lock()
         self._cache: dict | None = None   # {"data": {...}, "ts": float}
         self._fail_count = 0
@@ -194,12 +202,12 @@ class HttpTempSensor:
         try:
             with urllib.request.urlopen(self.url, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-            if payload.get("status") not in ("ok", "partial"):
-                raise ValueError(f"sensor status={payload.get('status')}")
+            if payload.get(self.fields["status"]) not in ("ok", "partial"):
+                raise ValueError(f"sensor status={payload.get(self.fields['status'])}")
             data = {
-                "temperature": payload.get("temperature"),
-                "humidity": payload.get("humidity"),
-                "light": payload.get("light"),
+                "temperature": payload.get(self.fields["temperature"]),
+                "humidity": payload.get(self.fields["humidity"]),
+                "light": payload.get(self.fields["light"]),
             }
             with self._lock:
                 self._cache = {"data": data, "ts": time.time()}
@@ -214,14 +222,65 @@ class HttpTempSensor:
             return None, False
 
 
+class HttpLightControl:
+    """ESP32 + MOS 继电器灯控：通过 HTTP 远程控制真实灯光。
+
+    请求路径与返回字段名可通过"系统配置页 → 灯控接口格式"修改（lamp_ctrl_fields），
+    适配不同设备的灯控接口。接口约定（ESP32）：
+    GET {base}{on|off|state} 返回 {"status":"ok","lamp":true/false}；
+    请求失败返回 None，由 LampDevice 上报控制失败（不在前端假装成功）。
+    """
+
+    def __init__(self, base_url: str, fields: dict | None = None, timeout: float = 1.5):
+        self.base = base_url.rstrip("/")
+        self.timeout = timeout
+        f = fields or {}
+        self.paths = {
+            "on": f.get("on", "/api/lamp/on"),
+            "off": f.get("off", "/api/lamp/off"),
+            "state": f.get("state", "/api/lamp/state"),
+        }
+        self.field = f.get("field", "lamp")
+        self.status_field = f.get("status", "status")
+
+    def _call(self, path: str) -> bool | None:
+        url = self.base + (path if path.startswith("/") else "/" + path)
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get(self.status_field) != "ok":
+                return None
+            return bool(payload.get(self.field))
+        except (urllib.error.URLError, OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+
+    def turn_on(self) -> bool:
+        """下发开灯，返回是否确认灯已亮。"""
+        return self._call(self.paths["on"]) is True
+
+    def turn_off(self) -> bool:
+        """下发关灯，返回是否确认灯已灭。"""
+        return self._call(self.paths["off"]) is False
+
+    def state(self) -> bool | None:
+        """查询当前灯状态（True=亮，False=灭，None=不可达）。"""
+        return self._call(self.paths["state"])
+
+
 class LampDevice:
     """单灯杆：传感器（真实 HTTP，无数据时为 0）+ 灯光（电磁阀）控制 + 视频流。"""
 
-    def __init__(self, lamp: dict):
+    def __init__(self, lamp: dict, sensor_fields: dict | None = None,
+                 lamp_ctrl_fields: dict | None = None):
         self.id = lamp["id"]
         self.name = lamp["name"]
         self.location = lamp["location"]
         self.rtsp_url = lamp.get("rtsp_url", "")
+        # 配置指纹：用于增量重建时判断该灯杆配置是否变化
+        self.fp = (self.id, self.name, self.location, self.rtsp_url,
+                   lamp.get("sensor_url", ""), lamp.get("esp32_base", ""),
+                   json.dumps(sensor_fields or {}, ensure_ascii=False, sort_keys=True),
+                   json.dumps(lamp_ctrl_fields or {}, ensure_ascii=False, sort_keys=True))
         self._lock = threading.Lock()
         self._light_state = "off"
         # 无真实数据时数值为 0（不使用模拟数据）
@@ -231,7 +290,11 @@ class LampDevice:
         self.online = True
         # 真实温湿度/光照传感器（ESP32 HTTP 接口），未配置时为 None
         sensor_url = lamp.get("sensor_url", "") or ""
-        self._http_sensor = HttpTempSensor(sensor_url) if sensor_url else None
+        self._http_sensor = HttpTempSensor(sensor_url, fields=sensor_fields) if sensor_url else None
+        # 真实灯控（ESP32 + MOS 继电器），未配置时为 None
+        light_base = lamp.get("esp32_base", "") or ""
+        self._light_ctrl = HttpLightControl(light_base, fields=lamp_ctrl_fields) if light_base else None
+        self._sync_counter = 0
         # None=未检测, True=在线, False=离线（真实传感器）
         self.sensor_online: bool | None = None   # ESP32 接口整体在线状态（温湿度）
         self.light_online: bool | None = None    # GY-302 光照传感器在线状态
@@ -274,8 +337,23 @@ class LampDevice:
     def set_light(self, action: str) -> None:
         if action not in ("on", "off"):
             raise ValueError("非法指令")
+        if self._light_ctrl is not None:
+            # 真实灯控：把指令下发给 ESP32，未确认成功则报错，绝不假装控制成功
+            ok = self._light_ctrl.turn_on() if action == "on" else self._light_ctrl.turn_off()
+            if not ok:
+                raise ValueError("灯控指令发送失败（ESP32 不可达或未确认灯状态）")
         with self._lock:
             self._light_state = action
+
+    def sync_light(self) -> None:
+        """定期（约每 5 个采样周期）从 ESP32 读回真实灯状态，保持前端显示与物理一致。"""
+        self._sync_counter += 1
+        if self._light_ctrl is None or self._sync_counter % 5 != 0:
+            return
+        st = self._light_ctrl.state()
+        if st is not None:
+            with self._lock:
+                self._light_state = "on" if st else "off"
 
     def snapshot(self) -> dict:
         video_online = True
@@ -304,16 +382,63 @@ class LampDevice:
 
 
 class LampManager:
-    """管理全部灯杆单元。"""
+    """管理全部灯杆单元，支持增量重建（仅重建配置变化的灯杆）。"""
 
-    def __init__(self):
+    def __init__(self, posts: list[dict] | None = None):
         from detector import PersonDetector
 
-        self._lamps = {lamp["id"]: LampDevice(lamp) for lamp in config.LAMP_POSTS}
-        # 每个灯杆启动持续人员自动识别（生成标注视频流并按规则告警）
-        self._detectors = {
-            lamp_id: PersonDetector(lamp) for lamp_id, lamp in self._lamps.items()
-        }
+        import store
+
+        posts = posts if posts is not None else store.lamp_posts()
+        fields = store.sensor_fields()
+        self._lamps: dict[str, LampDevice] = {}
+        self._detectors = {}
+        for lamp in posts:
+            light_cfg = lamp.get("lamp_ctrl")   # 灯杆级灯控接口（缺省用 HttpLightControl 默认 /api/lamp/*）
+            dev = LampDevice(lamp, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
+            self._lamps[lamp["id"]] = dev
+            self._detectors[lamp["id"]] = PersonDetector(dev)
+
+    def reload(self, posts: list[dict] | None = None) -> list[str]:
+        """按新配置增量重建灯杆：配置未变的灯杆保持运行（视频/识别不中断）。
+
+        返回被重建/删除的灯杆 ID 列表（供提示用）。
+        """
+        from detector import PersonDetector
+
+        import store
+
+        posts = posts if posts is not None else store.lamp_posts()
+        fields = store.sensor_fields()
+        changed: list[str] = []
+
+        # 先停止被删除或配置变化的旧灯杆线程
+        for lamp_id, dev in list(self._lamps.items()):
+            kept = next((p for p in posts if p["id"] == lamp_id), None)
+            if kept is None or dev.fp != _post_fp(kept, fields):
+                det = self._detectors.pop(lamp_id, None)
+                if det is not None:
+                    det.stop()
+                dev.video.stop()
+                changed.append(lamp_id)
+
+        # 重建：未变化的直接复用旧实例
+        new_lamps: dict[str, LampDevice] = {}
+        new_dets = {}
+        for post in posts:
+            lamp_id = post["id"]
+            old = self._lamps.get(lamp_id)
+            if old is not None and old.fp == _post_fp(post, fields):
+                new_lamps[lamp_id] = old
+                new_dets[lamp_id] = self._detectors.get(lamp_id)
+            else:
+                light_cfg = post.get("lamp_ctrl")
+                dev = LampDevice(post, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
+                new_lamps[lamp_id] = dev
+                new_dets[lamp_id] = PersonDetector(dev)
+        self._lamps = new_lamps
+        self._detectors = new_dets
+        return changed
 
     def all(self) -> list[LampDevice]:
         return list(self._lamps.values())
@@ -323,3 +448,13 @@ class LampManager:
 
     def detector(self, lamp_id: str):
         return self._detectors.get(lamp_id)
+
+
+def _post_fp(post: dict, fields: dict) -> tuple:
+    """按灯杆配置 + 传感器字段映射 + 灯杆级灯控格式计算指纹（与 LampDevice.fp 对齐）。"""
+    light_cfg = post.get("lamp_ctrl") or {}
+    return (post["id"], post.get("name", ""), post.get("location", ""),
+            post.get("rtsp_url", ""), post.get("sensor_url", ""),
+            post.get("esp32_base", ""),
+            json.dumps(fields or {}, ensure_ascii=False, sort_keys=True),
+            json.dumps(light_cfg or {}, ensure_ascii=False, sort_keys=True))

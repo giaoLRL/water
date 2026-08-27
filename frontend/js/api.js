@@ -50,6 +50,8 @@ window.API = (() => {
     alarmConfigSet: (cfg) => req("POST", "/api/alarm/config", cfg),
     logs: (lampId, params) => req("GET", "/api/logs" + qs(lampId, params)),
     system: () => req("GET", "/api/system"),
+    sysConfigGet: () => req("GET", "/api/sysconfig"),
+    sysConfigSet: (body) => req("POST", "/api/sysconfig", body),
     videoUrl: (id) => `/api/lampposts/${id}/video`,
     detectVideoUrl: (id) => `/api/lampposts/${id}/detect_video`,
   };

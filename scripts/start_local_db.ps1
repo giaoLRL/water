@@ -1,4 +1,4 @@
-﻿param(
+param(
     [int]$Port = 3306,
     [string]$RootPassword = "root_local_2026"
 )

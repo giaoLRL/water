@@ -200,6 +200,8 @@ def init_database() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            # 配置值扩容：动态配置以 JSON 存入（灯杆列表等），255 字符不够
+            cur.execute("ALTER TABLE config MODIFY COLUMN value LONGTEXT NOT NULL")
             for key, value in config.DEFAULT_THRESHOLDS.items():
                 cur.execute(
                     "INSERT IGNORE INTO config (config_key, value) VALUES (%s, %s)",

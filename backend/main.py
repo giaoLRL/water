@@ -12,12 +12,13 @@ from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 import config
 import database
 import infer
+import store
 from alarm import AlarmEngine
 from api import router
 from device import LampManager
@@ -47,6 +48,8 @@ def _collect_lamp(lamp) -> None:
     image = infer.frame_to_dataurl(frame) if frame is not None else None
     active = services.alarm.check(lamp.id, sensors, image=image)
     services.set_lamp_alarms(lamp.id, active)
+    # 周期性读回真实灯状态（ESP32），保持页面显示与物理一致
+    lamp.sync_light()
 
 
 async def collect_loop() -> None:
@@ -60,7 +63,8 @@ async def collect_loop() -> None:
             )
         except Exception:  # noqa: BLE001
             pass
-        await asyncio.sleep(config.SAMPLE_INTERVAL)
+        # 采样间隔可在系统配置页调整（每轮读取，即时生效）
+        await asyncio.sleep(store.sample_interval())
 
 
 @asynccontextmanager
@@ -100,7 +104,16 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-app.mount("/", StaticFiles(directory=str(config.FRONTEND_DIR), html=True), name="static")
+class NoCacheStaticFiles(StarletteStaticFiles):
+    """静态资源禁用启发式缓存：每次请求都重新验证，避免前端改版后浏览器仍用旧文件。"""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/", NoCacheStaticFiles(directory=str(config.FRONTEND_DIR), html=True), name="static")
 
 
 if __name__ == "__main__":

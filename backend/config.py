@@ -49,6 +49,7 @@ LAMP_POSTS = [
         "location": "东门主干道",
         "rtsp_url": "rtsp://admin:123456@192.168.31.201/stream0",
         "sensor_url": "http://192.168.31.100/api/data",  # ESP32 + DHT11 真实温湿度
+        "esp32_base": "http://192.168.31.100",           # ESP32 灯控服务（MOS 继电器）
     },
     {
         "id": "02",

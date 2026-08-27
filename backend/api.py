@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 import config
 import database
 import infer
+import store
 from state import services
 
 router = APIRouter(prefix="/api")
@@ -42,6 +43,13 @@ class AlarmConfigRequest(BaseModel):
     # 人员数量告警规则
     person_alert_enabled: int | None = Field(default=None, ge=0, le=1)
     person_alert_min: float | None = Field(default=None, ge=1, le=100)
+
+
+class SysConfigRequest(BaseModel):
+    """系统配置页提交：可带任意一节，未带的节保持不变。"""
+    lamp_posts: list | None = None
+    service: dict | None = None
+    sensor_fields: dict | None = None
 
 
 def _validate_range(start: str | None, end: str | None) -> None:
@@ -337,6 +345,70 @@ def logs(
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
+# ---------- 系统配置（配置中心页面） ----------
+@router.get("/sysconfig")
+def sysconfig_get():
+    """返回全部可在前端编辑的配置（含当前生效值）。"""
+    lamps = services.lamps.all() if services.lamps else []
+    return ok({
+        "lamp_posts": store.lamp_posts(),
+        "infer_url": store.infer_url(),
+        "infer_timeout": store.infer_timeout(),
+        "person_detect_interval": store.person_detect_interval(),
+        "sample_interval": store.sample_interval(),
+        "sensor_fields": store.sensor_fields(),
+        "running_lamps": [l.id for l in lamps],
+    })
+
+
+@router.post("/sysconfig")
+def sysconfig_set(body: SysConfigRequest):
+    """分节保存配置：灯杆增量重建 / 服务参数即时生效 / 传感器格式重建灯杆生效。"""
+    msgs: list[str] = []
+    changed: list[str] = []
+
+    if body.lamp_posts is not None:
+        for p in body.lamp_posts:
+            if not str(p.get("id", "")).strip():
+                return err(40002, "灯杆 ID 不能为空")
+            p.setdefault("name", "")
+            p.setdefault("location", "")
+            p.setdefault("rtsp_url", "")
+            p.setdefault("sensor_url", "")
+            p.setdefault("esp32_base", "")
+        store.set_json("lamp_posts", body.lamp_posts)
+        if services.lamps:
+            changed = services.lamps.reload(body.lamp_posts)
+        msgs.append(f"灯杆配置已保存，重建/删除: {', '.join(changed) if changed else '无'}")
+
+    if body.service is not None:
+        svc = body.service
+        try:
+            if "infer_url" in svc:
+                store.set("infer_url", str(svc["infer_url"]))
+            if "infer_timeout" in svc:
+                store.set("infer_timeout", float(svc["infer_timeout"]))
+            if "person_detect_interval" in svc:
+                store.set("person_detect_interval", max(1.0, float(svc["person_detect_interval"])))
+            if "sample_interval" in svc:
+                store.set("sample_interval", max(0.5, float(svc["sample_interval"])))
+        except (TypeError, ValueError):
+            return err(40002, "服务参数中存在非法数值")
+        msgs.append("服务参数已保存，即时生效")
+
+    if body.sensor_fields is not None:
+        for key in ("status", "temperature", "humidity", "light"):
+            if not str(body.sensor_fields.get(key, "")).strip():
+                return err(40002, f"传感器格式缺少字段: {key}")
+        store.set_json("sensor_fields", body.sensor_fields)
+        if services.lamps:
+            # 字段映射变化 → 所有灯杆指纹变化 → 重建（生效）
+            changed = services.lamps.reload()
+        msgs.append("传感器格式已保存并生效")
+
+    return ok({"msg": "；".join(msgs), "changed": changed})
+
+
 # ---------- 系统状态 ----------
 @router.get("/system")
 def system_status():
@@ -346,7 +418,7 @@ def system_status():
         "lamps": [_lamp_summary(l) for l in lamps],
         "uptime_s": round(services.uptime, 1),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "infer_url": config.INFER_URL,
+        "infer_url": store.infer_url(),
         "active_alarm_count": services.active_count(),
         "devices": services.device_status(),
     })
