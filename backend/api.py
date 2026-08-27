@@ -1,4 +1,8 @@
-"""HTTP 业务接口：灯杆列表/详情/历史/控制/视频流/人员监测/告警/统计。"""
+"""HTTP 业务接口（FastAPI 路由）：灯杆列表/详情/历史/统计/控制/视频流/人员监测/告警/日志。
+
+统一返回 {"code":0,"msg":"ok","data":...}；前端页面通过 /api/* 调用，
+接口文档在启动后访问 /docs 自动生成。
+"""
 import time
 import urllib.error
 from datetime import datetime
@@ -260,13 +264,12 @@ def detections(
     lamp_id: str | None = Query(default=None),
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=200),
 ):
-    rows = database.query_detections(lamp_id, start, end)
-    # 列表返回时剥离体积较大的 base64 图片
-    for row in rows:
-        row.pop("original_image", None)
-        row.pop("processed_image", None)
-    return ok({"detections": rows})
+    items, total = database.query_detections(lamp_id, start, end, keyword, page, page_size)
+    return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
 @router.get("/detections/{detection_id}")
@@ -303,9 +306,12 @@ def alarms(
     end: str | None = Query(default=None),
     type: str | None = Query(default=None, alias="type"),
     status: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=200),
 ):
-    rows = database.query_alarms(lamp_id, start, end, type, status)
-    return ok({"alarms": rows})
+    items, total = database.query_alarms(lamp_id, start, end, type, status, keyword, page, page_size)
+    return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
 @router.get("/alarms/{alarm_id}")
@@ -319,8 +325,16 @@ def alarm_detail(alarm_id: int):
 
 # ---------- 操作日志 ----------
 @router.get("/logs")
-def logs(lamp_id: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=500)):
-    return ok({"logs": database.query_control_log(lamp_id, limit)})
+def logs(
+    lamp_id: str | None = Query(default=None),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=200),
+):
+    items, total = database.query_control_log(lamp_id, start, end, keyword, page, page_size)
+    return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
 # ---------- 系统状态 ----------

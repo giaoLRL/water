@@ -19,6 +19,19 @@ window.API = (() => {
     return json.data;
   }
 
+  // 拼接查询串：自动合并 lamp_id，过滤 undefined 值，避免 URLSearchParams 把它们序列化成 "undefined" 字符串
+  function qs(lampId, params) {
+    const p = {};
+    if (lampId) p.lamp_id = lampId;
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null && v !== "") p[k] = v;
+      }
+    }
+    const s = new URLSearchParams(p).toString();
+    return s ? "?" + s : "";
+  }
+
   return {
     lamps: () => req("GET", "/api/lampposts"),
     lamp: (id) => req("GET", `/api/lampposts/${id}`),
@@ -29,13 +42,13 @@ window.API = (() => {
     control: (id, action) => req("POST", `/api/lampposts/${id}/control`, { action }),
     detect: (id) => req("POST", `/api/lampposts/${id}/detect`),
     detectCurrent: (id) => req("GET", `/api/lampposts/${id}/detect/current`),
-    detections: (lampId) => req("GET", "/api/detections" + (lampId ? `?lamp_id=${lampId}` : "")),
+    detections: (lampId, params) => req("GET", "/api/detections" + qs(lampId, params)),
     detection: (id) => req("GET", `/api/detections/${id}`),
-    alarms: (lampId) => req("GET", "/api/alarms" + (lampId ? `?lamp_id=${lampId}` : "")),
+    alarms: (lampId, params) => req("GET", "/api/alarms" + qs(lampId, params)),
     alarm: (id) => req("GET", `/api/alarms/${id}`),
     alarmConfigGet: () => req("GET", "/api/alarm/config"),
     alarmConfigSet: (cfg) => req("POST", "/api/alarm/config", cfg),
-    logs: (lampId) => req("GET", "/api/logs" + (lampId ? `?lamp_id=${lampId}` : "")),
+    logs: (lampId, params) => req("GET", "/api/logs" + qs(lampId, params)),
     system: () => req("GET", "/api/system"),
     videoUrl: (id) => `/api/lampposts/${id}/video`,
     detectVideoUrl: (id) => `/api/lampposts/${id}/detect_video`,

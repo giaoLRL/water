@@ -1,4 +1,10 @@
-"""FastAPI 入口：初始化数据库/灯杆/告警，启动后台采集循环。"""
+"""FastAPI 应用入口：初始化数据库 / 灯杆 / 告警引擎 / 设备监控，并启动采样循环。
+
+- lifespan 启动阶段完成资源初始化，创建采集任务；
+- 采集循环把各灯杆的同步工作（真实传感器 HTTP、数据库写入）放进线程池并行执行，
+  避免阻塞 uvicorn 异步事件循环，保证视频流与接口不因传感器慢而周期卡顿。
+启动: python main.py（默认 http://0.0.0.0:8000）
+"""
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime

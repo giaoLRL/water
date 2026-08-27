@@ -1,4 +1,8 @@
-"""智能识别服务辅助：帧 <-> base64 dataURL 与调用 YOLO 推理接口。"""
+"""智能识别服务辅助：封装的帧 <-> base64 dataURL 转换与 YOLO 推理接口调用。
+
+供 api.py（手动截图检测）与 detector.py（持续自动识别）复用，
+统一图片编解码与 POST /infer 请求逻辑，避免多处重复实现。
+"""
 import base64
 import json
 import urllib.request

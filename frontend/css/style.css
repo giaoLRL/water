@@ -609,6 +609,22 @@ td { font-variant-numeric: tabular-nums; }
 }
 .rule-item input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
 .alarm-rule .btn-primary { margin-left: auto; }
+
+/* ===== 记录筛选与分页 ===== */
+.filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.filter-bar input[type="search"], .filter-bar input[type="date"] {
+  padding: 6px 8px; background: var(--bg-deep); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+}
+.filter-bar input[type="search"] { width: 180px; }
+.filter-bar span { color: var(--text-dim); font-size: 12px; }
+.pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--text-sub); }
+.pager select {
+  padding: 5px 6px; background: var(--bg-deep); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+}
+.pager .btn-ghost { font-size: 12px; padding: 5px 12px; }
+.pager .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 .detect-imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .detect-img-box { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .detect-img-label { font-size: 11px; color: var(--text-dim); padding: 5px 10px; background: var(--bg-deep); border-bottom: 1px solid var(--border); }

@@ -1,4 +1,9 @@
-"""MySQL 封装：连接池、建表初始化、灯杆相关读写接口。"""
+"""MySQL 数据层：连接池、建库建表初始化、灯杆传感/告警/人员监测/日志等读写接口。
+
+所有的 SQL 都封装在本模块，业务模块（api / alarm / 采集循环）只调用这里的函数，
+不直接写 SQL。启动时 init_database() 负责建库建表，并自动清理旧水循环遗留表结构、
+温和补充新增列（如告警快照图列），避免丢历史数据。
+"""
 import threading
 from datetime import datetime
 
@@ -309,35 +314,44 @@ def recover_alarm(lamp_id: str, type_: str) -> None:
 
 
 def query_alarms(lamp_id: str | None, start: str | None, end: str | None,
-                 type_: str | None, status: str | None) -> list[dict]:
+                 type_: str | None, status: str | None, keyword: str | None = None,
+                 page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
+    """分页查询告警记录，返回 (items, total)。keyword 模糊匹配类型或描述。"""
     conn = get_pool().connection()
-    # 列表不返回体积较大的 image 列，仅标记是否有快照
-    sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
-           "threshold, direction, message, status, "
-           "(image IS NOT NULL AND image <> '') AS has_image FROM alarms WHERE 1=1")
+    where = " WHERE 1=1"
     params: list = []
     if lamp_id:
-        sql += " AND lamp_id = %s"
+        where += " AND lamp_id = %s"
         params.append(lamp_id)
     if start:
-        sql += " AND ts >= %s"
+        where += " AND ts >= %s"
         params.append(start)
     if end:
-        sql += " AND ts <= %s"
+        where += " AND ts <= %s"
         params.append(end)
     if type_:
-        sql += " AND type = %s"
+        where += " AND type = %s"
         params.append(type_)
     if status:
-        sql += " AND status = %s"
+        where += " AND status = %s"
         params.append(status)
-    sql += " ORDER BY ts DESC LIMIT 500"
+    if keyword:
+        where += " AND (type LIKE %s OR message LIKE %s)"
+        params += [f"%{keyword}%", f"%{keyword}%"]
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return list(cur.fetchall())
+            cur.execute(f"SELECT COUNT(*) AS n FROM alarms{where}", params)
+            total = cur.fetchone()["n"]
+            offset = (page - 1) * page_size
+            sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
+                   "threshold, direction, message, status, "
+                   "(image IS NOT NULL AND image <> '') AS has_image FROM alarms"
+                   + where + " ORDER BY ts DESC LIMIT %s OFFSET %s")
+            cur.execute(sql, params + [page_size, offset])
+            items = list(cur.fetchall())
     finally:
         conn.close()
+    return items, total
 
 
 def get_alarm(alarm_id: int) -> dict | None:
@@ -378,27 +392,38 @@ def insert_detection(
         conn.close()
 
 
-def query_detections(lamp_id: str | None, start: str | None, end: str | None) -> list[dict]:
+def query_detections(lamp_id: str | None, start: str | None, end: str | None,
+                     keyword: str | None = None, page: int = 1,
+                     page_size: int = 10) -> tuple[list[dict], int]:
+    """分页查询人员监测记录，返回 (items, total)。keyword 模糊匹配灯杆编号。"""
     conn = get_pool().connection()
-    sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, person_count, "
-           "max_confidence, original_image, processed_image FROM person_detections WHERE 1=1")
+    where = " WHERE 1=1"
     params: list = []
     if lamp_id:
-        sql += " AND lamp_id = %s"
+        where += " AND lamp_id = %s"
         params.append(lamp_id)
     if start:
-        sql += " AND ts >= %s"
+        where += " AND ts >= %s"
         params.append(start)
     if end:
-        sql += " AND ts <= %s"
+        where += " AND ts <= %s"
         params.append(end)
-    sql += " ORDER BY ts DESC LIMIT 200"
+    if keyword:
+        where += " AND lamp_id LIKE %s"
+        params.append(f"%{keyword}%")
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return list(cur.fetchall())
+            cur.execute(f"SELECT COUNT(*) AS n FROM person_detections{where}", params)
+            total = cur.fetchone()["n"]
+            offset = (page - 1) * page_size
+            sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, person_count, "
+                   "max_confidence FROM person_detections"
+                   + where + " ORDER BY ts DESC LIMIT %s OFFSET %s")
+            cur.execute(sql, params + [page_size, offset])
+            items = list(cur.fetchall())
     finally:
         conn.close()
+    return items, total
 
 
 def get_detection(detection_id: int) -> dict | None:
@@ -463,22 +488,37 @@ def insert_control_log(lamp_id: str, action: str, result: str, detail: str | Non
         conn.close()
 
 
-def query_control_log(lamp_id: str | None = None, limit: int = 50) -> list[dict]:
+def query_control_log(lamp_id: str | None = None, start: str | None = None,
+                      end: str | None = None, keyword: str | None = None,
+                      page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
+    """分页查询设备操作日志，返回 (items, total)。keyword 模糊匹配灯杆/指令/说明。"""
     conn = get_pool().connection()
-    sql = ("SELECT lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail "
-           "FROM control_log")
+    where = " WHERE 1=1"
     params: list = []
     if lamp_id:
-        sql += " WHERE lamp_id = %s"
+        where += " AND lamp_id = %s"
         params.append(lamp_id)
-    sql += " ORDER BY id DESC LIMIT %s"
-    params.append(limit)
+    if start:
+        where += " AND ts >= %s"
+        params.append(start)
+    if end:
+        where += " AND ts <= %s"
+        params.append(end)
+    if keyword:
+        where += " AND (lamp_id LIKE %s OR action LIKE %s OR result LIKE %s OR detail LIKE %s)"
+        params += [f"%{keyword}%"] * 4
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return list(cur.fetchall())
+            cur.execute(f"SELECT COUNT(*) AS n FROM control_log{where}", params)
+            total = cur.fetchone()["n"]
+            offset = (page - 1) * page_size
+            sql = ("SELECT lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail "
+                   "FROM control_log" + where + " ORDER BY id DESC LIMIT %s OFFSET %s")
+            cur.execute(sql, params + [page_size, offset])
+            items = list(cur.fetchall())
     finally:
         conn.close()
+    return items, total
 
 
 # ---------- 统计 ----------

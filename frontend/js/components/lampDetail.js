@@ -21,9 +21,13 @@ window.ViewLampDetail = {
       trend: { temperature: [], humidity: [], luminance: [] },
       // 告警
       alarms: [],
+      alarmTotal: 0, alarmPage: 1, alarmPageSize: 10,
+      alarmKeyword: "", alarmStart: "", alarmEnd: "",
       alarmDetail: null,     // 单条告警详情（含异常快照图）
       // 人员监测
       detections: [],
+      detTotal: 0, detPage: 1, detPageSize: 10,
+      detKeyword: "", detStart: "", detEnd: "",
       curDetect: null,       // 持续自动识别最新结果
       ruleEnabled: 1,        // 人数告警规则：是否启用
       ruleMin: 3,            // 人数告警阈值
@@ -31,6 +35,10 @@ window.ViewLampDetail = {
       detailInfo: null,
       // 日志
       logs: [],
+      logTotal: 0, logPage: 1, logPageSize: 10,
+      logKeyword: "", logStart: "", logEnd: "",
+      // 历史明细（前端分页）
+      histPage: 1, histPageSize: 10,
       timer: null,
     };
   },
@@ -43,15 +51,26 @@ window.ViewLampDetail = {
     },
     sensorTag() {
       if (this.lamp.sensor_source === "esp32") {
-        return this.lamp.sensor_online === false ? "传感器离线·模拟回退" : "真实温湿度(ESP32)";
+        return this.lamp.sensor_online === false ? "传感器离线" : "真实温湿度(ESP32)";
       }
-      return "模拟数据";
+      return "无真实传感器";
     },
     luxTag() {
       if (this.lamp.sensor_source === "esp32") {
-        return this.lamp.light_online === false ? "光照离线·模拟回退" : "真实光照(GY-302)";
+        return this.lamp.light_online === false ? "光照离线" : "真实光照(GY-302)";
       }
-      return "模拟数据";
+      return "无真实传感器";
+    },
+    alarmPages() { return Math.max(1, Math.ceil(this.alarmTotal / this.alarmPageSize)); },
+    detPages() { return Math.max(1, Math.ceil(this.detTotal / this.detPageSize)); },
+    logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
+    histRows() {
+      const all = this.histPoints.slice(-200);
+      const start = (this.histPage - 1) * this.histPageSize;
+      return all.slice(start, start + this.histPageSize).reverse();
+    },
+    histPageTotal() {
+      return Math.max(1, Math.ceil(Math.min(this.histPoints.length, 200) / this.histPageSize));
     },
   },
   mounted() {
@@ -81,7 +100,7 @@ window.ViewLampDetail = {
       this.fetchStats("1h");
       this.fetchAlarms();
       this.fetchDetections();
-      this.fetchLogs();
+      this.fetchLogs(1);
       this.fetchDetectCurrent();
       try {
         this.thresholds = (await API.alarmConfigGet()).thresholds || {};
@@ -128,29 +147,88 @@ window.ViewLampDetail = {
         this.stats = await API.stats(this.lampId, s, e);
       } catch (err) { /* silent */ }
     },
-    async fetchAlarms() {
+    dateFilter(start, end) {
+      // 日历筛选：把日期转成当天起止时间
+      const r = {};
+      if (start) r.start = start + " 00:00:00";
+      if (end) r.end = end + " 23:59:59";
+      return r;
+    },
+    async fetchAlarms(page) {
+      if (page) this.alarmPage = page;
+      if (this.alarmPage < 1) this.alarmPage = 1;
       try {
-        this.alarms = (await API.alarms(this.lampId)).alarms || [];
+        const d = await API.alarms(this.lampId, {
+          page: this.alarmPage, page_size: this.alarmPageSize,
+          keyword: this.alarmKeyword || undefined,
+          ...this.dateFilter(this.alarmStart, this.alarmEnd),
+        });
+        this.alarms = d.items || [];
+        this.alarmTotal = d.total || 0;
         this.renderAlarmChart();
       } catch (e) { /* silent */ }
     },
-    async fetchDetections() {
+    resetAlarmFilter() {
+      this.alarmKeyword = ""; this.alarmStart = ""; this.alarmEnd = "";
+      this.fetchAlarms(1);
+    },
+    async fetchDetections(page) {
+      if (page) this.detPage = page;
+      if (this.detPage < 1) this.detPage = 1;
       try {
-        this.detections = (await API.detections(this.lampId)).detections || [];
+        const d = await API.detections(this.lampId, {
+          page: this.detPage, page_size: this.detPageSize,
+          keyword: this.detKeyword || undefined,
+          ...this.dateFilter(this.detStart, this.detEnd),
+        });
+        this.detections = d.items || [];
+        this.detTotal = d.total || 0;
         this.renderDetectionChart();
       } catch (e) { /* silent */ }
     },
-    async fetchLogs() {
+    resetDetFilter() {
+      this.detKeyword = ""; this.detStart = ""; this.detEnd = "";
+      this.fetchDetections(1);
+    },
+    async fetchLogs(page) {
+      if (page) this.logPage = page;
+      if (this.logPage < 1) this.logPage = 1;
       try {
-        this.logs = (await API.logs(this.lampId)).logs || [];
+        const d = await API.logs(this.lampId, {
+          page: this.logPage, page_size: this.logPageSize,
+          keyword: this.logKeyword || undefined,
+          ...this.dateFilter(this.logStart, this.logEnd),
+        });
+        this.logs = d.items || [];
+        this.logTotal = d.total || 0;
       } catch (e) { /* silent */ }
+    },
+    resetLogFilter() {
+      this.logKeyword = ""; this.logStart = ""; this.logEnd = "";
+      this.fetchLogs(1);
+    },
+    async saveEnvRule() {
+      const keys = ["temp_max", "temp_min", "humidity_max", "humidity_min", "luminance_max", "luminance_min"];
+      const cfg = {};
+      for (const k of keys) {
+        const v = parseFloat(this.thresholds[k]);
+        if (isNaN(v)) { alert(`请填写有效数值: ${k}`); return; }
+        cfg[k] = v;
+      }
+      try {
+        this.thresholds = (await API.alarmConfigSet(cfg)).thresholds || {};
+        this.applyRuleFromThresholds();
+        alert("环境参数阈值已保存");
+      } catch (e) {
+        alert(e.message);
+      }
     },
     setTab(t) {
       this.tab = t;
-      if (t === "alarm") this.fetchAlarms();
-      if (t === "detections") this.fetchDetections();
-      if (t === "logs") this.fetchLogs();
-      if (t === "history") this.fetchHistory(this.histRangeKey);
+      if (t === "alarm") this.fetchAlarms(1);
+      if (t === "detections") this.fetchDetections(1);
+      if (t === "logs") this.fetchLogs(1);
+      if (t === "history") { this.histPage = 1; this.fetchHistory(this.histRangeKey); }
       setTimeout(() => window.Charts.resizeAll(), 120);
     },
     async doControl(action) {
@@ -356,7 +434,7 @@ window.ViewLampDetail = {
               <span class="desc">{{ curDetect && curDetect.ts ? curDetect.ts : '识别启动中…' }}</span>
             </div>
             <img class="video-frame" :src="detectVideoUrl" alt="标注视频流">
-            <div v-if="!curDetect || !curDetect.enabled" class="note">人数告警规则未启用或识别服务尚未返回，可在“人员监测”页配置人数阈值。</div>
+            <div v-if="!curDetect || !curDetect.enabled" class="note">人数告警规则未启用或识别服务尚未返回，可在“告警记录”页配置人数阈值。</div>
           </div>
         </div>
       </div>
@@ -393,14 +471,14 @@ window.ViewLampDetail = {
         </div>
         <div class="section">
           <div class="table-actions">
-            <h3 style="margin-bottom:0;">数据明细（最近 50 条）</h3>
-            <span class="desc">{{ histPoints.length }} 个采样点</span>
+            <h3 style="margin-bottom:0;">数据明细</h3>
+            <span class="desc">共 {{ histPoints.length }} 个采样点（展示最近 200 个）</span>
           </div>
           <div style="overflow-x:auto;">
             <table>
               <thead><tr><th>时间</th><th>温度 ℃</th><th>湿度 %</th><th>光照 lx</th><th>灯光</th></tr></thead>
               <tbody>
-                <tr v-for="(p, i) in histPoints.slice(-50).reverse()" :key="i">
+                <tr v-for="(p, i) in histRows" :key="i">
                   <td>{{ p.ts }}</td><td>{{ p.temperature }}</td><td>{{ p.humidity }}</td><td>{{ p.luminance }}</td>
                   <td>{{ p.light_state === 'on' ? '开' : '关' }}</td>
                 </tr>
@@ -408,17 +486,60 @@ window.ViewLampDetail = {
               </tbody>
             </table>
           </div>
+          <div class="pager">
+            <span>每页</span>
+            <select v-model.number="histPageSize" @change="histPage = 1">
+              <option :value="10">10</option><option :value="20">20</option><option :value="50">50</option>
+            </select>
+            <span>第 {{ histPage }} / {{ histPageTotal }} 页</span>
+            <button class="btn-ghost" :disabled="histPage <= 1" @click="histPage--">上一页</button>
+            <button class="btn-ghost" :disabled="histPage >= histPageTotal" @click="histPage++">下一页</button>
+          </div>
         </div>
       </div>
 
-      <!-- 告警记录 -->
+      <!-- 告警记录：告警配置 + 规则 + 记录列表（筛选/分页） -->
       <div v-show="tab === 'alarm'">
+        <div class="section">
+          <h3>环境参数告警阈值 <span class="desc">温度 / 湿度 / 光照上下限 · 超限触发告警</span></h3>
+          <div class="alarm-rule">
+            <label class="rule-item"><span>温度上限 ℃</span><input type="number" v-model.number="thresholds.temp_max"></label>
+            <label class="rule-item"><span>温度下限 ℃</span><input type="number" v-model.number="thresholds.temp_min"></label>
+            <label class="rule-item"><span>湿度上限 %</span><input type="number" v-model.number="thresholds.humidity_max"></label>
+            <label class="rule-item"><span>湿度下限 %</span><input type="number" v-model.number="thresholds.humidity_min"></label>
+            <label class="rule-item"><span>光照上限 lx</span><input type="number" v-model.number="thresholds.luminance_max"></label>
+            <label class="rule-item"><span>光照下限 lx</span><input type="number" v-model.number="thresholds.luminance_min"></label>
+            <button class="btn-primary" @click="saveEnvRule">保存环境阈值</button>
+          </div>
+        </div>
+        <div class="section">
+          <h3>人数告警规则 <span class="desc">识别到的人数达到阈值即告警</span></h3>
+          <div class="alarm-rule">
+            <label class="rule-item">
+              <span>启用人数告警</span>
+              <input type="checkbox" v-model="ruleEnabled" :true-value="1" :false-value="0">
+            </label>
+            <label class="rule-item">
+              <span>人数告警阈值（人）</span>
+              <input type="number" v-model.number="ruleMin" min="1" step="1">
+            </label>
+            <button class="btn-primary" @click="savePersonRule">保存规则</button>
+          </div>
+        </div>
         <div class="section">
           <h3>告警类型分布</h3>
           <div class="chart" id="alarm-stat-chart"></div>
         </div>
         <div class="section">
-          <h3>告警记录</h3>
+          <h3>告警记录 <span class="desc">共 {{ alarmTotal }} 条</span></h3>
+          <div class="filter-bar">
+            <input type="search" v-model="alarmKeyword" placeholder="搜索类型/描述" @keyup.enter="fetchAlarms(1)">
+            <input type="date" v-model="alarmStart" title="开始日期">
+            <span>至</span>
+            <input type="date" v-model="alarmEnd" title="结束日期">
+            <button class="btn-ghost" @click="fetchAlarms(1)">查询</button>
+            <button class="btn-ghost" @click="resetAlarmFilter">重置</button>
+          </div>
           <div style="overflow-x:auto;">
             <table>
               <thead><tr><th>时间</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th><th>快照</th></tr></thead>
@@ -436,31 +557,34 @@ window.ViewLampDetail = {
               </tbody>
             </table>
           </div>
+          <div class="pager">
+            <span>每页</span>
+            <select v-model.number="alarmPageSize" @change="fetchAlarms(1)">
+              <option :value="10">10</option><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option>
+            </select>
+            <span>共 {{ alarmTotal }} 条 · 第 {{ alarmPage }} / {{ alarmPages }} 页</span>
+            <button class="btn-ghost" :disabled="alarmPage <= 1" @click="fetchAlarms(alarmPage - 1)">上一页</button>
+            <button class="btn-ghost" :disabled="alarmPage >= alarmPages" @click="fetchAlarms(alarmPage + 1)">下一页</button>
+          </div>
         </div>
       </div>
 
-      <!-- 人员监测记录 -->
+      <!-- 人员监测记录（人数规则已移至告警记录页） -->
       <div v-show="tab === 'detections'">
-        <div class="section">
-          <h3>人数告警规则 <span class="desc">可自定义 · 识别到的人数达到阈值即告警</span></h3>
-          <div class="alarm-rule">
-            <label class="rule-item">
-              <span>启用人数告警</span>
-              <input type="checkbox" v-model="ruleEnabled" :true-value="1" :false-value="0">
-            </label>
-            <label class="rule-item">
-              <span>人数告警阈值（人）</span>
-              <input type="number" v-model.number="ruleMin" min="1" step="1">
-            </label>
-            <button class="btn-primary" @click="savePersonRule">保存规则</button>
-          </div>
-        </div>
         <div class="section">
           <h3>人员检出趋势</h3>
           <div class="chart" id="detect-stat-chart"></div>
         </div>
         <div class="section">
-          <h3>人员监测记录</h3>
+          <h3>人员监测记录 <span class="desc">共 {{ detTotal }} 条</span></h3>
+          <div class="filter-bar">
+            <input type="search" v-model="detKeyword" placeholder="搜索窗口" @keyup.enter="fetchDetections(1)">
+            <input type="date" v-model="detStart" title="开始日期">
+            <span>至</span>
+            <input type="date" v-model="detEnd" title="结束日期">
+            <button class="btn-ghost" @click="fetchDetections(1)">查询</button>
+            <button class="btn-ghost" @click="resetDetFilter">重置</button>
+          </div>
           <div style="overflow-x:auto;">
             <table>
               <thead><tr><th>时间</th><th>窗口</th><th>人数</th><th>最高置信度</th><th>操作</th></tr></thead>
@@ -476,13 +600,30 @@ window.ViewLampDetail = {
               </tbody>
             </table>
           </div>
+          <div class="pager">
+            <span>每页</span>
+            <select v-model.number="detPageSize" @change="fetchDetections(1)">
+              <option :value="10">10</option><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option>
+            </select>
+            <span>共 {{ detTotal }} 条 · 第 {{ detPage }} / {{ detPages }} 页</span>
+            <button class="btn-ghost" :disabled="detPage <= 1" @click="fetchDetections(detPage - 1)">上一页</button>
+            <button class="btn-ghost" :disabled="detPage >= detPages" @click="fetchDetections(detPage + 1)">下一页</button>
+          </div>
         </div>
       </div>
 
-      <!-- 操作日志 -->
+      <!-- 操作日志（筛选/分页） -->
       <div v-show="tab === 'logs'">
         <div class="section">
-          <h3>设备操作日志</h3>
+          <h3>设备操作日志 <span class="desc">共 {{ logTotal }} 条</span></h3>
+          <div class="filter-bar">
+            <input type="search" v-model="logKeyword" placeholder="搜索窗口/指令/说明" @keyup.enter="fetchLogs(1)">
+            <input type="date" v-model="logStart" title="开始日期">
+            <span>至</span>
+            <input type="date" v-model="logEnd" title="结束日期">
+            <button class="btn-ghost" @click="fetchLogs(1)">查询</button>
+            <button class="btn-ghost" @click="resetLogFilter">重置</button>
+          </div>
           <div style="overflow-x:auto;">
             <table>
               <thead><tr><th>时间</th><th>窗口</th><th>指令</th><th>结果</th><th>说明</th></tr></thead>
@@ -497,6 +638,15 @@ window.ViewLampDetail = {
                 <tr v-if="!logs.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无操作日志</td></tr>
               </tbody>
             </table>
+          </div>
+          <div class="pager">
+            <span>每页</span>
+            <select v-model.number="logPageSize" @change="fetchLogs(1)">
+              <option :value="10">10</option><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option>
+            </select>
+            <span>共 {{ logTotal }} 条 · 第 {{ logPage }} / {{ logPages }} 页</span>
+            <button class="btn-ghost" :disabled="logPage <= 1" @click="fetchLogs(logPage - 1)">上一页</button>
+            <button class="btn-ghost" :disabled="logPage >= logPages" @click="fetchLogs(logPage + 1)">下一页</button>
           </div>
         </div>
       </div>

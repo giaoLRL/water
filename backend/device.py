@@ -1,6 +1,11 @@
-"""分布式智慧灯杆采集端：每个灯杆作为独立单元，传感器（模拟/ESP32真实）+ 视频流。"""
+"""灯杆采集端：每个灯杆是一个 LampDevice —— 传感器（ESP32 真实，无数据为 0）+ 视频流。
+
+- HttpTempSensor: 从 ESP32（DHT11 + GY-302）HTTP 接口读温度/湿度/光照，带 TTL 缓存与失败熔断，
+  设备掉线时快速返回无数据（对应数值为 0），避免拖慢采集循环；
+- VideoStream: 配置了 RTSP 读真实视频流（失败自动降级模拟画面），否则渲染模拟监控画面；
+- LampManager: 管理全部灯杆，并为每个灯杆启动持续人员识别器（PersonDetector）。
+"""
 import json
-import math
 import os
 import random
 import threading
@@ -22,20 +27,6 @@ os.environ.setdefault(
 
 _FRAME_WIDTH = 640
 _FRAME_HEIGHT = 360
-
-# 每个灯杆的模拟数据特征，便于演示不同的异常报警场景。
-_SIM_PROFILES = {
-    "01": {"temp_base": 24.0, "temp_amp": 8.0, "humid_base": 55.0, "humid_amp": 14.0, "lux_scale": 1.0},
-    "02": {"temp_base": 36.5, "temp_amp": 5.5, "humid_base": 38.0, "humid_amp": 10.0, "lux_scale": 1.1},
-    "03": {"temp_base": 23.0, "temp_amp": 7.0, "humid_base": 78.0, "humid_amp": 15.0, "lux_scale": 0.9},
-}
-
-
-def _day_factor() -> float:
-    """返回 0~1 的昼夜因子：正午≈1，午夜≈0。"""
-    now = time.localtime()
-    hour = now.tm_hour + now.tm_min / 60.0 + now.tm_sec / 3600.0
-    return max(0.0, math.sin(math.pi * (hour - 6.0) / 12.0))
 
 
 def render_sim_frame(lamp, light_on: bool) -> np.ndarray:
@@ -224,18 +215,18 @@ class HttpTempSensor:
 
 
 class LampDevice:
-    """单灯杆：传感器（HTTP 真实 或 模拟）+ 灯光（电磁阀）控制 + 视频流。"""
+    """单灯杆：传感器（真实 HTTP，无数据时为 0）+ 灯光（电磁阀）控制 + 视频流。"""
 
     def __init__(self, lamp: dict):
         self.id = lamp["id"]
         self.name = lamp["name"]
         self.location = lamp["location"]
         self.rtsp_url = lamp.get("rtsp_url", "")
-        self.profile = _SIM_PROFILES.get(self.id, _SIM_PROFILES["01"])
         self._lock = threading.Lock()
         self._light_state = "off"
-        self._temperature = self.profile["temp_base"]
-        self._humidity = self.profile["humid_base"]
+        # 无真实数据时数值为 0（不使用模拟数据）
+        self._temperature = 0.0
+        self._humidity = 0.0
         self._luminance = 0.0
         self.online = True
         # 真实温湿度/光照传感器（ESP32 HTTP 接口），未配置时为 None
@@ -249,46 +240,31 @@ class LampDevice:
         self.video = VideoStream(self, self.rtsp_url)
 
     def read_sensors(self) -> dict:
-        """按昼夜规律 + 灯杆特征 + 噪声模拟一次采样；配置了真实传感器时优先使用真实数据。"""
-        day = _day_factor()
-        p = self.profile
+        """采样一次：仅当有真实传感器数据时使用真实值，否则对应指标直接为 0（不使用模拟数据）。"""
         with self._lock:
+            temp = hum = lux = 0.0
             if self._http_sensor is not None:
                 real, ok = self._http_sensor.read()
                 self.sensor_online = ok
                 light_ok = False
                 if ok:
-                    temp = real.get("temperature")
-                    hum = real.get("humidity")
-                    if temp is not None:
-                        self._temperature = float(temp)
-                    else:
-                        # 温湿度读不到：降级为模拟值，避免采集中断
-                        self._temperature = p["temp_base"] + p["temp_amp"] * day + random.uniform(-0.6, 0.6)
-                    if hum is not None:
-                        self._humidity = max(0.0, min(100.0, float(hum)))
-                    else:
-                        self._humidity = max(0.0, min(100.0, p["humid_base"] - 5.0 * day + random.uniform(-1.5, 1.5)))
-                    lux = real.get("light")
-                    if lux is not None:
-                        self._luminance = float(lux)
+                    t = real.get("temperature")
+                    h = real.get("humidity")
+                    if t is not None:
+                        temp = float(t)
+                    if h is not None:
+                        hum = max(0.0, min(100.0, float(h)))
+                    l = real.get("light")
+                    if l is not None:
+                        lux = float(l)
                         light_ok = True
-                else:
-                    # 真实传感器不可用：整体降级为模拟值
-                    self._temperature = p["temp_base"] + p["temp_amp"] * day + random.uniform(-0.6, 0.6)
-                    self._humidity = max(0.0, min(100.0, p["humid_base"] - 5.0 * day + random.uniform(-1.5, 1.5)))
                 self.light_online = light_ok
-                # 光照读不到（或接口整体失败）时按模拟昼夜规律兜底
-                if not light_ok:
-                    base_lux = day * 80000.0 * p["lux_scale"]
-                    light_boost = 320.0 if self._light_state == "on" else 0.0
-                    self._luminance = max(0.0, base_lux + light_boost + random.uniform(-40.0, 40.0))
             else:
-                self._temperature = p["temp_base"] + p["temp_amp"] * day + random.uniform(-0.6, 0.6)
-                self._humidity = max(0.0, min(100.0, p["humid_base"] - 5.0 * day + random.uniform(-1.5, 1.5)))
-                base_lux = day * 80000.0 * p["lux_scale"]
-                light_boost = 320.0 if self._light_state == "on" else 0.0
-                self._luminance = max(0.0, base_lux + light_boost + random.uniform(-40.0, 40.0))
+                self.sensor_online = False
+                self.light_online = False
+            self._temperature = temp
+            self._humidity = hum
+            self._luminance = lux
             return {
                 "temperature": round(self._temperature, 2),
                 "humidity": round(self._humidity, 2),

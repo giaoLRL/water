@@ -65,7 +65,7 @@ window.ViewLampList = {
       return Math.round(v);
     },
     statusText(s) {
-      return { online: "在线", offline: "离线", sim: "模拟", detecting: "检测中" }[s] || s;
+      return { online: "在线", offline: "离线", sim: "无真实传感器", detecting: "检测中" }[s] || s;
     },
     statusCls(s) {
       return { online: "running", offline: "offline", sim: "sim", detecting: "detecting" }[s] || "";
@@ -204,7 +204,7 @@ window.ViewLampList = {
               灯光 {{ l.light_state === 'on' ? '开启' : '关闭' }}
             </span>
             <span class="lamp-video">{{ l.video_source === 'rtsp' ? '实时视频' : '模拟画面' }}</span>
-            <span class="lamp-video" :class="{ real: l.sensor_source === 'esp32' }">{{ l.sensor_source === 'esp32' ? '真实温湿度' : '模拟温湿度' }}</span>
+            <span class="lamp-video" :class="{ real: l.sensor_source === 'esp32' }">{{ l.sensor_source === 'esp32' ? '真实温湿度' : '无真实传感器' }}</span>
             <span class="lamp-alarm" v-if="l.alarm_count">
               <b>{{ l.alarm_count }}</b> 告警
             </span>

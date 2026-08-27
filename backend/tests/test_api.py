@@ -1,6 +1,6 @@
 """后端接口功能测试：覆盖灯杆实时/详情/历史/统计/控制/告警/人员监测/系统状态/日志。
 
-用法: python backend/tests/test_api.py [base_url]
+用法: python backend/tests/test_api.py [base_url]（缺省 http://127.0.0.1:8000）
 """
 import json
 import sys
