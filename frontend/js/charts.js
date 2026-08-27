@@ -70,8 +70,8 @@ window.Charts = (() => {
       legend: { bottom: 0, textStyle: { color: "#7d8b99" }, itemWidth: 10, itemHeight: 10 },
       series: [{
         type: "pie",
-        radius: ["40%", "66%"],
-        center: ["50%", "44%"],
+        radius: ["32%", "74%"],
+        center: ["50%", "46%"],
         itemStyle: { borderColor: "#151b24", borderWidth: 2 },
         label: { color: "#7d8b99", fontSize: 11 },
         data: items.map((it, i) => ({ ...it, itemStyle: { color: palette[i % palette.length] } })),

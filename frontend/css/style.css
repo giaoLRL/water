@@ -355,6 +355,15 @@ td { font-variant-numeric: tabular-nums; }
 .tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .chart { width: 100%; height: 320px; }
 .chart.small { height: 210px; }
+/* 首页告警区：饼图 + 矩形树图 左右分格，填满不留白 */
+.half-row { display: flex; gap: 14px; }
+.half { flex: 1; min-width: 0; }
+.half-title { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+.chart.alarm-pie { height: 340px; }
+.chart.alarm-tree { height: 340px; }
+@media (max-width: 860px) {
+  .half-row { flex-direction: column; }
+}
 .custom-range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .custom-range input[type=datetime-local] {
   border: 1px solid var(--border);

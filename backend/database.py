@@ -280,7 +280,7 @@ def query_latest_sensor(lamp_id: str) -> dict | None:
 
 
 # ---------- 告警 ----------
-def insert_alarm(
+def update_or_insert_alarm(
     lamp_id: str,
     ts: datetime,
     type_: str,
@@ -290,14 +290,24 @@ def insert_alarm(
     message: str,
     image: str | None = None,
 ) -> None:
+    """写入活跃告警：同一 (灯杆, 类型) 已有 active 记录则更新，否则插入。
+
+    避免长期活跃的告警在进程重启后反复插入多条 active 记录导致统计虚高。
+    """
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, status, image) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s)",
-                (lamp_id, ts, type_, value, threshold, direction, message, image),
+                "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s, image=%s "
+                "WHERE lamp_id=%s AND type=%s AND status='active'",
+                (ts, value, threshold, direction, message, image, lamp_id, type_),
             )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, status, image) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s)",
+                    (lamp_id, ts, type_, value, threshold, direction, message, image),
+                )
     finally:
         conn.close()
 
@@ -310,6 +320,27 @@ def recover_alarm(lamp_id: str, type_: str) -> None:
                 "UPDATE alarms SET status='recovered', recovered_at=%s "
                 "WHERE lamp_id=%s AND type=%s AND status='active'",
                 (datetime.now(), lamp_id, type_),
+            )
+    finally:
+        conn.close()
+
+
+def recover_alarms_for_types(lamp_id: str, types: list[str]) -> None:
+    """把指定灯杆、指定类型数据库中的活跃告警批量置为已恢复（幂等）。
+
+    用于告警引擎每轮兜底：即使进程重启导致内存活跃集丢失，
+    也能确保数据库 status='active' 与内存真实活跃保持一致。
+    """
+    if not types:
+        return
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(types))
+            cur.execute(
+                f"UPDATE alarms SET status='recovered', recovered_at=%s "
+                f"WHERE lamp_id=%s AND type IN ({placeholders}) AND status='active'",
+                [datetime.now(), lamp_id, *types],
             )
     finally:
         conn.close()

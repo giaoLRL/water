@@ -75,11 +75,11 @@ class AlarmEngine:
             if lid == lamp_id and key != "person" and key not in active_now:
                 database.recover_alarm(lid, key)
 
-        # 新告警入库（携带异常快照图）
+        # 新告警入库（携带异常快照图；同类型活跃期间只保留一条 active 记录）
         for key, item in active_now.items():
             if (lamp_id, key) not in self._active:
                 direction_text = "超上限" if item["direction"] == "above" else "低于下限"
-                database.insert_alarm(
+                database.update_or_insert_alarm(
                     lamp_id,
                     datetime.now(),
                     item["type"],
@@ -100,6 +100,12 @@ class AlarmEngine:
         new_alarms = list(active_now.values())
         # 补充人员数量告警（由持续识别线程实时写入，此处归并到快照）
         new_alarms.extend(self._person_active_locked(lamp_id))
+
+        # 兜底恢复：本轮不活跃的环境类型，把数据库中残留的 active 记录置为已恢复，
+        # 保证进程重启后数据库 status 与内存真实活跃一致（幂等、每轮执行开销极小）。
+        not_active = [t for t in ("temperature", "humidity", "luminance") if t not in active_now]
+        if not_active:
+            database.recover_alarms_for_types(lamp_id, not_active)
         return new_alarms
 
     def check_person(self, lamp_id: str, person_count: int, image: str | None = None) -> list[dict]:
@@ -124,7 +130,7 @@ class AlarmEngine:
                 "direction": "above",
             }
             if (lamp_id, "person") not in self._active:
-                database.insert_alarm(
+                database.update_or_insert_alarm(
                     lamp_id, datetime.now(), "person", person_count, threshold, "above",
                     f"检测到 {int(person_count)} 人，超过告警阈值 {int(threshold)} 人",
                     image=image,

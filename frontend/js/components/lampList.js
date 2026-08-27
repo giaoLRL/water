@@ -42,6 +42,7 @@ window.ViewLampList = {
       handler() {
         this.drawLampMap();
         this.drawAlarmPie();
+        this.drawAlarmTree();
       },
       deep: true,
     },
@@ -49,6 +50,7 @@ window.ViewLampList = {
   mounted() {
     this.drawLampMap();
     this.drawAlarmPie();
+    this.drawAlarmTree();
     this._onResize = () => window.Charts.resizeAll();
     window.addEventListener("resize", this._onResize);
   },
@@ -130,9 +132,66 @@ window.ViewLampList = {
           agg[name] = (agg[name] || 0) + 1;
         });
       });
-      this.alarmItems = Object.keys(agg).map((n) => ({ name: n, value: agg[n] }));
-      if (!document.getElementById("lamp-alarm-pie") || !window.echarts) return;
-      window.Charts.init("lamp-alarm-pie", window.Charts.pieOption(this.alarmItems));
+      this.alarmItems = Object.keys(agg).map((n) => ({ name: n, value: agg[n] }))
+        .sort((x, y) => this.typeOrder(x.name) - this.typeOrder(y.name));
+      const el = document.getElementById("lamp-alarm-pie");
+      if (!el || !window.echarts) return;
+      const colors = this.alarmItems.map((it) => this.typeColor(it.name));
+      const opt = window.Charts.pieOption(this.alarmItems, colors);
+      // 百分比半径（不读运行时宽度，避免初始化错位），由容器高度决定圆的大小
+      opt.series[0].radius = ["30%", "74%"];
+      opt.series[0].center = ["50%", "46%"];
+      window.Charts.init("lamp-alarm-pie", opt);
+    },
+    /* 告警类型固定排序与配色：保证树图与饼图颜色一一对应 */
+    typeOrder(name) {
+      const order = ["人员数量", "空气湿度", "环境温度", "光照强度"];
+      const i = order.indexOf(name);
+      return i === -1 ? 99 : i;
+    },
+    typeColor(name) {
+      const map = {
+        "人员数量": "#f87171",
+        "空气湿度": "#38bdf8",
+        "环境温度": "#2dd4bf",
+        "光照强度": "#fbbf24",
+      };
+      return map[name] || "#a78bfa";
+    },
+    /* 活跃告警矩形树图：类型 → 灯杆 二层铺满，无空白，颜色与饼图对应 */
+    drawAlarmTree() {
+      const el = document.getElementById("lamp-alarm-tree");
+      if (!el || !window.echarts) return;
+      // 两层矩形树：类型 → 各灯杆
+      const byType = {};
+      (this.lamps || []).forEach((l) => {
+        (l.active_alarms || []).forEach((a) => {
+          const t = a.label || a.type || "未知";
+          if (!byType[t]) byType[t] = [];
+          byType[t].push({ name: l.name || l.id, value: 1 });
+        });
+      });
+      const names = Object.keys(byType).sort((x, y) => this.typeOrder(x) - this.typeOrder(y));
+      const data = names.map((t) => ({ name: t, children: byType[t] }));
+      if (!data.length) return;
+      window.Charts.init("lamp-alarm-tree", {
+        tooltip: { backgroundColor: "#1a222d", borderColor: "#2a3442", textStyle: { color: "#d7e0ea" } },
+        series: [{
+          type: "treemap", data,
+          roam: false,
+          breadcrumb: { show: false },
+          label: { show: true, formatter: "{b}", color: "#d7e0ea", fontSize: 11 },
+          upperLabel: { show: false },
+          itemStyle: { borderColor: "#0f151e", borderWidth: 2 },
+          levels: [
+            { itemStyle: { borderColor: "#0f151e", borderWidth: 2, gapWidth: 3 } },
+            { itemStyle: { borderColor: "#0f151e", borderWidth: 1, gapWidth: 2 },
+              label: { show: true, formatter: "{b}", color: "#e6edf3", fontSize: 10 } },
+          ],
+        }],
+        // 与外层类型顺序一致 → 颜色与饼图一一对应
+        color: names.map((n) => this.typeColor(n)),
+      });
     },
   },
   template: `
@@ -158,9 +217,18 @@ window.ViewLampList = {
           <div class="chart map-chart" id="lamp-map-chart"></div>
         </div>
         <div class="section" style="margin-bottom:0;">
-          <h3>活跃告警类型分布</h3>
-          <div class="chart map-chart" id="lamp-alarm-pie" v-show="alarmItems.length"></div>
-          <div class="empty-chart" v-if="!alarmItems.length">暂无活跃告警</div>
+          <h3>活跃告警类型分布与构成</h3>
+          <div class="half-row">
+            <div class="half">
+              <div class="half-title">类型占比</div>
+              <div class="chart alarm-pie" id="lamp-alarm-pie"></div>
+              <div class="empty-chart" v-if="!alarmItems.length">暂无活跃告警</div>
+            </div>
+            <div class="half">
+              <div class="half-title">类型 × 灯杆（占比占满）</div>
+              <div class="chart alarm-tree" id="lamp-alarm-tree"></div>
+            </div>
+          </div>
         </div>
       </div>
 

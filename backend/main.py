@@ -105,11 +105,12 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 
 class NoCacheStaticFiles(StarletteStaticFiles):
-    """静态资源禁用启发式缓存：每次请求都重新验证，避免前端改版后浏览器仍用旧文件。"""
+    """静态资源彻底禁用缓存：no-store 强制不缓存，避免浏览器拿到旧版前端文件。"""
 
     def file_response(self, *args, **kwargs):
         resp = super().file_response(*args, **kwargs)
-        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
         return resp
 
 
