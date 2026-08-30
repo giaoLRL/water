@@ -21,6 +21,7 @@ import infer
 import store
 from alarm import AlarmEngine
 from api import router
+from auth import ensure_admin
 from device import LampManager
 from monitor import DeviceMonitor
 from state import services
@@ -72,6 +73,8 @@ async def collect_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_database()
+    # 首次启动创建默认管理员账号（admin/admin123），已存在则跳过
+    ensure_admin()
     services.lamps = LampManager()
     services.alarm = AlarmEngine()
     services.monitor = DeviceMonitor()
@@ -99,6 +102,17 @@ async def validation_handler(request: Request, exc: RequestValidationError):
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     if request.url.path.startswith("/api"):
+        # 认证/权限错误用专属错误码区分（未登录 40101，无权限 40301）
+        if exc.status_code == 401:
+            return JSONResponse(
+                status_code=200,
+                content={"code": 40101, "msg": f"未登录或登录已过期: {exc.detail}", "data": None},
+            )
+        if exc.status_code == 403:
+            return JSONResponse(
+                status_code=200,
+                content={"code": 40301, "msg": f"无权限执行此操作: {exc.detail}", "data": None},
+            )
         return JSONResponse(
             status_code=200,
             content={"code": 40002, "msg": f"接口不存在或请求错误: {exc.detail}", "data": None},

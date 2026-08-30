@@ -8,10 +8,11 @@ import urllib.error
 from datetime import datetime
 
 import cv2
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import auth
 import config
 import database
 import infer
@@ -46,6 +47,29 @@ class AlarmConfigRequest(BaseModel):
     # 人员数量告警规则
     person_alert_enabled: int | None = Field(default=None, ge=0, le=1)
     person_alert_min: float | None = Field(default=None, ge=1, le=100)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+    role: str = Field(default="viewer", max_length=32)
+
+
+class UserRoleRequest(BaseModel):
+    role: str = Field(min_length=1, max_length=32)
+
+
+class UserPasswordRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserStatusRequest(BaseModel):
+    status: str = Field(pattern="^(active|disabled)$")
 
 
 class SysConfigRequest(BaseModel):
@@ -83,13 +107,13 @@ def _lamp_summary(lamp) -> dict:
 
 # ---------- 灯杆列表与详情 ----------
 @router.get("/lampposts")
-def lampposts():
+def lampposts(_: dict = Depends(auth.require_perm("view_monitor"))):
     lamps = services.lamps.all() if services.lamps else []
     return ok({"lampposts": [_lamp_summary(l) for l in lamps]})
 
 
 @router.get("/lampposts/{lamp_id}")
-def lamppost_detail(lamp_id: str):
+def lamppost_detail(lamp_id: str, _: dict = Depends(auth.require_perm("view_monitor"))):
     try:
         lamp = _get_lamp(lamp_id)
     except LookupError as exc:
@@ -104,6 +128,7 @@ def history(
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
     limit: int = Query(default=5000, ge=1, le=50000),
+    _: dict = Depends(auth.require_perm("view_history")),
 ):
     try:
         _validate_range(start, end)
@@ -118,6 +143,7 @@ def stats(
     lamp_id: str,
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
+    _: dict = Depends(auth.require_perm("view_history")),
 ):
     try:
         _validate_range(start, end)
@@ -128,7 +154,7 @@ def stats(
 
 # ---------- 设备控制（灯光） ----------
 @router.post("/lampposts/{lamp_id}/control")
-def control(lamp_id: str, body: ControlRequest):
+def control(lamp_id: str, body: ControlRequest, _: dict = Depends(auth.require_perm("ctrl_light"))):
     try:
         lamp = _get_lamp(lamp_id)
     except LookupError as exc:
@@ -145,7 +171,7 @@ def control(lamp_id: str, body: ControlRequest):
 
 # ---------- 视频流 ----------
 @router.get("/lampposts/{lamp_id}/video")
-def video(lamp_id: str):
+def video(lamp_id: str, _: dict = Depends(auth.require_perm("view_monitor"))):
     try:
         lamp = _get_lamp(lamp_id)
     except LookupError as exc:
@@ -169,7 +195,7 @@ def video(lamp_id: str):
 
 # ---------- 截图与人员智能监测 ----------
 @router.get("/lampposts/{lamp_id}/snapshot")
-def snapshot(lamp_id: str):
+def snapshot(lamp_id: str, _: dict = Depends(auth.require_perm("view_monitor"))):
     """截图并返回 base64 编码（不触发识别）。"""
     try:
         lamp = _get_lamp(lamp_id)
@@ -186,7 +212,7 @@ def snapshot(lamp_id: str):
 
 
 @router.post("/lampposts/{lamp_id}/detect")
-def detect(lamp_id: str):
+def detect(lamp_id: str, _: dict = Depends(auth.require_perm("view_detect"))):
     """手动截图并调用 AI 识别接口进行人员监测，记录并返回结果。"""
     try:
         lamp = _get_lamp(lamp_id)
@@ -225,7 +251,7 @@ def detect(lamp_id: str):
 
 
 @router.get("/lampposts/{lamp_id}/detect/current")
-def detect_current(lamp_id: str):
+def detect_current(lamp_id: str, _: dict = Depends(auth.require_perm("view_detect"))):
     """返回持续自动识别的最新结果摘要（供前端实时展示人数）。"""
     try:
         lamp = _get_lamp(lamp_id)
@@ -245,7 +271,7 @@ def detect_current(lamp_id: str):
 
 
 @router.get("/lampposts/{lamp_id}/detect_video")
-def detect_video(lamp_id: str):
+def detect_video(lamp_id: str, _: dict = Depends(auth.require_perm("view_detect"))):
     """持续自动识别的标注视频流（MJPEG）。"""
     try:
         lamp = _get_lamp(lamp_id)
@@ -279,13 +305,14 @@ def detections(
     keyword: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=200),
+    _: dict = Depends(auth.require_perm("view_detect")),
 ):
     items, total = database.query_detections(lamp_id, start, end, keyword, page, page_size)
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
 @router.get("/detections/{detection_id}")
-def detection_detail(detection_id: int):
+def detection_detail(detection_id: int, _: dict = Depends(auth.require_perm("view_detect"))):
     row = database.get_detection(detection_id)
     if row is None:
         return err(40004, "监测记录不存在")
@@ -294,13 +321,13 @@ def detection_detail(detection_id: int):
 
 # ---------- 告警 ----------
 @router.get("/alarm/config")
-def alarm_config_get():
+def alarm_config_get(_: dict = Depends(auth.require_perm("view_alarm"))):
     thresholds = services.alarm.thresholds if services.alarm else {}
     return ok({"thresholds": thresholds, "active_count": services.active_count()})
 
 
 @router.post("/alarm/config")
-def alarm_config_set(body: AlarmConfigRequest):
+def alarm_config_set(body: AlarmConfigRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
     updates = body.model_dump(exclude_none=True)
     if not updates:
         return err(40002, "未提供任何阈值")
@@ -321,20 +348,21 @@ def alarms(
     keyword: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=200),
+    _: dict = Depends(auth.require_perm("view_alarm")),
 ):
     items, total = database.query_alarms(lamp_id, start, end, type, status, keyword, page, page_size)
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
 @router.get("/alarm/stats")
-def alarm_stats(lamp_id: str | None = Query(default=None)):
+def alarm_stats(lamp_id: str | None = Query(default=None), _: dict = Depends(auth.require_perm("view_alarm"))):
     """按类型统计告警数量（全库或指定灯杆），供告警分布图使用。"""
     rows = database.query_alarm_stats(lamp_id)
     return ok({"stats": rows})
 
 
 @router.get("/alarms/{alarm_id}")
-def alarm_detail(alarm_id: int):
+def alarm_detail(alarm_id: int, _: dict = Depends(auth.require_perm("view_alarm"))):
     """单条告警详情（含异常情况截图快照图）。"""
     row = database.get_alarm(alarm_id)
     if row is None:
@@ -351,6 +379,7 @@ def logs(
     keyword: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=200),
+    _: dict = Depends(auth.require_perm("view_log")),
 ):
     items, total = database.query_control_log(lamp_id, start, end, keyword, page, page_size)
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
@@ -358,7 +387,7 @@ def logs(
 
 # ---------- 系统配置（配置中心页面） ----------
 @router.get("/sysconfig")
-def sysconfig_get():
+def sysconfig_get(_: dict = Depends(auth.require_perm("cfg_system"))):
     """返回全部可在前端编辑的配置（含当前生效值）。"""
     lamps = services.lamps.all() if services.lamps else []
     return ok({
@@ -376,7 +405,7 @@ def sysconfig_get():
 
 
 @router.post("/sysconfig")
-def sysconfig_set(body: SysConfigRequest):
+def sysconfig_set(body: SysConfigRequest, _: dict = Depends(auth.require_perm("cfg_system"))):
     """分节保存配置：灯杆增量重建 / 服务参数即时生效 / 传感器格式重建灯杆生效。"""
     msgs: list[str] = []
     changed: list[str] = []
@@ -440,7 +469,7 @@ def sysconfig_set(body: SysConfigRequest):
 
 # ---------- 系统状态 ----------
 @router.get("/system")
-def system_status():
+def system_status(_: dict = Depends(auth.require_perm("view_device"))):
     lamps = services.lamps.all() if services.lamps else []
     return ok({
         "lamp_count": len(lamps),
@@ -451,3 +480,139 @@ def system_status():
         "active_alarm_count": services.active_count(),
         "devices": services.device_status(),
     })
+
+
+# ---------- 账号与权限 ----------
+def _user_public(row: dict) -> dict:
+    """用户数据对外脱敏：不返回密码哈希。"""
+    return {k: v for k, v in row.items() if k != "password_hash"}
+
+
+@router.post("/auth/login")
+def login(body: LoginRequest):
+    """登录：校验用户名密码，签发 JWT。"""
+    row = database.get_user(body.username)
+    if row is None or not auth.verify_password(body.password, row["password_hash"]):
+        return err(40006, "用户名或密码错误")
+    if row["status"] != "active":
+        return err(40006, "账号已被禁用")
+    token = auth.make_token(row["username"], row["role"])
+    perms = auth.perms_of(row["role"])
+    return ok({
+        "token": token,
+        "user": {"username": row["username"], "role": row["role"], "perms": perms},
+    })
+
+
+@router.get("/auth/me")
+def auth_me(user: dict = Depends(auth.get_current_user)):
+    """返回当前登录用户信息（前端启动时校验登录态）。"""
+    return ok({"username": user["username"], "role": user["role"],
+               "perms": user["perms"], "role_label": auth.role_label(user["role"])})
+
+
+@router.post("/auth/change_password")
+def change_password(body: UserPasswordRequest, user: dict = Depends(auth.get_current_user)):
+    """当前登录用户修改自己的密码。"""
+    row = database.get_user(user["username"])
+    if row is None:
+        return err(40004, "用户不存在")
+    database.update_user_password(row["id"], auth.hash_password(body.password))
+    return ok({"msg": "密码已修改"})
+
+
+@router.get("/auth/users")
+def auth_users(_: dict = Depends(auth.require_perm("account_manage"))):
+    rows = database.query_users()
+    return ok({"users": [_user_public(r) for r in rows]})
+
+
+@router.post("/auth/users")
+def auth_create_user(body: UserCreateRequest, _: dict = Depends(auth.require_perm("account_manage"))):
+    username = body.username.strip()
+    if not username:
+        return err(40002, "用户名不能为空")
+    if database.get_user(username) is not None:
+        return err(40002, "用户名已存在")
+    if body.role not in auth.role_matrix():
+        return err(40002, f"角色不存在: {body.role}")
+    user_id = database.insert_user(username, auth.hash_password(body.password), body.role)
+    return ok({"id": user_id, "msg": f"已创建用户 {username}"})
+
+
+@router.post("/auth/users/{user_id}/password")
+def auth_reset_password(user_id: int, body: UserPasswordRequest,
+                        _: dict = Depends(auth.require_perm("account_manage"))):
+    """管理员重置指定用户密码。"""
+    database.update_user_password(user_id, auth.hash_password(body.password))
+    return ok({"msg": "密码已重置"})
+
+
+@router.post("/auth/users/{user_id}/role")
+def auth_set_role(user_id: int, body: UserRoleRequest,
+                  _: dict = Depends(auth.require_perm("account_manage"))):
+    if body.role not in auth.role_matrix():
+        return err(40002, f"角色不存在: {body.role}")
+    database.update_user_role(user_id, body.role)
+    return ok({"msg": "角色已更新"})
+
+
+@router.post("/auth/users/{user_id}/status")
+def auth_set_status(user_id: int, body: UserStatusRequest,
+                    user: dict = Depends(auth.require_perm("account_manage"))):
+    rows = database.query_users()
+    target = next((r for r in rows if r["id"] == user_id), None)
+    if target is None:
+        return err(40004, "用户不存在")
+    if target["username"] == user["username"]:
+        return err(40002, "不能禁用自己")
+    if target["username"] == config.ADMIN_USERNAME:
+        return err(40002, "不能禁用管理员账号")
+    database.update_user_status(user_id, body["status"])
+    return ok({"msg": "状态已更新"})
+
+
+@router.delete("/auth/users/{user_id}")
+def auth_delete_user(user_id: int, user: dict = Depends(auth.require_perm("account_manage"))):
+    rows = database.query_users()
+    target = next((r for r in rows if r["id"] == user_id), None)
+    if target is None:
+        return err(40004, "用户不存在")
+    if target["username"] == user["username"]:
+        return err(40002, "不能删除自己")
+    if target["username"] == config.ADMIN_USERNAME:
+        return err(40002, "不能删除管理员账号")
+    database.delete_user(user_id)
+    return ok({"msg": "用户已删除"})
+
+
+@router.get("/auth/roles")
+def auth_roles(_: dict = Depends(auth.require_perm("account_manage"))):
+    """返回权限点定义与角色矩阵（供前端矩阵勾选）。"""
+    return ok({
+        "permissions": auth.PERMISSIONS,
+        "roles": auth.role_matrix(),
+    })
+
+
+@router.post("/auth/roles")
+def auth_save_roles(body: dict, user: dict = Depends(auth.require_perm("account_manage"))):
+    """保存角色矩阵：{角色: [权限key, ...]} 或 {角色: (显示名, 权限列表)}。"""
+    matrix = {}
+    for key, val in body.get("roles", {}).items():
+        if not str(key).strip():
+            continue
+        if isinstance(val, (list, tuple)):
+            matrix[str(key)] = [str(v) for v in val]
+        elif isinstance(val, dict):
+            label = val.get("label", key)
+            plist = val.get("perms")
+            matrix[str(key)] = [label, "*" if plist == "*" else [str(p) for p in (plist or [])]]
+        else:
+            return err(40002, f"角色 {key} 格式错误")
+    # 安全兜底：admin 角色必须存在且拥有全部权限
+    matrix.setdefault("admin", auth.DEFAULT_ROLES["admin"])
+    if matrix.get("admin") != auth.DEFAULT_ROLES["admin"]:
+        matrix["admin"] = auth.DEFAULT_ROLES["admin"]
+    auth.save_role_matrix(matrix)
+    return ok({"msg": "角色矩阵已保存", "roles": auth.role_matrix()})

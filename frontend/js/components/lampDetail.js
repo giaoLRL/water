@@ -83,11 +83,19 @@ window.ViewLampDetail = {
     },
   },
   mounted() {
-    this.tab = this.initialTab || "monitor";
+    // 初始 tab 无权限时回退到实时监控
+    const canTab = {
+      monitor: true,
+      history: this.perm("view_history"),
+      alarm: this.perm("view_alarm"),
+      detections: this.perm("view_detect"),
+      logs: this.perm("view_log"),
+    };
+    this.tab = canTab[this.initialTab] ? this.initialTab : "monitor";
     this.loadAll();
     this.timer = setInterval(() => {
       this.fetchLamp();
-      this.fetchDetectCurrent();
+      if (this.perm("view_detect")) this.fetchDetectCurrent();
     }, 2000);
   },
   beforeUnmount() {
@@ -98,6 +106,9 @@ window.ViewLampDetail = {
       const d = new Date(s);
       const p = (n) => String(n).padStart(2, "0");
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    },
+    perm(p) {
+      return window.Auth ? window.Auth.has(p) : false;
     },
     fmtSmoke(v) {
       if (v == null) return "--";
@@ -426,21 +437,23 @@ window.ViewLampDetail = {
         <span class="desc">{{ lamp.location }}</span>
         <span class="lamp-dot" :class="lamp.light_state === 'on' ? 'on' : 'off'"></span>
         <div class="detail-controls">
-          <!-- 灯光滑块：关→只能开，开→只能关 -->
-          <label class="toggle" :class="{ on: lamp.light_state === 'on' }">
-            <input type="checkbox" :checked="lamp.light_state === 'on'" :disabled="lightBusy" @change="onLightToggle">
-            <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          </label>
-          <span class="toggle-state">{{ lamp.light_state === 'on' ? '灯光已开' : '灯光已关' }}</span>
+          <template v-if="perm('ctrl_light')">
+            <!-- 灯光滑块：关→只能开，开→只能关 -->
+            <label class="toggle" :class="{ on: lamp.light_state === 'on' }">
+              <input type="checkbox" :checked="lamp.light_state === 'on'" :disabled="lightBusy" @change="onLightToggle">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+            <span class="toggle-state">{{ lamp.light_state === 'on' ? '灯光已开' : '灯光已关' }}</span>
+          </template>
+          <span v-else class="toggle-state" style="color:var(--text-dim);">无灯光控制权限</span>
         </div>
-      </div>
 
       <div class="tabs">
         <span class="tab" :class="{ active: tab === 'monitor' }" @click="setTab('monitor')">实时监控</span>
-        <span class="tab" :class="{ active: tab === 'history' }" @click="setTab('history')">历史数据</span>
-        <span class="tab" :class="{ active: tab === 'alarm' }" @click="setTab('alarm')">告警记录</span>
-        <span class="tab" :class="{ active: tab === 'detections' }" @click="setTab('detections')">人员监测</span>
-        <span class="tab" :class="{ active: tab === 'logs' }" @click="setTab('logs')">操作日志</span>
+        <span class="tab" v-if="perm('view_history')" :class="{ active: tab === 'history' }" @click="setTab('history')">历史数据</span>
+        <span class="tab" v-if="perm('view_alarm')" :class="{ active: tab === 'alarm' }" @click="setTab('alarm')">告警记录</span>
+        <span class="tab" v-if="perm('view_detect')" :class="{ active: tab === 'detections' }" @click="setTab('detections')">人员监测</span>
+        <span class="tab" v-if="perm('view_log')" :class="{ active: tab === 'logs' }" @click="setTab('logs')">操作日志</span>
       </div>
 
       <!-- 实时监控 -->
@@ -549,7 +562,7 @@ window.ViewLampDetail = {
 
       <!-- 告警记录：告警配置 + 规则 + 记录列表（筛选/分页） -->
       <div v-show="tab === 'alarm'">
-        <div class="section">
+        <div class="section" v-if="perm('cfg_alarm')">
           <h3>环境参数告警阈值 <span class="desc">温度 / 湿度 / 光照 / 烟雾上下限 · 超限触发告警</span></h3>
           <div class="alarm-rule">
             <label class="rule-item"><span>温度上限 ℃</span><input type="number" v-model.number="thresholds.temp_max"></label>
@@ -563,7 +576,7 @@ window.ViewLampDetail = {
             <button class="btn-primary" @click="saveEnvRule">保存环境阈值</button>
           </div>
         </div>
-        <div class="section">
+        <div class="section" v-if="perm('cfg_alarm')">
           <h3>人数告警规则 <span class="desc">识别到的人数达到阈值即告警</span></h3>
           <div class="alarm-rule">
             <label class="rule-item">

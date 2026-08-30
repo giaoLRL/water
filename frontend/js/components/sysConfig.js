@@ -1,4 +1,4 @@
-/* 系统配置视图：灯杆管理 + 服务接口参数 + 传感器格式映射，修改即时生效、无需改代码。 */
+/* 系统配置视图：灯杆管理 + 服务接口参数 + 传感器格式映射 + 账号与权限，修改即时生效。 */
 window.ViewSysConfig = {
   name: "SysConfigView",
   emits: ["back"],
@@ -7,6 +7,15 @@ window.ViewSysConfig = {
       loading: true,
       saving: false,
       showSpec: false,   // 接口数据格式说明展开/收起
+      // 账号与权限
+      users: [],
+      permsList: [],            // [[key, label], ...]
+      roleMatrix: {},           // {role: [label, perms[]] }
+      newUser: { username: "", password: "", role: "viewer" },
+      rolePerms: {},            // 勾选态 {role: {permKey: bool}}（仅非 admin）
+      newRoleKey: "",
+      newRoleLabel: "",
+      pwd: { old: "", new: "", new2: "" },   // 修改自己的密码
       // 灯杆管理
       lampSeeds: [ { id: "", name: "", location: "", rtsp_url: "", sensor_url: "", esp32_base: "", cfgStr: "" } ],
       // 服务接口参数
@@ -39,11 +48,26 @@ window.ViewSysConfig = {
         return p;
       });
     },
+    roleRows() {
+      // 矩阵表格行：角色 key + 显示名 + 权限列表（可编辑的勾选态）
+      return Object.keys(this.roleMatrix).map((key) => {
+        const item = this.roleMatrix[key];
+        const label = Array.isArray(item) && item.length ? item[0] : key;
+        const perms = Array.isArray(item) && item.length > 1 && Array.isArray(item[1]) ? item[1] : [];
+        return { key, label, perms: perms.slice() };
+      });
+    },
+    canManageAccount() {
+      return window.Auth ? window.Auth.has("account_manage") : false;
+    },
   },
   mounted() {
     this.load();
   },
   methods: {
+    perm(p) {
+      return window.Auth ? window.Auth.has(p) : false;
+    },
     async load() {
       this.loading = true;
       try {
@@ -65,6 +89,10 @@ window.ViewSysConfig = {
         this.monitor = { interval: d.monitor_interval, timeout: d.monitor_timeout };
         this.lampCtrlDefault = { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status", ...d.lamp_ctrl_default };
         this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", ...d.sensor_fields };
+        // 账号与权限（有管理权限才拉取）
+        if (this.canManageAccount) {
+          await this.loadAccount();
+        }
       } catch (e) {
         this.showMsg(e.message, "error");
       } finally {
@@ -133,6 +161,130 @@ window.ViewSysConfig = {
         this.showMsg(e.message, "error");
       } finally {
         this.saving = false;
+      }
+    },
+    // ---- 账号与权限 ----
+    async loadAccount() {
+      try {
+        const [u, r] = await Promise.all([API.users(), API.roles()]);
+        this.users = u.users || [];
+        this.permsList = (r.permissions || []).map((p) => (Array.isArray(p) ? p : [p, p]));
+        this.roleMatrix = r.roles || {};
+      } catch (e) { /* silent */ }
+    },
+    roleLabel(key) {
+      const item = this.roleMatrix[key];
+      if (Array.isArray(item) && item.length) return item[0];
+      return key;
+    },
+    roleHas(key, perm) {
+      const item = this.roleMatrix[key];
+      if (!Array.isArray(item) || item.length < 2) return false;
+      if (!Array.isArray(item[1])) return false;
+      return item[1].includes(perm);
+    },
+    toggleRolePerm(key, perm) {
+      const item = this.roleMatrix[key];
+      if (!Array.isArray(item) || item.length < 2 || !Array.isArray(item[1])) return;
+      const list = item[1];
+      if (list.includes(perm)) item[1] = list.filter((p) => p !== perm);
+      else item[1] = list.concat([perm]);
+      // 触发视图更新
+      this.roleMatrix = Object.assign({}, this.roleMatrix);
+    },
+    async saveRolesMatrix() {
+      const roles = {};
+      for (const row of this.roleRows) {
+        const item = this.roleMatrix[row.key];
+        const perms = Array.isArray(item) && item.length > 1 && Array.isArray(item[1]) ? item[1] : [];
+        roles[row.key] = { label: row.label, perms };
+      }
+      this.saving = true;
+      try {
+        const d = await API.saveRoles(roles);
+        this.roleMatrix = d.roles;
+        this.showMsg("角色矩阵已保存", "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+      }
+    },
+    addRole() {
+      const key = String(this.newRoleKey || "").trim();
+      const label = String(this.newRoleLabel || "").trim() || key;
+      if (!key) { this.showMsg("请输入角色标识（英文/数字）", "error"); return; }
+      if (this.roleMatrix[key]) { this.showMsg("角色已存在", "error"); return; }
+      this.roleMatrix[key] = [label, []];
+      this.roleMatrix = Object.assign({}, this.roleMatrix);
+      this.newRoleKey = "";
+      this.newRoleLabel = "";
+      this.showMsg(`已新增角色 ${key}（点击下方勾选权限后保存生效）`, "ok");
+    },
+    async createUser() {
+      const u = String(this.newUser.username || "").trim();
+      const p = this.newUser.password || "";
+      if (!u || !p) { this.showMsg("请填写用户名和密码", "error"); return; }
+      if (!this.roleMatrix[this.newUser.role]) { this.showMsg("角色不存在", "error"); return; }
+      this.saving = true;
+      try {
+        await API.createUser({ username: u, password: p, role: this.newUser.role });
+        this.showMsg("用户已创建", "ok");
+        this.newUser = { username: "", password: "", role: "viewer" };
+        await this.loadAccount();
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+      }
+    },
+    async resetPwd(user) {
+      const p = window.prompt(`输入 ${user.username} 的新密码：`);
+      if (p == null) return;
+      if (!p.trim()) { this.showMsg("密码不能为空", "error"); return; }
+      try {
+        await API.resetPassword(user.id, p.trim());
+        this.showMsg("密码已重置", "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      }
+    },
+    async toggleUserStatus(user) {
+      const next = user.status === "active" ? "disabled" : "active";
+      try {
+        await API.setUserStatus(user.id, next);
+        await this.loadAccount();
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      }
+    },
+    async removeUser(user) {
+      if (!window.confirm(`确认删除用户 ${user.username}？`)) return;
+      try {
+        await API.deleteUser(user.id);
+        this.showMsg("用户已删除", "ok");
+        await this.loadAccount();
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      }
+    },
+    async setUserRole(user, role) {
+      try {
+        await API.setUserRole(user.id, role);
+        this.showMsg(`已将 ${user.username} 设为角色「${this.roleLabel(role)}」`, "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      }
+    },
+    async savePwd() {
+      if (!this.pwd.new) { this.showMsg("请输入新密码", "error"); return; }
+      if (this.pwd.new !== this.pwd.new2) { this.showMsg("两次输入的新密码不一致", "error"); return; }
+      try {
+        await API.changePassword(this.pwd.new);
+        this.pwd = { old: "", new: "", new2: "" };
+        this.showMsg("密码已修改", "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
       }
     },
     showMsg(t, type) {
@@ -299,6 +451,97 @@ window.ViewSysConfig = {
         </div>
         <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..} 为默认，
         若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾字段可选（无 MQ-2 的设备留空即可，自动回退默认）。保存后灯杆会重建以立即采用新格式。</div>
+      </div>
+
+      <!-- 账号与权限 -->
+      <div class="section" v-if="perm('account_manage')">
+        <h3>账号与权限 <span class="desc">用户管理 + 角色权限矩阵，逐项勾选即时生效</span></h3>
+
+        <!-- 修改自己的密码 -->
+        <div class="alarm-rule" style="margin-bottom:14px;">
+          <span class="desc" style="flex:1;">修改我的密码</span>
+          <label class="rule-item cfg-item"><span>新密码</span>
+            <input class="cfg-input" style="width:140px;" type="password" v-model="pwd.new"></label>
+          <label class="rule-item cfg-item"><span>确认密码</span>
+            <input class="cfg-input" style="width:140px;" type="password" v-model="pwd.new2"></label>
+          <button class="btn-ghost" :disabled="saving" @click="savePwd">修改密码</button>
+        </div>
+
+        <!-- 用户列表 -->
+        <h4 class="sub-head">用户列表</h4>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="u in users" :key="u.id">
+                <td>{{ u.id }}</td>
+                <td>{{ u.username }}</td>
+                <td>
+                  <select class="cfg-input" style="width:110px;" :disabled="u.username === 'admin'" :value="u.role" @change="setUserRole(u, $event.target.value)">
+                    <option v-for="rk in Object.keys(roleMatrix)" :key="rk" :value="rk">{{ roleLabel(rk) }}</option>
+                  </select>
+                </td>
+                <td><span class="badge" :class="u.status === 'active' ? 'ok' : 'fail'">{{ u.status === 'active' ? '正常' : '已禁用' }}</span></td>
+                <td>{{ u.created_at }}</td>
+                <td>
+                  <button class="btn-ghost" @click="resetPwd(u)">重置密码</button>
+                  <button class="btn-ghost" :disabled="u.username === 'admin'" @click="toggleUserStatus(u)">{{ u.status === 'active' ? '禁用' : '启用' }}</button>
+                  <button class="btn-ghost" style="color:var(--danger);" :disabled="u.username === 'admin'" @click="removeUser(u)">删除</button>
+                </td>
+              </tr>
+              <tr v-if="!users.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无用户</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- 新增用户 -->
+        <div class="alarm-rule" style="margin-top:10px;">
+          <span class="desc" style="flex:1;">新增用户</span>
+          <input class="cfg-input" style="width:120px;" v-model="newUser.username" placeholder="用户名">
+          <input class="cfg-input" style="width:120px;" type="password" v-model="newUser.password" placeholder="初始密码">
+          <select class="cfg-input" style="width:110px;" v-model="newUser.role">
+            <option v-for="rk in Object.keys(roleMatrix).filter(r => r !== 'admin')" :key="rk" :value="rk">{{ roleLabel(rk) }}</option>
+          </select>
+          <button class="btn-primary" :disabled="saving" @click="createUser">创建用户</button>
+        </div>
+
+        <!-- 角色权限矩阵 -->
+        <h4 class="sub-head">角色权限矩阵 <span class="desc">勾选权限点（账号重登录后生效）</span></h4>
+        <div class="matrix-wrap">
+          <table class="perm-matrix">
+            <thead>
+              <tr>
+                <th class="matrix-role-col">角色 \\ 权限</th>
+                <th v-for="(p, pi) in permsList" :key="p[0]" :title="p[1]">{{ p[1] }}</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in roleRows" :key="row.key">
+                <td class="matrix-role-col">
+                  <b>{{ row.label }}</b>
+                  <span class="matrix-role-key">{{ row.key }}</span>
+                  <em v-if="row.key === 'admin'" class="role-tag">全权限</em>
+                </td>
+                <td v-for="(p, pi) in permsList" :key="p[0]" class="matrix-cell">
+                  <input v-if="row.key !== 'admin'" type="checkbox"
+                    :checked="roleHas(row.key, p[0])" @change="toggleRolePerm(row.key, p[0])">
+                  <span v-else class="matrix-all">✓</span>
+                </td>
+                <td class="matrix-note">
+                  <span v-if="row.key === 'admin'">管理员必为全权限，不可修改</span>
+                  <span v-else>{{ row.perms.length }}/{{ permsList.length }} 项</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-actions" style="margin-top:10px;">
+          <input class="cfg-input" style="width:110px;" v-model="newRoleKey" placeholder="角色标识(如 guard)">
+          <input class="cfg-input" style="width:110px;" v-model="newRoleLabel" placeholder="角色名(如 安保)">
+          <button class="btn-ghost" @click="addRole">+ 新增角色</button>
+          <button class="btn-primary" :disabled="saving" @click="saveRolesMatrix">保存角色矩阵</button>
+          <span class="desc">已登录用户需重新登录后按新权限生效</span>
+        </div>
       </div>
 
       <div class="note" style="margin-top:6px;">

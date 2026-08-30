@@ -50,6 +50,7 @@ _TABLE_COLUMNS = {
     "person_detections": {"lamp_id", "ts", "person_count", "max_confidence", "original_image", "processed_image"},
     "control_log": {"lamp_id", "ts", "action", "result", "detail"},
     "config": {"config_key", "value"},
+    "users": {"username", "password_hash", "role", "status"},
 }
 
 # 业务表的新增列：存在表结构时温和补列（不删表），避免丢失历史数据
@@ -211,6 +212,21 @@ def init_database() -> None:
                     "INSERT IGNORE INTO config (config_key, value) VALUES (%s, %s)",
                     (key, str(value)),
                 )
+            # 账号表
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    username      VARCHAR(64) NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    role          VARCHAR(32) NOT NULL DEFAULT 'viewer',
+                    status        VARCHAR(16) NOT NULL DEFAULT 'active',
+                    created_at    DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_username (username)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
     finally:
         conn.close()
 
@@ -598,5 +614,95 @@ def query_stats(lamp_id: str, start: str, end: str) -> dict:
                 "max_luminance": round(row["max_luminance"], 1) if row["max_luminance"] is not None else None,
                 "sample_count": row["sample_count"] or 0,
             }
+    finally:
+        conn.close()
+
+
+# ---------- 账号（users 表） ----------
+def count_users() -> int:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM users")
+            return cur.fetchone()["n"] or 0
+    finally:
+        conn.close()
+
+
+def get_user(username: str) -> dict | None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash, role, status, "
+                "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at "
+                "FROM users WHERE username=%s",
+                (username,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def insert_user(username: str, password_hash: str, role: str) -> int:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, password_hash, role, status, created_at) "
+                "VALUES (%s, %s, %s, 'active', %s)",
+                (username, password_hash, role, datetime.now()),
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_user_password(user_id: int, password_hash: str) -> None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (password_hash, user_id))
+    finally:
+        conn.close()
+
+
+def update_user_role(user_id: int, role: str) -> None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET role=%s WHERE id=%s", (role, user_id))
+    finally:
+        conn.close()
+
+
+def update_user_status(user_id: int, status: str) -> None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
+    finally:
+        conn.close()
+
+
+def delete_user(user_id: int) -> None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE id=%s", (user_id,))
+    finally:
+        conn.close()
+
+
+def query_users() -> list[dict]:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, role, status, "
+                "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at "
+                "FROM users ORDER BY id ASC",
+            )
+            return list(cur.fetchall())
     finally:
         conn.close()

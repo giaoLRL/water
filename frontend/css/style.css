@@ -330,6 +330,73 @@ header h1 { font-size: 15px; font-weight: 600; color: var(--text); letter-spacin
 .auto-mode input[type=number]:focus { border-color: var(--accent); outline: none; }
 .note { font-size: 11px; color: var(--text-dim); margin-top: 10px; }
 
+/* ===== 登录页 ===== */
+.login-wrap {
+  min-height: 100vh;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(1200px 600px at 50% -10%, #101826 0%, var(--bg) 55%);
+  padding: 20px;
+}
+.login-card {
+  width: 380px; max-width: 94vw;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 30px 28px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.login-logo { color: var(--accent); margin-bottom: 6px; }
+.login-card h2 { font-size: 17px; font-weight: 600; line-height: 1.4; }
+.login-sub { font-size: 12px; color: var(--text-dim); margin-bottom: 16px; }
+.login-input {
+  width: 100%;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-size: 14px;
+  color: var(--text);
+  margin-bottom: 12px;
+}
+.login-input:focus { border-color: var(--accent); outline: none; }
+.login-btn { width: 100%; padding: 10px 0; font-size: 14px; }
+.login-tip { font-size: 11px; color: var(--text-dim); margin-top: 12px; text-align: center; }
+
+/* ===== 顶部权限提示条 ===== */
+.auth-tip {
+  position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+  z-index: 99;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-size: 12px;
+  padding: 6px 16px;
+  border-radius: 4px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+.no-perm {
+  padding: 60px 0; text-align: center;
+  color: var(--text-dim); font-size: 14px;
+  border: 1px dashed var(--border); border-radius: var(--radius);
+}
+.user-chip .role-tag { font-style: normal; font-size: 10px; color: var(--accent); margin-left: 4px; }
+
+/* ===== 账号与权限矩阵 ===== */
+.sub-head {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  margin: 14px 0 8px;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.matrix-wrap { overflow-x: auto; }
+.perm-matrix { border: 1px solid var(--border-soft); }
+.perm-matrix th, .perm-matrix td { border-bottom: 1px solid var(--border-soft); text-align: center; }
+.perm-matrix .matrix-role-col { text-align: left; }
+.perm-matrix .matrix-role-key { font-family: var(--mono); font-size: 10px; color: var(--text-dim); margin-left: 6px; }
+.perm-matrix .matrix-cell { min-width: 46px; }
+.perm-matrix .matrix-all { color: var(--ok); }
+.perm-matrix .matrix-note { font-size: 11px; color: var(--text-dim); min-width: 120px; }
+.perm-matrix input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+
 /* ===== 表格 ===== */
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }

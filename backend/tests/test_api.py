@@ -1,6 +1,7 @@
-"""后端接口功能测试：覆盖灯杆实时/详情/历史/统计/控制/告警/人员监测/系统状态/日志。
+"""后端接口功能测试：覆盖账号/权限、灯杆实时/详情/历史/统计/控制/告警/人员监测/系统状态/日志。
 
 用法: python backend/tests/test_api.py [base_url]（缺省 http://127.0.0.1:8000）
+说明: 使用默认管理员 admin/admin123 登录后对所有业务接口鉴权访问。
 """
 import json
 import sys
@@ -11,21 +12,31 @@ import urllib.request
 from datetime import datetime, timedelta
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+ADMIN = ("admin", "admin123")
 
 passed = 0
 failed = 0
+TOKEN = ""
 
 
-def request(method: str, path: str, body: dict | None = None) -> dict:
+def request_raw(method: str, path: str, body: dict | None = None, token: str | None = None) -> dict:
     data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(
         BASE + path,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method=method,
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def request(method: str, path: str, body: dict | None = None, token: str | None = None) -> dict:
+    """带当前登录 token 的请求。"""
+    return request_raw(method, path, body, token or TOKEN)
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -43,6 +54,48 @@ def now_fmt(offset_minutes: int = 0) -> str:
 
 
 def main() -> None:
+    global TOKEN
+    print("== 0. 账号与权限 ==")
+    # 未登录访问被拒
+    r = request_raw("GET", "/api/lampposts")
+    check("未登录访问返回 40101", r["code"] == 40101, str(r))
+    # 错误密码
+    r = request_raw("POST", "/api/auth/login", {"username": "admin", "password": "wrong"})
+    check("错误密码登录失败", r["code"] == 40006, str(r))
+    # 管理员登录
+    r = request_raw("POST", "/api/auth/login", {"username": ADMIN[0], "password": ADMIN[1]})
+    check("admin 登录成功", r["code"] == 0 and "token" in r["data"], str(r))
+    TOKEN = r["data"]["token"]
+    check("admin 拥有全权限", "account_manage" in r["data"]["user"]["perms"], str(r["data"]["user"]["perms"]))
+    # 当前用户
+    r = request("GET", "/api/auth/me")
+    check("auth/me 返回当前用户", r["code"] == 0 and r["data"]["username"] == "admin", str(r))
+    # 用户管理
+    test_user = f"tester{int(time.time())}"
+    r = request("POST", "/api/auth/users", {"username": test_user, "password": "t123456", "role": "viewer"})
+    check("创建用户成功", r["code"] == 0, str(r))
+    r = request("POST", "/api/auth/users", {"username": ADMIN[0], "password": "x", "role": "viewer"})
+    check("重复用户名被拒", r["code"] == 40002, str(r))
+    r = request("GET", "/api/auth/users")
+    users = r["data"]["users"]
+    check("用户列表不含密码哈希", all("password_hash" not in u for u in users), str(users[:1]))
+    # 权限矩阵
+    r = request("GET", "/api/auth/roles")
+    check("角色矩阵可读", r["code"] == 0 and "admin" in r["data"]["roles"], str(r))
+
+    print("== 0.1 权限拦截（viewer 无 ctrl_light） ==")
+    r = request_raw("POST", "/api/auth/login", {"username": test_user, "password": "t123456"})
+    viewer_token = r["data"]["token"]
+    r = request_raw("GET", "/api/lampposts", token=viewer_token)
+    check("viewer 可看监控(view_monitor)", r["code"] == 0, str(r))
+    r = request_raw("POST", f"/api/lampposts/{r['data']['lampposts'][0]['id']}/control",
+                    {"action": "on"}, token=viewer_token)
+    check("viewer 开灯被拒 40301", r["code"] == 40301, str(r))
+    r = request_raw("GET", "/api/sysconfig", token=viewer_token)
+    check("viewer 访问配置被拒 40301", r["code"] == 40301, str(r))
+    r = request_raw("GET", "/api/auth/users", token=viewer_token)
+    check("viewer 访问账号管理被拒 40301", r["code"] == 40301, str(r))
+
     print("== 1. 灯杆列表与详情 ==")
     rt = request("GET", "/api/lampposts")
     check("lampposts 返回 code=0", rt["code"] == 0, str(rt))
@@ -95,7 +148,7 @@ def main() -> None:
 
     print("== 7. 人员监测记录 ==")
     r = request("GET", f"/api/detections?lamp_id={lamp_id}")
-    check("监测记录可查询", r["code"] == 0 and isinstance(r["data"]["detections"], list), str(r))
+    check("监测记录可查询", r["code"] == 0 and isinstance(r["data"]["items"], list), str(r))
 
     print("== 8. 告警配置与日志 ==")
     r = request("GET", "/api/alarm/config")
@@ -103,13 +156,24 @@ def main() -> None:
     r = request("POST", "/api/alarm/config", {"temp_max": 50.0, "humidity_min": 10.0})
     check("保存阈值成功", r["code"] == 0 and r["data"]["thresholds"]["temp_max"] == 50.0, str(r))
     r = request("GET", "/api/alarms")
-    check("告警日志可查询", r["code"] == 0 and isinstance(r["data"]["alarms"], list), str(r))
+    check("告警日志可查询", r["code"] == 0 and isinstance(r["data"]["items"], list), str(r))
+    r = request("GET", "/api/alarm/stats")
+    check("告警统计可查询", r["code"] == 0 and isinstance(r["data"]["stats"], list), str(r))
 
     print("== 9. 操作日志与系统状态 ==")
     r = request("GET", f"/api/logs?lamp_id={lamp_id}")
-    check("操作日志返回", r["code"] == 0 and isinstance(r["data"]["logs"], list), str(r))
+    check("操作日志返回", r["code"] == 0 and isinstance(r["data"]["items"], list), str(r))
     r = request("GET", "/api/system")
     check("系统状态返回", r["code"] == 0 and "lamp_count" in r["data"] and "server_time" in r["data"], str(r))
+    r = request("GET", "/api/sysconfig")
+    check("系统配置可读取(cfg_system)", r["code"] == 0 and "lamp_posts" in r["data"], str(r))
+
+    print("== 10. 账号清理 ==")
+    tr = request_raw("POST", "/api/auth/login", {"username": test_user, "password": "t123456"})
+    me = request("GET", f"/api/auth/users", token=TOKEN)
+    tid = next((u["id"] for u in me["data"]["users"] if u["username"] == test_user), None)
+    r = request("DELETE", f"/api/auth/users/{tid}")
+    check("删除测试用户", r["code"] == 0, str(r))
 
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)

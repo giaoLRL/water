@@ -70,6 +70,12 @@ INFER_URL = _env("LAMP_INFER_URL", "http://127.0.0.1:5000/infer")
 INFER_TIMEOUT = _env_float("LAMP_INFER_TIMEOUT", 60.0)
 PERSON_DETECT_INTERVAL = _env_float("LAMP_PERSON_DETECT_INTERVAL", 5.0)
 
+# ---------- 账号与令牌 ----------
+JWT_SECRET = _env("IOT_JWT_SECRET", "iot-smart-lamp-secret")
+TOKEN_TTL = _env_int("IOT_TOKEN_TTL", 12 * 3600)          # 令牌有效期（秒），默认 12 小时
+ADMIN_USERNAME = _env("IOT_ADMIN_USER", "admin")
+ADMIN_DEFAULT_PASSWORD = _env("IOT_ADMIN_PASSWORD", "admin123")   # 首次登录后请尽快修改
+
 # ---------- 告警阈值默认值 ----------
 DEFAULT_THRESHOLDS = {
     "temp_max": 38.0,

@@ -61,6 +61,9 @@ window.ViewLampList = {
     open(id) {
       this.$emit("open", id);
     },
+    perm(p) {
+      return window.Auth ? window.Auth.has(p) : false;
+    },
     fmtLux(v) {
       if (v == null) return "--";
       if (v >= 1000) return (v / 1000).toFixed(1) + "k";
@@ -239,7 +242,7 @@ window.ViewLampList = {
         </div>
       </div>
 
-      <div class="section" style="margin-bottom:14px;">
+      <div class="section" v-if="perm('view_device')" style="margin-bottom:14px;">
         <h3>设备在线状态 <span class="desc">按接口返回情况实时检测</span></h3>
         <div class="device-status">
           <div class="device-group" v-for="g in devices" :key="g.group">
