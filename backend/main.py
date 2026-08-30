@@ -50,6 +50,8 @@ def _collect_lamp(lamp) -> None:
     frame = lamp.video.get_frame()
     image = infer.frame_to_dataurl(frame) if frame is not None else None
     active = services.alarm.check(lamp.id, sensors, image=image)
+    # 设备不在线告警：指标/传感器掉线本身即告警，全部在线自动恢复
+    active.extend(services.alarm.check_offline(lamp.id, snap, image=image))
     services.set_lamp_alarms(lamp.id, active)
     # 周期性读回真实灯状态（ESP32），保持页面显示与物理一致
     lamp.sync_light()

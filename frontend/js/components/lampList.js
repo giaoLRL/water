@@ -155,7 +155,7 @@ window.ViewLampList = {
     },
     /* 告警类型固定排序与配色：保证树图与饼图颜色一一对应 */
     typeOrder(name) {
-      const order = ["人员数量", "空气湿度", "环境温度", "光照强度", "烟雾浓度"];
+      const order = ["人员数量", "空气湿度", "环境温度", "光照强度", "烟雾浓度", "设备离线"];
       const i = order.indexOf(name);
       return i === -1 ? 99 : i;
     },
@@ -166,6 +166,7 @@ window.ViewLampList = {
         "环境温度": "#2dd4bf",
         "光照强度": "#fbbf24",
         "烟雾浓度": "#f472b6",
+        "设备离线": "#a78bfa",
       };
       return map[name] || "#a78bfa";
     },

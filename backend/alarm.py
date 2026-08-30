@@ -123,6 +123,52 @@ class AlarmEngine:
             database.recover_alarms_for_types(lamp_id, not_active)
         return new_alarms
 
+    def check_offline(self, lamp_id: str, snap: dict, image: str | None = None) -> list[dict]:
+        """设备不在线告警：设备/指标掉线本身即告警（非数值异常）。
+
+        - esp32 灯杆：温湿度(sensor_online)、光照(light_online)、烟雾(smoke_online)
+          任一明确离线(False)即告警；检测中(None)不告警
+        - 视频流离线(video_online is False)也告警
+        - 全部设备在线时自动恢复
+        - 未配置真实传感器的灯杆（sim）不产生离线告警
+        """
+        with self._lock:
+            offline: list[str] = []
+            if snap.get("sensor_source") == "esp32":
+                if snap.get("sensor_online") is False:
+                    offline.append("温湿度")
+                if snap.get("light_online") is False:
+                    offline.append("光照")
+                if snap.get("smoke_online") is False:
+                    offline.append("烟雾")
+            if snap.get("video_online") is False:
+                offline.append("视频")
+
+            key = "device_offline"
+            if offline:
+                message = "、".join(f"{n}不在线" for n in offline)
+                item = {
+                    "lamp_id": lamp_id,
+                    "type": key,
+                    "label": "设备离线",
+                    "value": round(float(len(offline)), 2),
+                    "threshold": 1.0,
+                    "direction": "above",
+                    "message": message,
+                }
+                if (lamp_id, key) not in self._active:
+                    database.update_or_insert_alarm(
+                        lamp_id, datetime.now(), key, item["value"], item["threshold"],
+                        "above", message, image=image,
+                    )
+                self._active[(lamp_id, key)] = item
+                return [item]
+            # 全部在线：恢复已有离线告警
+            if (lamp_id, key) in self._active:
+                database.recover_alarm(lamp_id, key)
+                del self._active[(lamp_id, key)]
+            return []
+
     def check_person(self, lamp_id: str, person_count: int, image: str | None = None) -> list[dict]:
         """按前端自定义规则检查人数告警；返回该灯杆当前人员活跃告警。"""
         with self._lock:

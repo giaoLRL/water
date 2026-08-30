@@ -168,6 +168,31 @@ def main() -> None:
     r = request("GET", "/api/sysconfig")
     check("系统配置可读取(cfg_system)", r["code"] == 0 and "lamp_posts" in r["data"], str(r))
 
+    print("== 9.1 设备不在线告警 ==")
+    sfc = request("GET", "/api/sysconfig")
+    posts = sfc["data"]["lamp_posts"]
+    target = next(p for p in posts if p["id"] == lamp_id)
+    orig_url = target.get("sensor_url", "")
+    try:
+        # 把传感器地址改成不可达 → 全部指标离线 → 产生 device_offline 告警
+        target["sensor_url"] = "http://127.0.0.1:1/api/data"
+        r = request("POST", "/api/sysconfig", {"lamp_posts": posts})
+        check("保存不可达传感器地址", r["code"] == 0, str(r))
+        time.sleep(7)
+        r = request("GET", f"/api/alarms?lamp_id={lamp_id}&type=device_offline&status=active")
+        items = r["data"]["items"]
+        check("设备不在线告警已产生", r["code"] == 0 and len(items) > 0, str(r))
+        # 恢复地址 → 指标重新在线 → 告警自动恢复
+        target["sensor_url"] = orig_url
+        r = request("POST", "/api/sysconfig", {"lamp_posts": posts})
+        check("恢复传感器地址", r["code"] == 0, str(r))
+        time.sleep(7)
+        r = request("GET", f"/api/alarms?lamp_id={lamp_id}&type=device_offline&status=active")
+        check("设备恢复后告警解除", len(r["data"]["items"]) == 0, str(r))
+    finally:
+        target["sensor_url"] = orig_url
+        request("POST", "/api/sysconfig", {"lamp_posts": posts})
+
     print("== 10. 账号清理 ==")
     tr = request_raw("POST", "/api/auth/login", {"username": test_user, "password": "t123456"})
     me = request("GET", f"/api/auth/users", token=TOKEN)
