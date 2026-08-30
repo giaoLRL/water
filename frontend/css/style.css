@@ -627,16 +627,31 @@ td { font-variant-numeric: tabular-nums; }
 .lamp-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); flex: none; }
 .lamp-dot.on { background: var(--ok); box-shadow: 0 0 6px rgba(52, 211, 153, 0.8); }
 .lamp-dot.off { background: var(--text-dim); }
-.lamp-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+.lamp-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 14px; }
 .lamp-metric {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 8px;
+  padding: 6px 4px;
   text-align: center;
+  min-width: 0;
 }
-.l-label { font-size: 11px; color: var(--text-dim); }
-.l-value { font-size: 18px; font-weight: 600; font-family: var(--mono); color: var(--accent); margin-top: 2px; }
+.l-label {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.l-value {
+  font-size: 16px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--accent);
+  margin-top: 2px;
+  white-space: nowrap;
+  min-width: 0;
+}
 .l-unit { font-size: 10px; color: var(--text-sub); margin-left: 2px; font-family: "Microsoft YaHei", sans-serif; }
 .lamp-metric.smoke-warn { border-color: var(--danger); background: var(--danger-soft); }
 .lamp-metric.smoke-warn .l-label { color: var(--danger); }
