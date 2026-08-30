@@ -593,13 +593,8 @@ td { font-variant-numeric: tabular-nums; }
 .gauge-box .desc { font-size: 10px; }
 .gauge { height: 150px; margin-top: 4px; }
 .spark { height: 44px; margin-top: 2px; opacity: 0.92; }
-.smoke-box { display: flex; flex-direction: column; }
-.smoke-value { flex: 1; min-height: 194px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
-.smoke-num { font-size: 36px; font-weight: 600; font-family: var(--mono); color: var(--accent); line-height: 1; }
-.smoke-value.alarm .smoke-num { color: var(--danger); }
-.smoke-state { font-size: 13px; font-weight: 600; padding: 3px 14px; border-radius: 999px; }
-.smoke-state.ok { background: var(--ok-soft); color: var(--ok); }
-.smoke-state.alarm { background: var(--danger-soft); color: var(--danger); }
+.gauge-box .label.smoke-alarm-label { color: var(--danger); }
+.gauge-box .label.smoke-alarm-label .desc { color: var(--danger); }
 .map-chart { height: 300px; }
 .empty-chart {
   height: 300px;

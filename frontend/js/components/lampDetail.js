@@ -224,7 +224,7 @@ window.ViewLampDetail = {
       this.fetchLogs(1);
     },
     async saveEnvRule() {
-      const keys = ["temp_max", "temp_min", "humidity_max", "humidity_min", "luminance_max", "luminance_min"];
+      const keys = ["temp_max", "temp_min", "humidity_max", "humidity_min", "luminance_max", "luminance_min", "smoke_max", "smoke_min"];
       const cfg = {};
       for (const k of keys) {
         const v = parseFloat(this.thresholds[k]);
@@ -362,6 +362,7 @@ window.ViewLampDetail = {
         ["spark-temp", "temperature", "#2dd4bf"],
         ["spark-hum", "humidity", "#38bdf8"],
         ["spark-lux", "luminance", "#fbbf24"],
+        ["spark-smoke", "smoke", "#f472b6"],
       ];
       defs.forEach(([id, key, color]) => {
         const data = this.trend[key];
@@ -383,6 +384,7 @@ window.ViewLampDetail = {
         ["gauge-temp", this.lamp.temperature || 0, -10, 60, "℃", "#2dd4bf"],
         ["gauge-hum", this.lamp.humidity || 0, 0, 100, "%", "#38bdf8"],
         ["gauge-lux", Math.min(this.lamp.luminance || 0, 100000), 0, 100000, "lx", "#fbbf24"],
+        ["gauge-smoke", Math.min(this.lamp.smoke || 0, 4095), 0, 4095, "AO", this.lamp.smoke_alarm ? "#f87171" : "#f472b6"],
       ];
       defs.forEach(([id, v, min, max, unit, color]) => {
         if (!document.getElementById(id)) return;
@@ -459,12 +461,10 @@ window.ViewLampDetail = {
             <div class="gauge" id="gauge-lux"></div>
             <div class="spark" id="spark-lux"></div>
           </div>
-          <div class="metric gauge-box smoke-box">
-            <div class="label">烟雾浓度 <span class="desc">{{ smokeTag }}</span></div>
-            <div class="smoke-value" :class="lamp.smoke_alarm ? 'alarm' : 'ok'">
-              <div class="smoke-num">{{ fmtSmoke(lamp.smoke) }}</div>
-              <span class="smoke-state" :class="lamp.smoke_alarm ? 'alarm' : 'ok'">{{ lamp.smoke_alarm ? '报警！' : '正常' }}</span>
-            </div>
+          <div class="metric gauge-box">
+            <div class="label" :class="{ 'smoke-alarm-label': lamp.smoke_alarm }">{{ lamp.smoke_alarm ? '烟雾报警！' : '烟雾浓度' }} <span class="desc">{{ smokeTag }}</span></div>
+            <div class="gauge" id="gauge-smoke"></div>
+            <div class="spark" id="spark-smoke"></div>
           </div>
         </div>
         <div class="grid-2 detail-cols">
@@ -528,7 +528,7 @@ window.ViewLampDetail = {
               <tbody>
                 <tr v-for="(p, i) in histRows" :key="i">
                   <td>{{ p.ts }}</td><td>{{ p.temperature }}</td><td>{{ p.humidity }}</td><td>{{ p.luminance }}</td>
-                  <td>{{ p.smoke }}</td>
+                  <td>{{ fmtSmoke(p.smoke) }}</td>
                   <td>{{ p.light_state === 'on' ? '开' : '关' }}</td>
                 </tr>
                 <tr v-if="!histPoints.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无数据</td></tr>
@@ -550,7 +550,7 @@ window.ViewLampDetail = {
       <!-- 告警记录：告警配置 + 规则 + 记录列表（筛选/分页） -->
       <div v-show="tab === 'alarm'">
         <div class="section">
-          <h3>环境参数告警阈值 <span class="desc">温度 / 湿度 / 光照上下限 · 超限触发告警</span></h3>
+          <h3>环境参数告警阈值 <span class="desc">温度 / 湿度 / 光照 / 烟雾上下限 · 超限触发告警</span></h3>
           <div class="alarm-rule">
             <label class="rule-item"><span>温度上限 ℃</span><input type="number" v-model.number="thresholds.temp_max"></label>
             <label class="rule-item"><span>温度下限 ℃</span><input type="number" v-model.number="thresholds.temp_min"></label>
@@ -558,6 +558,8 @@ window.ViewLampDetail = {
             <label class="rule-item"><span>湿度下限 %</span><input type="number" v-model.number="thresholds.humidity_min"></label>
             <label class="rule-item"><span>光照上限 lx</span><input type="number" v-model.number="thresholds.luminance_max"></label>
             <label class="rule-item"><span>光照下限 lx</span><input type="number" v-model.number="thresholds.luminance_min"></label>
+            <label class="rule-item"><span>烟雾浓度上限 AO</span><input type="number" v-model.number="thresholds.smoke_max"></label>
+            <label class="rule-item"><span>烟雾浓度下限 AO</span><input type="number" v-model.number="thresholds.smoke_min"></label>
             <button class="btn-primary" @click="saveEnvRule">保存环境阈值</button>
           </div>
         </div>

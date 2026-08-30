@@ -46,13 +46,13 @@ class DeviceMonitor:
                 self._check_once()
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(10)
+            time.sleep(store.monitor_interval())
 
     def _check_once(self) -> None:
         import database
 
         db_ok = database.ping()
-        infer_ok = _probe_url(store.infer_url())
+        infer_ok = _probe_url(store.infer_url(), timeout=store.monitor_timeout())
         with self._lock:
             self._db_online = db_ok
             self._infer_online = infer_ok

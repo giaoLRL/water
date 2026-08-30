@@ -416,10 +416,12 @@ class LampManager:
 
         posts = posts if posts is not None else store.lamp_posts()
         fields = store.sensor_fields()
+        ctrl_default = store.lamp_ctrl_default()
         self._lamps: dict[str, LampDevice] = {}
         self._detectors = {}
         for lamp in posts:
-            light_cfg = lamp.get("lamp_ctrl")   # 灯杆级灯控接口（缺省用 HttpLightControl 默认 /api/lamp/*）
+            # 灯杆级灯控接口，未配置时回退全局默认格式
+            light_cfg = lamp.get("lamp_ctrl") or ctrl_default
             dev = LampDevice(lamp, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
             self._lamps[lamp["id"]] = dev
             self._detectors[lamp["id"]] = PersonDetector(dev)
@@ -435,12 +437,13 @@ class LampManager:
 
         posts = posts if posts is not None else store.lamp_posts()
         fields = store.sensor_fields()
+        ctrl_default = store.lamp_ctrl_default()
         changed: list[str] = []
 
         # 先停止被删除或配置变化的旧灯杆线程
         for lamp_id, dev in list(self._lamps.items()):
             kept = next((p for p in posts if p["id"] == lamp_id), None)
-            if kept is None or dev.fp != _post_fp(kept, fields):
+            if kept is None or dev.fp != _post_fp(kept, fields, ctrl_default):
                 det = self._detectors.pop(lamp_id, None)
                 if det is not None:
                     det.stop()
@@ -453,11 +456,11 @@ class LampManager:
         for post in posts:
             lamp_id = post["id"]
             old = self._lamps.get(lamp_id)
-            if old is not None and old.fp == _post_fp(post, fields):
+            if old is not None and old.fp == _post_fp(post, fields, ctrl_default):
                 new_lamps[lamp_id] = old
                 new_dets[lamp_id] = self._detectors.get(lamp_id)
             else:
-                light_cfg = post.get("lamp_ctrl")
+                light_cfg = post.get("lamp_ctrl") or ctrl_default
                 dev = LampDevice(post, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
                 new_lamps[lamp_id] = dev
                 new_dets[lamp_id] = PersonDetector(dev)
@@ -475,9 +478,9 @@ class LampManager:
         return self._detectors.get(lamp_id)
 
 
-def _post_fp(post: dict, fields: dict) -> tuple:
-    """按灯杆配置 + 传感器字段映射 + 灯杆级灯控格式计算指纹（与 LampDevice.fp 对齐）。"""
-    light_cfg = post.get("lamp_ctrl") or {}
+def _post_fp(post: dict, fields: dict, ctrl_default: dict) -> tuple:
+    """按灯杆配置 + 传感器字段映射 + 灯控格式计算指纹（与 LampDevice.fp 对齐）。"""
+    light_cfg = post.get("lamp_ctrl") or ctrl_default
     return (post["id"], post.get("name", ""), post.get("location", ""),
             post.get("rtsp_url", ""), post.get("sensor_url", ""),
             post.get("esp32_base", ""),

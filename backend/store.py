@@ -70,6 +70,17 @@ def sensor_fields() -> dict:
     }))
 
 
+def lamp_ctrl_default() -> dict:
+    """灯控接口全局默认格式（fallback，逐灯杆未配置灯控接口时使用）。"""
+    return dict(get_json("lamp_ctrl_default", {
+        "on": "/api/lamp/on",
+        "off": "/api/lamp/off",
+        "state": "/api/lamp/state",
+        "field": "lamp",
+        "status": "status",
+    }))
+
+
 def infer_url() -> str:
     return get("infer_url", config.INFER_URL)
 
@@ -84,3 +95,13 @@ def person_detect_interval() -> float:
 
 def sample_interval() -> float:
     return get_float("sample_interval", config.SAMPLE_INTERVAL)
+
+
+def monitor_interval() -> float:
+    """设备在线状态探测间隔（秒）。"""
+    return get_float("monitor_interval", 10.0)
+
+
+def monitor_timeout() -> float:
+    """设备在线状态单次探测超时（秒）。"""
+    return get_float("monitor_timeout", 1.5)

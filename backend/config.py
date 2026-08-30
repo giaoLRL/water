@@ -78,6 +78,9 @@ DEFAULT_THRESHOLDS = {
     "humidity_min": 20.0,
     "luminance_max": 80000.0,
     "luminance_min": 0.0,
+    # 烟雾浓度（MQ-2 AO 原始值 0~4095）上下限
+    "smoke_max": 3000.0,
+    "smoke_min": 0.0,
     # 人员数量告警规则：识别到人数 >= person_alert_min 时告警
     "person_alert_min": 3.0,
     "person_alert_enabled": 1.0,

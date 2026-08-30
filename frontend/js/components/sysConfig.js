@@ -11,6 +11,10 @@ window.ViewSysConfig = {
       lampSeeds: [ { id: "", name: "", location: "", rtsp_url: "", sensor_url: "", esp32_base: "", cfgStr: "" } ],
       // 服务接口参数
       service: { infer_url: "", infer_timeout: 60, person_detect_interval: 5, sample_interval: 2 },
+      // 设备在线检测参数
+      monitor: { interval: 10, timeout: 1.5 },
+      // 灯控接口全局默认格式（fallback）
+      lampCtrlDefault: { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status" },
       // 传感器格式映射
       sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light", smoke: "smokeRaw", smoke_alarm: "smokeAlarm" },
       msg: "",
@@ -58,6 +62,8 @@ window.ViewSysConfig = {
           person_detect_interval: d.person_detect_interval,
           sample_interval: d.sample_interval,
         };
+        this.monitor = { interval: d.monitor_interval, timeout: d.monitor_timeout };
+        this.lampCtrlDefault = { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status", ...d.lamp_ctrl_default };
         this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", ...d.sensor_fields };
       } catch (e) {
         this.showMsg(e.message, "error");
@@ -107,6 +113,28 @@ window.ViewSysConfig = {
         this.load();
       }
     },
+    async saveLampCtrl() {
+      this.saving = true;
+      try {
+        const d = await API.sysConfigSet({ lamp_ctrl_default: this.lampCtrlDefault });
+        this.showMsg(d.msg, "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+      }
+    },
+    async saveMonitor() {
+      this.saving = true;
+      try {
+        const d = await API.sysConfigSet({ service: { monitor_interval: this.monitor.interval, monitor_timeout: this.monitor.timeout } });
+        this.showMsg(d.msg, "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+      }
+    },
     showMsg(t, type) {
       this.msg = t;
       this.msgType = type || "";
@@ -150,8 +178,9 @@ window.ViewSysConfig = {
   "unit": { "temperature": "C", "humidity": "%", "light": "lx" },
   "lastUpdateMs": 616
 }</pre>
-          <h4>② 灯控接口 GET {esp32_base}/api/lamp/{on|off|state}（各灯杆路径可在"灯杆管理"单独配置）</h4>
-<pre>{ "status": "ok", "lamp": true }      // lamp: true=亮 false=灭；on 须返回 true、off 须返回 false 才算生效</pre>
+          <h4>② 灯控接口 GET {esp32_base}{on|off|state 路径}（路径可在"灯杆管理"或"灯控全局默认格式"配置）</h4>
+<pre>{ "status": "ok", "lamp": true }      // lamp: true=亮 false=灭；on 须返回 true、off 须返回 false 才算生效
+// 未单独配置灯控接口的灯杆，使用"灯控全局默认格式"里的 on/off/state/字段 组装请求</pre>
           <h4>③ 系统接口统一返回格式（所有 /api/*）</h4>
 <pre>{
   "code": 0,        // 0=成功，见下方错误码
@@ -203,6 +232,25 @@ window.ViewSysConfig = {
         </div>
       </div>
 
+      <!-- 灯控接口全局默认格式 -->
+      <div class="section">
+        <h3>灯控接口全局默认格式 <span class="desc">fallback：未单独配置灯控接口的灯杆使用</span></h3>
+        <div class="alarm-rule">
+          <label class="rule-item cfg-item"><span>开灯路径</span>
+            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.on"></label>
+          <label class="rule-item cfg-item"><span>关灯路径</span>
+            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.off"></label>
+          <label class="rule-item cfg-item"><span>状态路径</span>
+            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.state"></label>
+          <label class="rule-item cfg-item"><span>状态字段</span>
+            <input class="cfg-input" style="width:90px;" v-model="lampCtrlDefault.field"></label>
+          <label class="rule-item cfg-item"><span>status 字段</span>
+            <input class="cfg-input" style="width:90px;" v-model="lampCtrlDefault.status"></label>
+          <button class="btn-primary" :disabled="saving" @click="saveLampCtrl">保存默认格式</button>
+        </div>
+        <div class="note">说明：未在"灯杆管理"里单独填写灯控接口的灯杆，用这里的 on/off/state/字段 组装请求 URL 与解析返回；在灯杆管理里填了就覆盖此项。</div>
+      </div>
+
       <!-- 服务接口参数 -->
       <div class="section">
         <h3>服务接口参数 <span class="desc">AI 识别地址 / 超时 / 识别间隔 / 采样间隔</span></h3>
@@ -216,6 +264,18 @@ window.ViewSysConfig = {
           <label class="rule-item cfg-item"><span>采样间隔(秒)</span>
             <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sample_interval" min="0.5" step="0.5"></label>
           <button class="btn-primary" :disabled="saving" @click="saveService">保存服务参数</button>
+        </div>
+      </div>
+
+      <!-- 设备在线检测参数 -->
+      <div class="section">
+        <h3>设备在线检测参数 <span class="desc">后端服务 / 数据库 / AI 识别 / 传感器视频的在线状态探测</span></h3>
+        <div class="alarm-rule">
+          <label class="rule-item cfg-item"><span>探测间隔(秒)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="monitor.interval" min="5" step="1"></label>
+          <label class="rule-item cfg-item"><span>探测超时(秒)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="monitor.timeout" min="0.5" step="0.5"></label>
+          <button class="btn-primary" :disabled="saving" @click="saveMonitor">保存检测参数</button>
         </div>
       </div>
 

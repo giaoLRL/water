@@ -48,6 +48,7 @@ class AlarmEngine:
             ("temperature", "环境温度", sensors.get("temperature", 0.0), "temp_max", "temp_min"),
             ("humidity", "空气湿度", sensors.get("humidity", 0.0), "humidity_max", "humidity_min"),
             ("luminance", "光照强度", sensors.get("luminance", 0.0), "luminance_max", "luminance_min"),
+            ("smoke", "烟雾浓度", sensors.get("smoke", 0.0) or 0.0, "smoke_max", "smoke_min"),
         ]
         active_now: dict[str, dict] = {}
 
@@ -70,17 +71,17 @@ class AlarmEngine:
                     "direction": direction,
                 }
 
-        # 烟雾告警：由 ESP32 的 DO 电平（smoke_alarm）判断，非阈值比较
-        if sensors.get("smoke_alarm"):
+        # 烟雾的 DO 硬件电平作为辅助触发源：AO 未超阈值但 DO 报警时也告警
+        if sensors.get("smoke_alarm") and "smoke" not in active_now:
             smoke_val = round(float(sensors.get("smoke", 0.0) or 0.0), 2)
             active_now["smoke"] = {
                 "lamp_id": lamp_id,
                 "type": "smoke",
                 "label": "烟雾浓度",
                 "value": smoke_val,
-                "threshold": 1.0,
+                "threshold": self._thresholds.get("smoke_max", 3000.0),
                 "direction": "above",
-                "message": f"检测到烟雾超标，浓度 {smoke_val}",
+                "message": f"检测到烟雾超标（硬件报警），浓度 {smoke_val}",
             }
 
         # 恢复已回正常范围的告警（人员告警由 check_person 单独管理，此处跳过）

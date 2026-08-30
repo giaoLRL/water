@@ -40,6 +40,9 @@ class AlarmConfigRequest(BaseModel):
     humidity_min: float | None = Field(default=None, ge=0, le=100)
     luminance_max: float | None = Field(default=None, ge=0, le=200000)
     luminance_min: float | None = Field(default=None, ge=0, le=200000)
+    # 烟雾浓度（MQ-2 AO 原始值）上下限
+    smoke_max: float | None = Field(default=None, ge=0, le=4095)
+    smoke_min: float | None = Field(default=None, ge=0, le=4095)
     # 人员数量告警规则
     person_alert_enabled: int | None = Field(default=None, ge=0, le=1)
     person_alert_min: float | None = Field(default=None, ge=1, le=100)
@@ -50,6 +53,7 @@ class SysConfigRequest(BaseModel):
     lamp_posts: list | None = None
     service: dict | None = None
     sensor_fields: dict | None = None
+    lamp_ctrl_default: dict | None = None
 
 
 def _validate_range(start: str | None, end: str | None) -> None:
@@ -359,10 +363,13 @@ def sysconfig_get():
     lamps = services.lamps.all() if services.lamps else []
     return ok({
         "lamp_posts": store.lamp_posts(),
+        "lamp_ctrl_default": store.lamp_ctrl_default(),
         "infer_url": store.infer_url(),
         "infer_timeout": store.infer_timeout(),
         "person_detect_interval": store.person_detect_interval(),
         "sample_interval": store.sample_interval(),
+        "monitor_interval": store.monitor_interval(),
+        "monitor_timeout": store.monitor_timeout(),
         "sensor_fields": store.sensor_fields(),
         "running_lamps": [l.id for l in lamps],
     })
@@ -399,6 +406,10 @@ def sysconfig_set(body: SysConfigRequest):
                 store.set("person_detect_interval", max(1.0, float(svc["person_detect_interval"])))
             if "sample_interval" in svc:
                 store.set("sample_interval", max(0.5, float(svc["sample_interval"])))
+            if "monitor_interval" in svc:
+                store.set("monitor_interval", max(5.0, float(svc["monitor_interval"])))
+            if "monitor_timeout" in svc:
+                store.set("monitor_timeout", max(0.5, float(svc["monitor_timeout"])))
         except (TypeError, ValueError):
             return err(40002, "服务参数中存在非法数值")
         msgs.append("服务参数已保存，即时生效")
@@ -416,6 +427,13 @@ def sysconfig_set(body: SysConfigRequest):
             # 字段映射变化 → 所有灯杆指纹变化 → 重建（生效）
             changed = services.lamps.reload()
         msgs.append("传感器格式已保存并生效")
+
+    if body.lamp_ctrl_default is not None:
+        store.set_json("lamp_ctrl_default", body.lamp_ctrl_default)
+        if services.lamps:
+            # 全局灯控格式变化 → 未单独配置灯控接口的灯杆指纹变化 → 重建
+            changed = services.lamps.reload()
+        msgs.append("灯控全局默认格式已保存并生效")
 
     return ok({"msg": "；".join(msgs), "changed": changed})
 
