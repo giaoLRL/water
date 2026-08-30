@@ -42,6 +42,8 @@ def _collect_lamp(lamp) -> None:
         snap["humidity"],
         snap["luminance"],
         snap["light_state"],
+        smoke=snap["smoke"],
+        smoke_alarm=snap["smoke_alarm"],
     )
     # 异常快照：取当前视频帧（仅在触发新告警时写库）
     frame = lamp.video.get_frame()

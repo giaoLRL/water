@@ -65,6 +65,8 @@ def sensor_fields() -> dict:
         "temperature": "temperature",
         "humidity": "humidity",
         "light": "light",
+        "smoke": "smokeRaw",
+        "smoke_alarm": "smokeAlarm",
     }))
 
 

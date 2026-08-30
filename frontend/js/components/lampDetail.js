@@ -19,7 +19,7 @@ window.ViewLampDetail = {
       customStart: "",
       customEnd: "",
       // 实时趋势（仪表盘迷你曲线累积缓冲）
-      trend: { temperature: [], humidity: [], luminance: [] },
+      trend: { temperature: [], humidity: [], luminance: [], smoke: [] },
       // 告警
       alarms: [],
       alarmTotal: 0, alarmPage: 1, alarmPageSize: 10,
@@ -64,6 +64,12 @@ window.ViewLampDetail = {
       }
       return "无真实传感器";
     },
+    smokeTag() {
+      if (this.lamp.sensor_source === "esp32") {
+        return this.lamp.smoke_online === false ? "烟雾离线" : "烟雾浓度(MQ-2)";
+      }
+      return "无真实传感器";
+    },
     alarmPages() { return Math.max(1, Math.ceil(this.alarmTotal / this.alarmPageSize)); },
     detPages() { return Math.max(1, Math.ceil(this.detTotal / this.detPageSize)); },
     logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
@@ -93,6 +99,10 @@ window.ViewLampDetail = {
       const p = (n) => String(n).padStart(2, "0");
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     },
+    fmtSmoke(v) {
+      if (v == null) return "--";
+      return Math.round(v);
+    },
     rangeEnd() { return this.fmt(new Date()); },
     rangeStart(key) {
       const hours = { "1h": 1, "6h": 6, "24h": 24 }[key] || 1;
@@ -119,6 +129,7 @@ window.ViewLampDetail = {
         push(t.temperature, this.lamp.temperature || 0);
         push(t.humidity, this.lamp.humidity || 0);
         push(t.luminance, this.lamp.luminance || 0);
+        push(t.smoke, this.lamp.smoke || 0);
         this.renderSparks();
         this.renderGauges();
       } catch (e) { /* silent */ }
@@ -140,6 +151,7 @@ window.ViewLampDetail = {
           this.trend.temperature = this.histPoints.map((p) => p.temperature).slice(-60);
           this.trend.humidity = this.histPoints.map((p) => p.humidity).slice(-60);
           this.trend.luminance = this.histPoints.map((p) => p.luminance).slice(-60);
+          this.trend.smoke = this.histPoints.map((p) => p.smoke).slice(-60);
         }
         this.renderChart();
       } catch (err) { /* silent */ }
@@ -335,6 +347,8 @@ window.ViewLampDetail = {
         data = pts.map((p) => p.humidity); name = "空气湿度"; color = "#38bdf8"; unit = "%";
       } else if (this.histType === "luminance") {
         data = pts.map((p) => p.luminance); name = "光照强度"; color = "#fbbf24"; unit = "lx";
+      } else if (this.histType === "smoke") {
+        data = pts.map((p) => p.smoke); name = "烟雾浓度"; color = "#f472b6"; unit = "AO";
       } else {
         data = pts.map((p) => p.temperature); name = "环境温度"; color = "#2dd4bf"; unit = "℃";
       }
@@ -399,7 +413,7 @@ window.ViewLampDetail = {
       });
     },
     typeName(t) {
-      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量" }[t] || t;
+      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量", smoke: "烟雾浓度" }[t] || t;
     },
   },
   template: `
@@ -429,7 +443,7 @@ window.ViewLampDetail = {
 
       <!-- 实时监控 -->
       <div v-show="tab === 'monitor'">
-        <div class="grid-3" style="margin-bottom:14px;">
+        <div class="grid-4" style="margin-bottom:14px;">
           <div class="metric gauge-box">
             <div class="label">环境温度 <span class="desc">{{ sensorTag }} · 阈值 {{ thresholds.temp_min ?? '--' }}~{{ thresholds.temp_max ?? '--' }}℃</span></div>
             <div class="gauge" id="gauge-temp"></div>
@@ -444,6 +458,13 @@ window.ViewLampDetail = {
             <div class="label">光照强度 <span class="desc">{{ luxTag }}</span></div>
             <div class="gauge" id="gauge-lux"></div>
             <div class="spark" id="spark-lux"></div>
+          </div>
+          <div class="metric gauge-box smoke-box">
+            <div class="label">烟雾浓度 <span class="desc">{{ smokeTag }}</span></div>
+            <div class="smoke-value" :class="lamp.smoke_alarm ? 'alarm' : 'ok'">
+              <div class="smoke-num">{{ fmtSmoke(lamp.smoke) }}</div>
+              <span class="smoke-state" :class="lamp.smoke_alarm ? 'alarm' : 'ok'">{{ lamp.smoke_alarm ? '报警！' : '正常' }}</span>
+            </div>
           </div>
         </div>
         <div class="grid-2 detail-cols">
@@ -486,6 +507,7 @@ window.ViewLampDetail = {
             <span class="tab" :class="{ active: histType === 'temperature' }" @click="pickHistType('temperature')">温度</span>
             <span class="tab" :class="{ active: histType === 'humidity' }" @click="pickHistType('humidity')">湿度</span>
             <span class="tab" :class="{ active: histType === 'luminance' }" @click="pickHistType('luminance')">光照</span>
+            <span class="tab" :class="{ active: histType === 'smoke' }" @click="pickHistType('smoke')">烟雾</span>
           </div>
           <div class="chart" id="detail-hist-chart"></div>
         </div>
@@ -502,13 +524,14 @@ window.ViewLampDetail = {
           </div>
           <div style="overflow-x:auto;">
             <table>
-              <thead><tr><th>时间</th><th>温度 ℃</th><th>湿度 %</th><th>光照 lx</th><th>灯光</th></tr></thead>
+              <thead><tr><th>时间</th><th>温度 ℃</th><th>湿度 %</th><th>光照 lx</th><th>烟雾 AO</th><th>灯光</th></tr></thead>
               <tbody>
                 <tr v-for="(p, i) in histRows" :key="i">
                   <td>{{ p.ts }}</td><td>{{ p.temperature }}</td><td>{{ p.humidity }}</td><td>{{ p.luminance }}</td>
+                  <td>{{ p.smoke }}</td>
                   <td>{{ p.light_state === 'on' ? '开' : '关' }}</td>
                 </tr>
-                <tr v-if="!histPoints.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无数据</td></tr>
+                <tr v-if="!histPoints.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无数据</td></tr>
               </tbody>
             </table>
           </div>

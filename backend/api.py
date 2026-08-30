@@ -404,10 +404,14 @@ def sysconfig_set(body: SysConfigRequest):
         msgs.append("服务参数已保存，即时生效")
 
     if body.sensor_fields is not None:
+        sf = dict(body.sensor_fields)
         for key in ("status", "temperature", "humidity", "light"):
-            if not str(body.sensor_fields.get(key, "")).strip():
+            if not str(sf.get(key, "")).strip():
                 return err(40002, f"传感器格式缺少字段: {key}")
-        store.set_json("sensor_fields", body.sensor_fields)
+        # 烟雾字段可选：未填写则回退默认（适配无 MQ-2 的设备）
+        sf.setdefault("smoke", "smokeRaw")
+        sf.setdefault("smoke_alarm", "smokeAlarm")
+        store.set_json("sensor_fields", sf)
         if services.lamps:
             # 字段映射变化 → 所有灯杆指纹变化 → 重建（生效）
             changed = services.lamps.reload()

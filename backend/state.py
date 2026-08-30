@@ -35,50 +35,63 @@ class Services:
         return time.time() - self.start_time
 
     def device_status(self) -> list[dict]:
-        """按接口返回情况汇总各设备在线状态。"""
-        items = [
+        """按接口返回情况汇总各设备在线状态，按系统服务与灯杆分组分栏。"""
+        groups = []
+
+        # 系统服务组
+        sys_items = [
             {"name": "后端服务", "type": "server", "status": "online",
              "detail": f"FastAPI · 运行 {int(self.uptime // 60)} 分钟"},
         ]
         mon = self.monitor.snapshot() if self.monitor else {}
         db_ok = mon.get("database")
-        items.append({
+        sys_items.append({
             "name": "MySQL 数据库", "type": "database",
             "status": "online" if db_ok is True else ("offline" if db_ok is False else "detecting"),
             "detail": f"{config.DB_HOST}:{config.DB_PORT}",
         })
         infer_ok = mon.get("infer")
-        items.append({
+        sys_items.append({
             "name": "AI 识别服务", "type": "infer",
             "status": "online" if infer_ok is True else ("offline" if infer_ok is False else "detecting"),
             "detail": config.INFER_URL,
         })
+        groups.append({"group": "系统服务", "items": sys_items})
+
+        # 每个灯杆一组：温湿度合并（同一 DHT11），光照、视频独立
         if self.lamps:
             for lamp in self.lamps.all():
                 snap = lamp.snapshot()
                 sensor_ok = snap["sensor_online"]
                 light_ok = snap["light_online"]
+                smoke_ok = snap.get("smoke_online")
                 if snap["sensor_source"] == "esp32":
                     s_status = "online" if sensor_ok is True else ("offline" if sensor_ok is False else "detecting")
                     s_detail = "ESP32 + DHT11"
-                    # 光照传感器（GY-302）单独作为健康指标
                     l_status = "online" if light_ok is True else ("offline" if light_ok is False else "detecting")
                     l_detail = "GY-302 (BH1750)"
+                    m_status = "online" if smoke_ok is True else ("offline" if smoke_ok is False else "detecting")
+                    m_detail = "MQ-2 (AO/DO)"
                 else:
                     s_status, s_detail = "sim", "无真实传感器"
                     l_status, l_detail = "sim", "无真实传感器"
-                # 传感器按三个指标分别呈现健康状态
-                items.append({"name": f"{snap['name']} 温度", "type": "sensor_temp",
-                              "status": s_status, "detail": s_detail})
-                items.append({"name": f"{snap['name']} 湿度", "type": "sensor_hum",
-                              "status": s_status, "detail": s_detail})
-                items.append({"name": f"{snap['name']} 光照", "type": "sensor_lux",
-                              "status": l_status, "detail": l_detail})
+                    m_status, m_detail = "sim", "无真实传感器"
                 v_status = "online" if snap["video_online"] else "offline"
-                items.append({"name": f"{snap['name']} 视频", "type": "video",
-                              "status": v_status,
-                              "detail": "RTSP 实时" if snap["video_source"] == "rtsp" else "模拟画面"})
-        return items
+                groups.append({
+                    "group": snap["name"],
+                    "items": [
+                        {"name": "温湿度", "type": "sensor_temp_hum",
+                         "status": s_status, "detail": s_detail},
+                        {"name": "光照", "type": "sensor_lux",
+                         "status": l_status, "detail": l_detail},
+                        {"name": "烟雾", "type": "sensor_smoke",
+                         "status": m_status, "detail": m_detail},
+                        {"name": "视频", "type": "video",
+                         "status": v_status,
+                         "detail": "RTSP 实时" if snap["video_source"] == "rtsp" else "模拟画面"},
+                    ],
+                })
+        return groups
 
 
 services = Services()

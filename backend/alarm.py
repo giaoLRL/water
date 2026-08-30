@@ -70,6 +70,19 @@ class AlarmEngine:
                     "direction": direction,
                 }
 
+        # 烟雾告警：由 ESP32 的 DO 电平（smoke_alarm）判断，非阈值比较
+        if sensors.get("smoke_alarm"):
+            smoke_val = round(float(sensors.get("smoke", 0.0) or 0.0), 2)
+            active_now["smoke"] = {
+                "lamp_id": lamp_id,
+                "type": "smoke",
+                "label": "烟雾浓度",
+                "value": smoke_val,
+                "threshold": 1.0,
+                "direction": "above",
+                "message": f"检测到烟雾超标，浓度 {smoke_val}",
+            }
+
         # 恢复已回正常范围的告警（人员告警由 check_person 单独管理，此处跳过）
         for (lid, key) in list(self._active):
             if lid == lamp_id and key != "person" and key not in active_now:
@@ -79,6 +92,7 @@ class AlarmEngine:
         for key, item in active_now.items():
             if (lamp_id, key) not in self._active:
                 direction_text = "超上限" if item["direction"] == "above" else "低于下限"
+                message = item.get("message") or f'{item["label"]} {item["value"]} {direction_text} {item["threshold"]}'
                 database.update_or_insert_alarm(
                     lamp_id,
                     datetime.now(),
@@ -86,7 +100,7 @@ class AlarmEngine:
                     item["value"],
                     item["threshold"],
                     item["direction"],
-                    f'{item["label"]} {item["value"]} {direction_text} {item["threshold"]}',
+                    message,
                     image=image,
                 )
 
@@ -103,7 +117,7 @@ class AlarmEngine:
 
         # 兜底恢复：本轮不活跃的环境类型，把数据库中残留的 active 记录置为已恢复，
         # 保证进程重启后数据库 status 与内存真实活跃一致（幂等、每轮执行开销极小）。
-        not_active = [t for t in ("temperature", "humidity", "luminance") if t not in active_now]
+        not_active = [t for t in ("temperature", "humidity", "luminance", "smoke") if t not in active_now]
         if not_active:
             database.recover_alarms_for_types(lamp_id, not_active)
         return new_alarms

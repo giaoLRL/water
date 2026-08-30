@@ -19,7 +19,7 @@ window.ViewAlarmCenter = {
   },
   methods: {
     typeName(t) {
-      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量" }[t] || t;
+      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量", smoke: "烟雾浓度" }[t] || t;
     },
     dateFilter() {
       const r = {};

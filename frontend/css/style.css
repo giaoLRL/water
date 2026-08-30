@@ -221,13 +221,20 @@ header h1 { font-size: 15px; font-weight: 600; color: var(--text); letter-spacin
   100% { color: var(--amber); text-shadow: none; }
 }
 
-.device-status { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.device-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-top: 12px; }
+.device-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel-2);
+}
+.device-group-title { font-size: 12px; color: var(--text-sub); font-weight: 600; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.device-group-items { display: flex; flex-direction: column; gap: 8px; }
 .status-item {
-  flex: 1; min-width: 160px;
   display: flex; align-items: center; gap: 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 9px 12px;
+  padding: 8px 10px;
   background: var(--bg-deep);
 }
 .status-item .state-dot {
@@ -553,7 +560,7 @@ td { font-variant-numeric: tabular-nums; }
 .lamp-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); flex: none; }
 .lamp-dot.on { background: var(--ok); box-shadow: 0 0 6px rgba(52, 211, 153, 0.8); }
 .lamp-dot.off { background: var(--text-dim); }
-.lamp-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.lamp-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
 .lamp-metric {
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -564,6 +571,9 @@ td { font-variant-numeric: tabular-nums; }
 .l-label { font-size: 11px; color: var(--text-dim); }
 .l-value { font-size: 18px; font-weight: 600; font-family: var(--mono); color: var(--accent); margin-top: 2px; }
 .l-unit { font-size: 10px; color: var(--text-sub); margin-left: 2px; font-family: "Microsoft YaHei", sans-serif; }
+.lamp-metric.smoke-warn { border-color: var(--danger); background: var(--danger-soft); }
+.lamp-metric.smoke-warn .l-label { color: var(--danger); }
+.lamp-metric.smoke-warn .l-value { color: var(--danger); }
 .lamp-card-foot { display: flex; align-items: center; gap: 8px; font-size: 11px; flex-wrap: wrap; }
 .lamp-light { border: 1px solid var(--border); padding: 2px 8px; border-radius: 3px; color: var(--text-sub); }
 .lamp-light.on { color: var(--ok); border-color: var(--ok-soft); background: var(--ok-soft); }
@@ -583,6 +593,13 @@ td { font-variant-numeric: tabular-nums; }
 .gauge-box .desc { font-size: 10px; }
 .gauge { height: 150px; margin-top: 4px; }
 .spark { height: 44px; margin-top: 2px; opacity: 0.92; }
+.smoke-box { display: flex; flex-direction: column; }
+.smoke-value { flex: 1; min-height: 194px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+.smoke-num { font-size: 36px; font-weight: 600; font-family: var(--mono); color: var(--accent); line-height: 1; }
+.smoke-value.alarm .smoke-num { color: var(--danger); }
+.smoke-state { font-size: 13px; font-weight: 600; padding: 3px 14px; border-radius: 999px; }
+.smoke-state.ok { background: var(--ok-soft); color: var(--ok); }
+.smoke-state.alarm { background: var(--danger-soft); color: var(--danger); }
 .map-chart { height: 300px; }
 .empty-chart {
   height: 300px;

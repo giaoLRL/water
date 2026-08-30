@@ -186,7 +186,8 @@ class HttpTempSensor:
         self.timeout = timeout
         self.ttl = ttl
         self.fields = fields or {"status": "status", "temperature": "temperature",
-                                 "humidity": "humidity", "light": "light"}
+                                 "humidity": "humidity", "light": "light",
+                                 "smoke": "smokeRaw", "smoke_alarm": "smokeAlarm"}
         self._lock = threading.Lock()
         self._cache: dict | None = None   # {"data": {...}, "ts": float}
         self._fail_count = 0
@@ -208,6 +209,8 @@ class HttpTempSensor:
                 "temperature": payload.get(self.fields["temperature"]),
                 "humidity": payload.get(self.fields["humidity"]),
                 "light": payload.get(self.fields["light"]),
+                "smoke": payload.get(self.fields.get("smoke", "smokeRaw")),
+                "smoke_alarm": payload.get(self.fields.get("smoke_alarm", "smokeAlarm")),
             }
             with self._lock:
                 self._cache = {"data": data, "ts": time.time()}
@@ -287,6 +290,8 @@ class LampDevice:
         self._temperature = 0.0
         self._humidity = 0.0
         self._luminance = 0.0
+        self._smoke = 0.0            # 烟雾浓度（MQ-2 AO 原始值 0~4095）
+        self._smoke_alarm = False    # 烟雾报警状态（MQ-2 DO，低电平=超标）
         self.online = True
         # 真实温湿度/光照传感器（ESP32 HTTP 接口），未配置时为 None
         sensor_url = lamp.get("sensor_url", "") or ""
@@ -298,6 +303,7 @@ class LampDevice:
         # None=未检测, True=在线, False=离线（真实传感器）
         self.sensor_online: bool | None = None   # ESP32 接口整体在线状态（温湿度）
         self.light_online: bool | None = None    # GY-302 光照传感器在线状态
+        self.smoke_online: bool | None = None    # MQ-2 烟雾传感器在线状态（读到 smoke 字段即在线）
         # 先占位，避免视频线程起来时 snapshot() 访问 self.video 报错
         self.video = None
         self.video = VideoStream(self, self.rtsp_url)
@@ -306,10 +312,13 @@ class LampDevice:
         """采样一次：仅当有真实传感器数据时使用真实值，否则对应指标直接为 0（不使用模拟数据）。"""
         with self._lock:
             temp = hum = lux = 0.0
+            smoke = 0.0
+            smoke_alarm = False
             if self._http_sensor is not None:
                 real, ok = self._http_sensor.read()
                 self.sensor_online = ok
                 light_ok = False
+                smoke_ok = False
                 if ok:
                     t = real.get("temperature")
                     h = real.get("humidity")
@@ -321,17 +330,30 @@ class LampDevice:
                     if l is not None:
                         lux = float(l)
                         light_ok = True
+                    s = real.get("smoke")
+                    if s is not None:
+                        smoke = max(0.0, float(s))
+                        smoke_ok = True
+                    # MQ-2 报警：truthy 字符串/数字均视为 true
+                    sa = real.get("smoke_alarm")
+                    smoke_alarm = sa is True or str(sa).lower() in ("1", "true", "yes", "on")
                 self.light_online = light_ok
+                self.smoke_online = smoke_ok
             else:
                 self.sensor_online = False
                 self.light_online = False
+                self.smoke_online = False
             self._temperature = temp
             self._humidity = hum
             self._luminance = lux
+            self._smoke = smoke
+            self._smoke_alarm = smoke_alarm
             return {
                 "temperature": round(self._temperature, 2),
                 "humidity": round(self._humidity, 2),
                 "luminance": round(self._luminance, 1),
+                "smoke": round(self._smoke, 1),
+                "smoke_alarm": bool(self._smoke_alarm),
             }
 
     def set_light(self, action: str) -> None:
@@ -371,11 +393,14 @@ class LampDevice:
                 "temperature": round(self._temperature, 2),
                 "humidity": round(self._humidity, 2),
                 "luminance": round(self._luminance, 1),
+                "smoke": round(self._smoke, 1),
+                "smoke_alarm": bool(self._smoke_alarm),
                 "light_state": self._light_state,
                 "online": self.online,
                 "sensor_source": "esp32" if self._http_sensor is not None else "sim",
                 "sensor_online": self.sensor_online,
                 "light_online": self.light_online,
+                "smoke_online": self.smoke_online,
                 "video_source": self.video.source if self.video is not None else "sim",
                 "video_online": video_online,
             }

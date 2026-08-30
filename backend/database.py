@@ -55,6 +55,10 @@ _TABLE_COLUMNS = {
 # 业务表的新增列：存在表结构时温和补列（不删表），避免丢失历史数据
 _EXTRA_COLUMNS = {
     "alarms": {"image": "LONGTEXT NULL"},
+    "lamp_sensors": {
+        "smoke": "DOUBLE NOT NULL DEFAULT 0",
+        "smoke_alarm": "TINYINT NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -237,14 +241,16 @@ def insert_sensor_data(
     humidity: float,
     luminance: float,
     light_state: str,
+    smoke: float = 0.0,
+    smoke_alarm: bool = False,
 ) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO lamp_sensors (lamp_id, ts, temperature, humidity, luminance, light_state) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (lamp_id, ts, temperature, humidity, luminance, light_state),
+                "INSERT INTO lamp_sensors (lamp_id, ts, temperature, humidity, luminance, light_state, smoke, smoke_alarm) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (lamp_id, ts, temperature, humidity, luminance, light_state, smoke, int(smoke_alarm)),
             )
     finally:
         conn.close()
@@ -256,7 +262,7 @@ def query_history(lamp_id: str, start: str, end: str, limit: int = 5000) -> list
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, temperature, humidity, luminance, "
-                "light_state FROM lamp_sensors "
+                "smoke, smoke_alarm, light_state FROM lamp_sensors "
                 "WHERE lamp_id=%s AND ts BETWEEN %s AND %s ORDER BY ts ASC LIMIT %s",
                 (lamp_id, start, end, limit),
             )
@@ -271,7 +277,7 @@ def query_latest_sensor(lamp_id: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, temperature, humidity, luminance, "
-                "light_state FROM lamp_sensors WHERE lamp_id=%s ORDER BY id DESC LIMIT 1",
+                "smoke, smoke_alarm, light_state FROM lamp_sensors WHERE lamp_id=%s ORDER BY id DESC LIMIT 1",
                 (lamp_id,),
             )
             return cur.fetchone()

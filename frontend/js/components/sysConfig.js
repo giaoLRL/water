@@ -12,7 +12,7 @@ window.ViewSysConfig = {
       // 服务接口参数
       service: { infer_url: "", infer_timeout: 60, person_detect_interval: 5, sample_interval: 2 },
       // 传感器格式映射
-      sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light" },
+      sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light", smoke: "smokeRaw", smoke_alarm: "smokeAlarm" },
       msg: "",
       msgType: "",
     };
@@ -58,7 +58,7 @@ window.ViewSysConfig = {
           person_detect_interval: d.person_detect_interval,
           sample_interval: d.sample_interval,
         };
-        this.sensorFields = { ...d.sensor_fields };
+        this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", ...d.sensor_fields };
       } catch (e) {
         this.showMsg(e.message, "error");
       } finally {
@@ -139,12 +139,14 @@ window.ViewSysConfig = {
           </span>
         </div>
         <div v-if="showSpec" class="spec-body">
-          <h4>① 传感器接口 GET {sensor_url}（对应下方"传感器格式映射"四项）</h4>
+          <h4>① 传感器接口 GET {sensor_url}（对应下方"传感器格式映射"六项）</h4>
 <pre>{
   "status": "ok",              // ok=全部正常 / partial=部分不可用
   "temperature": 24.1,         // 温度 ℃
   "humidity": 53.7,            // 湿度 %
   "light": 19.2,               // 光照 lx（读不到时为 null）
+  "smokeRaw": 1234,            // 烟雾浓度（MQ-2 AO 原始值 0~4095，可空）
+  "smokeAlarm": false,         // 烟雾报警（MQ-2 DO，true=超标，可空）
   "unit": { "temperature": "C", "humidity": "%", "light": "lx" },
   "lastUpdateMs": 616
 }</pre>
@@ -229,10 +231,14 @@ window.ViewSysConfig = {
             <input class="cfg-input" style="width:110px;" v-model="sensorFields.humidity"></label>
           <label class="rule-item cfg-item"><span>光照字段</span>
             <input class="cfg-input" style="width:110px;" v-model="sensorFields.light"></label>
+          <label class="rule-item cfg-item"><span>烟雾浓度字段</span>
+            <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke"></label>
+          <label class="rule-item cfg-item"><span>烟雾报警字段</span>
+            <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke_alarm"></label>
           <button class="btn-primary" :disabled="saving" @click="saveSensor">保存格式映射</button>
         </div>
-        <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..} 为默认，
-        若换用其他设备只需把"字段名"改成其返回的 JSON key。保存后灯杆会重建以立即采用新格式。</div>
+        <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..} 为默认，
+        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾字段可选（无 MQ-2 的设备留空即可，自动回退默认）。保存后灯杆会重建以立即采用新格式。</div>
       </div>
 
       <div class="note" style="margin-top:6px;">

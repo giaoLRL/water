@@ -66,6 +66,10 @@ window.ViewLampList = {
       if (v >= 1000) return (v / 1000).toFixed(1) + "k";
       return Math.round(v);
     },
+    fmtSmoke(v) {
+      if (v == null) return "--";
+      return Math.round(v);
+    },
     statusText(s) {
       return { online: "在线", offline: "离线", sim: "无真实传感器", detecting: "检测中" }[s] || s;
     },
@@ -83,6 +87,8 @@ window.ViewLampList = {
         temperature: l.temperature,
         humidity: l.humidity,
         luminance: l.luminance,
+        smoke: l.smoke,
+        smoke_alarm: l.smoke_alarm,
         alarm: (l.alarm_count || 0) > 0,
         on: l.light_state === "on",
       }));
@@ -93,7 +99,7 @@ window.ViewLampList = {
           textStyle: { color: "#d7e0ea" },
           formatter: (p) => {
             const d = p.data;
-            return `${d.name}<br/>温度 ${d.temperature}℃ · 湿度 ${d.humidity}%<br/>光照 ${this.fmtLux(d.luminance)} lx<br/>灯光 ${d.on ? "开启" : "关闭"}`;
+            return `${d.name}<br/>温度 ${d.temperature}℃ · 湿度 ${d.humidity}%<br/>光照 ${this.fmtLux(d.luminance)} lx<br/>烟雾 ${this.fmtSmoke(d.smoke)}${d.smoke_alarm ? "（报警）" : ""}<br/>灯光 ${d.on ? "开启" : "关闭"}`;
           },
         },
         grid: { left: 10, right: 10, top: 30, bottom: 14 },
@@ -145,7 +151,7 @@ window.ViewLampList = {
     },
     /* 告警类型固定排序与配色：保证树图与饼图颜色一一对应 */
     typeOrder(name) {
-      const order = ["人员数量", "空气湿度", "环境温度", "光照强度"];
+      const order = ["人员数量", "空气湿度", "环境温度", "光照强度", "烟雾浓度"];
       const i = order.indexOf(name);
       return i === -1 ? 99 : i;
     },
@@ -155,6 +161,7 @@ window.ViewLampList = {
         "空气湿度": "#38bdf8",
         "环境温度": "#2dd4bf",
         "光照强度": "#fbbf24",
+        "烟雾浓度": "#f472b6",
       };
       return map[name] || "#a78bfa";
     },
@@ -235,11 +242,16 @@ window.ViewLampList = {
       <div class="section" style="margin-bottom:14px;">
         <h3>设备在线状态 <span class="desc">按接口返回情况实时检测</span></h3>
         <div class="device-status">
-          <div class="status-item" v-for="d in devices" :key="d.type + d.name" :class="statusCls(d.status)">
-            <span class="state-dot"></span>
-            <div style="flex:1;">
-              <div class="name">{{ d.name }} <span class="detail">{{ d.detail }}</span></div>
-              <div class="state">{{ statusText(d.status) }}</div>
+          <div class="device-group" v-for="g in devices" :key="g.group">
+            <div class="device-group-title">{{ g.group }}</div>
+            <div class="device-group-items">
+              <div class="status-item" v-for="d in g.items" :key="d.type + d.name" :class="statusCls(d.status)">
+                <span class="state-dot"></span>
+                <div style="flex:1;">
+                  <div class="name">{{ d.name }} <span class="detail">{{ d.detail }}</span></div>
+                  <div class="state">{{ statusText(d.status) }}</div>
+                </div>
+              </div>
             </div>
           </div>
           <div class="status-item" v-if="!devices.length"><div class="name" style="color:var(--text-dim);">设备状态加载中…</div></div>
@@ -265,6 +277,10 @@ window.ViewLampList = {
             <div class="lamp-metric">
               <div class="l-label">光照强度</div>
               <div class="l-value">{{ fmtLux(l.luminance) }}<span class="l-unit">lx</span></div>
+            </div>
+            <div class="lamp-metric" :class="{ 'smoke-warn': l.smoke_alarm }">
+              <div class="l-label">{{ l.smoke_alarm ? '烟雾报警！' : '烟雾浓度' }}</div>
+              <div class="l-value">{{ fmtSmoke(l.smoke) }}</div>
             </div>
           </div>
           <div class="lamp-card-foot">
