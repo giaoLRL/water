@@ -11,7 +11,8 @@ window.ViewLampList = {
   },
   computed: {
     onlineCount() {
-      return this.lamps.filter((l) => l.online).length;
+      // 灯杆在线 = 全部已配置设备（温湿度/光照/烟雾/视频）在线
+      return this.lamps.filter((l) => l.lamp_online).length;
     },
     lightOnCount() {
       return this.lamps.filter((l) => l.light_state === "on").length;

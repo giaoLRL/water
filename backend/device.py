@@ -386,6 +386,18 @@ class LampDevice:
                 or self.video.source == "sim"  # 降级模拟也算有画面
             )
         with self._lock:
+            # 灯杆在线 = 全部已配置设备在线：
+            # - 配了真实传感器(esp32)：温湿度 + 光照 + 烟雾 + 视频 全部在线才算
+            # - 未配真实传感器：仅要求视频在线（模拟画面恒定在线）
+            if self._http_sensor is not None:
+                lamp_online = bool(
+                    video_online
+                    and self.sensor_online is True
+                    and self.light_online is True
+                    and self.smoke_online is True
+                )
+            else:
+                lamp_online = bool(video_online)
             return {
                 "id": self.id,
                 "name": self.name,
@@ -396,7 +408,8 @@ class LampDevice:
                 "smoke": round(self._smoke, 1),
                 "smoke_alarm": bool(self._smoke_alarm),
                 "light_state": self._light_state,
-                "online": self.online,
+                "online": self.online,          # 灯杆单元恒定存在
+                "lamp_online": lamp_online,     # 真实在线：全部设备在线
                 "sensor_source": "esp32" if self._http_sensor is not None else "sim",
                 "sensor_online": self.sensor_online,
                 "light_online": self.light_online,

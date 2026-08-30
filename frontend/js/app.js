@@ -33,6 +33,10 @@ const app = createApp({
     const perm = (p) => window.Auth.has(p);
     // 当前登录用户（reactive 跟随 Auth 状态变化）
     const authUser = computed(() => (window.Auth && window.Auth.user) || null);
+    // 灯杆在线数：全部设备（温湿度/光照/烟雾/视频）在线才算
+    const onlineCount = computed(() =>
+      (state.lamps || []).filter((l) => l.lamp_online).length
+    );
 
     function startPoll() {
       window.clearInterval(window.__pollLamps);
@@ -125,7 +129,7 @@ const app = createApp({
     });
 
     return {
-      state, ICONS, perm, authUser,
+      state, ICONS, perm, authUser, onlineCount,
       openDetail, openConfig, openAlarmCenter, gotoLampAlarm, backToList,
       onLogged, doLogout,
     };
@@ -142,7 +146,7 @@ const app = createApp({
       </div>
       <div class="status-chips">
         <span class="chip clickable" v-if="perm('cfg_system')" @click="openConfig"><span v-html="ICONS.gear" style="vertical-align:-2px;"></span> 系统配置</span>
-        <span class="chip" v-if="perm('view_device')"><span class="dot green"></span>在线灯杆 {{ state.lamps.length }}</span>
+        <span class="chip" v-if="perm('view_device')"><span class="dot" :class="onlineCount ? 'green' : 'red'"></span>在线灯杆 {{ onlineCount }}</span>
         <span class="chip bell clickable" v-if="perm('view_alarm')" title="查看全站告警" @click="openAlarmCenter"><span v-html="ICONS.bell"></span><span class="badge" v-if="state.activeAlarmCount">{{ state.activeAlarmCount }}</span></span>
         <span class="chip" v-if="perm('view_alarm')">活跃告警 {{ state.activeAlarmCount }}</span>
         <span class="chip" v-if="perm('view_device')">{{ state.serverTime || "--" }}</span>
