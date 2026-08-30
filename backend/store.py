@@ -105,3 +105,23 @@ def monitor_interval() -> float:
 def monitor_timeout() -> float:
     """设备在线状态单次探测超时（秒）。"""
     return get_float("monitor_timeout", 1.5)
+
+
+def sensor_timeout() -> float:
+    """传感器 HTTP 请求超时（秒）。ESP32 /api/data 读取较慢，默认 3 秒。"""
+    return get_float("sensor_timeout", 3.0)
+
+
+def sensor_ttl() -> float:
+    """传感器响应缓存时长（秒），避免高频请求。"""
+    return get_float("sensor_ttl", 5.0)
+
+
+def sensor_trip() -> int:
+    """传感器熔断：连续失败次数阈值。"""
+    return get_int("sensor_trip", 3)
+
+
+def sensor_cooldown() -> float:
+    """传感器熔断：冷却时长（秒），冷却期内不再发请求。"""
+    return get_float("sensor_cooldown", 15.0)

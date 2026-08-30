@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 import config
+import store
 
 # 强制 RTSP 使用 TCP 传输，避免网络抖动导致长时间卡死
 os.environ.setdefault(
@@ -194,14 +195,19 @@ class HttpTempSensor:
         self._cooldown_until = 0.0
 
     def read(self) -> tuple[dict | None, bool]:
+        # 超时/缓存/熔断参数每次读取（系统配置页可改，即时生效，无需重启）
+        timeout = store.sensor_timeout()
+        ttl = store.sensor_ttl()
+        trip = max(1, store.sensor_trip())
+        cooldown = max(1.0, store.sensor_cooldown())
         now = time.time()
         with self._lock:
-            if self._cache and now - self._cache["ts"] < self.ttl:
+            if self._cache and now - self._cache["ts"] < ttl:
                 return self._cache["data"], True
             if now < self._cooldown_until:
                 return None, False   # 熔断冷却期内快速失败，不发起网络请求
         try:
-            with urllib.request.urlopen(self.url, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(self.url, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             if payload.get(self.fields["status"]) not in ("ok", "partial"):
                 raise ValueError(f"sensor status={payload.get(self.fields['status'])}")
@@ -219,8 +225,8 @@ class HttpTempSensor:
         except (urllib.error.URLError, OSError, ValueError, KeyError, json.JSONDecodeError):
             with self._lock:
                 self._fail_count += 1
-                if self._fail_count >= self._TRIP:
-                    self._cooldown_until = time.time() + self._COOLDOWN
+                if self._fail_count >= trip:
+                    self._cooldown_until = time.time() + cooldown
                     self._fail_count = 0
             return None, False
 
@@ -234,7 +240,7 @@ class HttpLightControl:
     请求失败返回 None，由 LampDevice 上报控制失败（不在前端假装成功）。
     """
 
-    def __init__(self, base_url: str, fields: dict | None = None, timeout: float = 1.5):
+    def __init__(self, base_url: str, fields: dict | None = None, timeout: float = 3.0):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         f = fields or {}

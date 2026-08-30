@@ -19,7 +19,7 @@ window.ViewSysConfig = {
       // 灯杆管理
       lampSeeds: [ { id: "", name: "", location: "", rtsp_url: "", sensor_url: "", esp32_base: "", cfgStr: "" } ],
       // 服务接口参数
-      service: { infer_url: "", infer_timeout: 60, person_detect_interval: 5, sample_interval: 2 },
+      service: { infer_url: "", infer_timeout: 60, person_detect_interval: 5, sample_interval: 2, sensor_timeout: 3, sensor_ttl: 5, sensor_trip: 3, sensor_cooldown: 15 },
       // 设备在线检测参数
       monitor: { interval: 10, timeout: 1.5 },
       // 灯控接口全局默认格式（fallback）
@@ -85,6 +85,10 @@ window.ViewSysConfig = {
           infer_timeout: d.infer_timeout,
           person_detect_interval: d.person_detect_interval,
           sample_interval: d.sample_interval,
+          sensor_timeout: d.sensor_timeout,
+          sensor_ttl: d.sensor_ttl,
+          sensor_trip: d.sensor_trip,
+          sensor_cooldown: d.sensor_cooldown,
         };
         this.monitor = { interval: d.monitor_interval, timeout: d.monitor_timeout };
         this.lampCtrlDefault = { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status", ...d.lamp_ctrl_default };
@@ -405,7 +409,7 @@ window.ViewSysConfig = {
 
       <!-- 服务接口参数 -->
       <div class="section">
-        <h3>服务接口参数 <span class="desc">AI 识别地址 / 超时 / 识别间隔 / 采样间隔</span></h3>
+        <h3>服务接口参数 <span class="desc">AI 识别地址 / 超时 / 识别间隔 / 采样间隔 / 传感器超时与熔断</span></h3>
         <div class="alarm-rule">
           <label class="rule-item cfg-item"><span>AI 识别地址</span>
             <input class="cfg-input" style="width:260px;" v-model="service.infer_url"></label>
@@ -415,8 +419,17 @@ window.ViewSysConfig = {
             <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.person_detect_interval" min="1"></label>
           <label class="rule-item cfg-item"><span>采样间隔(秒)</span>
             <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sample_interval" min="0.5" step="0.5"></label>
+          <label class="rule-item cfg-item"><span>传感器超时(秒)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_timeout" min="0.5" step="0.5"></label>
+          <label class="rule-item cfg-item"><span>传感器缓存(秒)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_ttl" min="0.5" step="0.5"></label>
+          <label class="rule-item cfg-item"><span>熔断失败次数</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_trip" min="1" step="1"></label>
+          <label class="rule-item cfg-item"><span>熔断冷却(秒)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_cooldown" min="1" step="1"></label>
           <button class="btn-primary" :disabled="saving" @click="saveService">保存服务参数</button>
         </div>
+        <div class="note">说明：ESP32 /api/data 读取温湿度/光照/烟雾较慢（约 1~2 秒），传感器超时太短会导致请求频繁失败并触发熔断、数据变 0；一般超时设 3 秒、缓存 5 秒即可。</div>
       </div>
 
       <!-- 设备在线检测参数 -->

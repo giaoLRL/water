@@ -399,6 +399,10 @@ def sysconfig_get(_: dict = Depends(auth.require_perm("cfg_system"))):
         "sample_interval": store.sample_interval(),
         "monitor_interval": store.monitor_interval(),
         "monitor_timeout": store.monitor_timeout(),
+        "sensor_timeout": store.sensor_timeout(),
+        "sensor_ttl": store.sensor_ttl(),
+        "sensor_trip": store.sensor_trip(),
+        "sensor_cooldown": store.sensor_cooldown(),
         "sensor_fields": store.sensor_fields(),
         "running_lamps": [l.id for l in lamps],
     })
@@ -439,6 +443,14 @@ def sysconfig_set(body: SysConfigRequest, _: dict = Depends(auth.require_perm("c
                 store.set("monitor_interval", max(5.0, float(svc["monitor_interval"])))
             if "monitor_timeout" in svc:
                 store.set("monitor_timeout", max(0.5, float(svc["monitor_timeout"])))
+            if "sensor_timeout" in svc:
+                store.set("sensor_timeout", max(0.5, min(60.0, float(svc["sensor_timeout"]))))
+            if "sensor_ttl" in svc:
+                store.set("sensor_ttl", max(0.5, min(30.0, float(svc["sensor_ttl"]))))
+            if "sensor_trip" in svc:
+                store.set("sensor_trip", max(1.0, min(20.0, float(svc["sensor_trip"]))))
+            if "sensor_cooldown" in svc:
+                store.set("sensor_cooldown", max(1.0, min(300.0, float(svc["sensor_cooldown"]))))
         except (TypeError, ValueError):
             return err(40002, "服务参数中存在非法数值")
         msgs.append("服务参数已保存，即时生效")
