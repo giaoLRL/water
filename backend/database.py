@@ -698,9 +698,10 @@ def query_users() -> list[dict]:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
+            # 无参数 execute 不做 % 转义，DATE_FORMAT 直接用单 %（%% 会被 MySQL 原样输出）
             cur.execute(
                 "SELECT id, username, role, status, "
-                "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at "
+                "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at "
                 "FROM users ORDER BY id ASC",
             )
             return list(cur.fetchall())
