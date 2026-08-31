@@ -113,6 +113,9 @@ window.Charts = (() => {
       chart.dispose();
       chart = null;
     }
+    // 容器隐藏（display:none）时 clientWidth 为 0，此时初始化会得到错误的画布宽度。
+    // 直接跳过：切换 tab 时调用方会触发重绘（见各 tab 的 renderXxx / resizeAll）。
+    if (el.clientWidth === 0) return null;
     if (!chart) chart = registry[id] = window.echarts.init(el);
     if (option) chart.setOption(option, notMerge);
     return chart;

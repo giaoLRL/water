@@ -110,7 +110,7 @@ window.ViewSysConfig = {
       this.lampSeeds.splice(i, 1);
     },
     async saveLamps() {
-      if (!this.lampPosts.length) { this.showMsg("至少保留 1 个灯杆（或先只改不改删）", "error"); return; }
+      if (!this.lampPosts.length) { this.showMsg("至少保留 1 个机房（或先只改不改删）", "error"); return; }
       this.saving = true;
       try {
         const d = await API.sysConfigSet({ lamp_posts: this.lampPosts });
@@ -334,9 +334,9 @@ window.ViewSysConfig = {
   "unit": { "temperature": "C", "humidity": "%", "light": "lx" },
   "lastUpdateMs": 616
 }</pre>
-          <h4>② 灯控接口 GET {esp32_base}{on|off|state 路径}（路径可在"灯杆管理"或"灯控全局默认格式"配置）</h4>
+          <h4>② 灯控接口 GET {esp32_base}{on|off|state 路径}（路径可在"机房管理"或"灯控全局默认格式"配置）</h4>
 <pre>{ "status": "ok", "lamp": true }      // lamp: true=亮 false=灭；on 须返回 true、off 须返回 false 才算生效
-// 未单独配置灯控接口的灯杆，使用"灯控全局默认格式"里的 on/off/state/字段 组装请求</pre>
+// 未单独配置灯控接口的机房，使用"灯控全局默认格式"里的 on/off/state/字段 组装请求</pre>
           <h4>③ 系统接口统一返回格式（所有 /api/*）</h4>
 <pre>{
   "code": 0,        // 0=成功，见下方错误码
@@ -350,7 +350,7 @@ window.ViewSysConfig = {
                 <tr><td>0</td><td>成功</td></tr>
                 <tr><td>40002</td><td>参数错误</td></tr>
                 <tr><td>40003</td><td>控制指令执行失败（如灯控时 ESP32 离线）</td></tr>
-                <tr><td>40004</td><td>灯杆 / 记录不存在</td></tr>
+                <tr><td>40004</td><td>机房 / 记录不存在</td></tr>
                 <tr><td>40005</td><td>视频流暂无画面</td></tr>
                 <tr><td>50000</td><td>智能识别服务调用失败</td></tr>
               </tbody>
@@ -361,7 +361,7 @@ window.ViewSysConfig = {
 
       <!-- 灯杆管理 -->
       <div class="section">
-        <h3>灯杆管理 <span class="desc">ID / 名称 / 位置 / 视频流 / 传感器 / 灯控地址，支持增删</span></h3>
+        <h3>机房管理 <span class="desc">ID / 名称 / 位置 / 视频流 / 传感器 / 灯控地址，支持增删</span></h3>
         <div style="overflow-x:auto;">
           <table>
             <thead><tr>
@@ -370,8 +370,8 @@ window.ViewSysConfig = {
             <tbody>
               <tr v-for="(l, i) in lampSeeds" :key="i">
                 <td><input class="cfg-input" style="width:52px;" v-model="l.id" placeholder="01"></td>
-                <td><input class="cfg-input" style="width:86px;" v-model="l.name" placeholder="灯杆01"></td>
-                <td><input class="cfg-input" style="width:110px;" v-model="l.location" placeholder="东门主干道"></td>
+                <td><input class="cfg-input" style="width:86px;" v-model="l.name" placeholder="机房01"></td>
+                <td><input class="cfg-input" style="width:110px;" v-model="l.location" placeholder="机房A区"></td>
                 <td><input class="cfg-input" v-model="l.rtsp_url" placeholder="rtsp://... 空=无视频"></td>
                 <td><input class="cfg-input" style="width:200px;" v-model="l.sensor_url" placeholder="http://.../api/data"></td>
                 <td><input class="cfg-input" style="width:170px;" v-model="l.esp32_base" placeholder="http://...灯控"></td>
@@ -382,15 +382,15 @@ window.ViewSysConfig = {
           </table>
         </div>
         <div class="table-actions" style="margin-top:10px;">
-          <button class="btn-ghost" @click="addLamp">+ 新增灯杆</button>
-          <button class="btn-primary" :disabled="saving" @click="saveLamps">保存灯杆配置</button>
-          <span class="desc">保存仅重建/删除变化的灯杆，其余视频与识别不中断</span>
+          <button class="btn-ghost" @click="addLamp">+ 新增机房</button>
+          <button class="btn-primary" :disabled="saving" @click="saveLamps">保存机房配置</button>
+          <span class="desc">保存仅重建/删除变化的机房，其余视频与识别不中断</span>
         </div>
       </div>
 
       <!-- 灯控接口全局默认格式 -->
       <div class="section">
-        <h3>灯控接口全局默认格式 <span class="desc">fallback：未单独配置灯控接口的灯杆使用</span></h3>
+        <h3>灯控接口全局默认格式 <span class="desc">fallback：未单独配置灯控接口的机房使用</span></h3>
         <div class="alarm-rule">
           <label class="rule-item cfg-item"><span>开灯路径</span>
             <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.on"></label>
@@ -404,7 +404,7 @@ window.ViewSysConfig = {
             <input class="cfg-input" style="width:90px;" v-model="lampCtrlDefault.status"></label>
           <button class="btn-primary" :disabled="saving" @click="saveLampCtrl">保存默认格式</button>
         </div>
-        <div class="note">说明：未在"灯杆管理"里单独填写灯控接口的灯杆，用这里的 on/off/state/字段 组装请求 URL 与解析返回；在灯杆管理里填了就覆盖此项。</div>
+        <div class="note">说明：未在"机房管理"里单独填写灯控接口的机房，用这里的 on/off/state/字段 组装请求 URL 与解析返回；在机房管理里填了就覆盖此项。</div>
       </div>
 
       <!-- 服务接口参数 -->
@@ -463,7 +463,7 @@ window.ViewSysConfig = {
           <button class="btn-primary" :disabled="saving" @click="saveSensor">保存格式映射</button>
         </div>
         <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..} 为默认，
-        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾字段可选（无 MQ-2 的设备留空即可，自动回退默认）。保存后灯杆会重建以立即采用新格式。</div>
+        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾字段可选（无 MQ-2 的设备留空即可，自动回退默认）。保存后机房会重建以立即采用新格式。</div>
       </div>
 
       <!-- 账号与权限 -->

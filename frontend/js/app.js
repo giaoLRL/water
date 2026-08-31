@@ -140,13 +140,13 @@ const app = createApp({
       <div class="brand">
         <div class="logo" v-html="ICONS.logo"></div>
         <div>
-          <h1>基于物联网的分布式智慧灯杆监控系统</h1>
-          <div class="subtitle">多灯杆环境监测 · 视频监控 · 人员智能识别</div>
+          <h1>基于物联网的分布式机房监控系统</h1>
+          <div class="subtitle">多机房环境监测 · 视频监控 · 人员智能识别</div>
         </div>
       </div>
       <div class="status-chips">
         <span class="chip clickable" v-if="perm('cfg_system')" @click="openConfig"><span v-html="ICONS.gear" style="vertical-align:-2px;"></span> 系统配置</span>
-        <span class="chip" v-if="perm('view_device')"><span class="dot" :class="onlineCount ? 'green' : 'red'"></span>在线灯杆 {{ onlineCount }}</span>
+        <span class="chip" v-if="perm('view_device')"><span class="dot" :class="onlineCount ? 'green' : 'red'"></span>在线机房 {{ onlineCount }}</span>
         <span class="chip bell clickable" v-if="perm('view_alarm')" title="查看全站告警" @click="openAlarmCenter"><span v-html="ICONS.bell"></span><span class="badge" v-if="state.activeAlarmCount">{{ state.activeAlarmCount }}</span></span>
         <span class="chip" v-if="perm('view_alarm')">活跃告警 {{ state.activeAlarmCount }}</span>
         <span class="chip" v-if="perm('view_device')">{{ state.serverTime || "--" }}</span>

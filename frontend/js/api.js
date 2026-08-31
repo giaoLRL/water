@@ -55,10 +55,12 @@ window.API = (() => {
     return s ? "?" + s : "";
   }
 
-  function videoUrlOf(path) {
+  function videoUrlOf(path, ts) {
     // 视频流用 <img> 直连，token 挂 query；未登录时返回空串（前端不会渲染）
+    // ts 为时间戳：每次挂载/切换强制新 URL，避免浏览器复用旧的 MJPEG 连接导致黑屏
     const token = (window.Auth && window.Auth.token) || "";
-    return token ? `${path}?token=${encodeURIComponent(token)}` : "";
+    const t = ts || Date.now();
+    return token ? `${path}?token=${encodeURIComponent(token)}&t=${t}` : "";
   }
 
   return {
@@ -96,7 +98,7 @@ window.API = (() => {
     system: () => req("GET", "/api/system"),
     sysConfigGet: () => req("GET", "/api/sysconfig"),
     sysConfigSet: (body) => req("POST", "/api/sysconfig", body),
-    videoUrl: (id) => videoUrlOf(`/api/lampposts/${id}/video`),
-    detectVideoUrl: (id) => videoUrlOf(`/api/lampposts/${id}/detect_video`),
+    videoUrl: (id, ts) => videoUrlOf(`/api/lampposts/${id}/video`, ts),
+    detectVideoUrl: (id, ts) => videoUrlOf(`/api/lampposts/${id}/detect_video`, ts),
   };
 })();

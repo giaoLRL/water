@@ -35,32 +35,32 @@ DB_PORT = _env_int("IOT_DB_PORT", 3306)
 DB_USER = _env("IOT_DB_USER", "iot_user")
 DB_PASSWORD = _env("IOT_DB_PASSWORD", "iot_pass_2026")
 DB_NAME = _env("IOT_DB_NAME", "iot_system")
-DB_POOL_SIZE = _env_int("IOT_DB_POOL_SIZE", 5)
+DB_POOL_SIZE = _env_int("IOT_DB_POOL_SIZE", 12)
 
 # ---------- 采集 ----------
 SAMPLE_INTERVAL = _env_float("LAMP_SAMPLE_INTERVAL", 2.0)
 
-# ---------- 灯杆列表 ----------
-# 每个灯杆作为独立监控单元；rtsp_url 为空时使用模拟视频画面。
+# ---------- 机房列表 ----------
+# 每个机房作为独立监控单元；rtsp_url 为空时使用模拟视频画面。
 LAMP_POSTS = [
     {
         "id": "01",
-        "name": "灯杆01",
-        "location": "东门主干道",
+        "name": "机房01",
+        "location": "机房A区",
         "rtsp_url": "rtsp://admin:123456@192.168.31.201/stream0",
         "sensor_url": "http://192.168.31.100/api/data",  # ESP32 + DHT11 真实温湿度
         "esp32_base": "http://192.168.31.100",           # ESP32 灯控服务（MOS 继电器）
     },
     {
         "id": "02",
-        "name": "灯杆02",
-        "location": "南门广场",
+        "name": "机房02",
+        "location": "机房B区",
         "rtsp_url": "",
     },
     {
         "id": "03",
-        "name": "灯杆03",
-        "location": "西侧停车场",
+        "name": "机房03",
+        "location": "机房C区",
         "rtsp_url": "",
     },
 ]

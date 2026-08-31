@@ -39,7 +39,7 @@ window.ViewLogin = {
       <div class="login-logo">
         <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v18M8 6h10l-4 3 4 3H8"/><path d="M4 21h18"/></svg>
       </div>
-      <h2>基于物联网的分布式智慧灯杆监控系统</h2>
+      <h2>基于物联网的分布式机房监控系统</h2>
       <p class="login-sub">账号登录 · 权限由系统管理员分配</p>
       <input class="login-input" type="text" v-model="username" placeholder="用户名" autocomplete="username" @keyup.enter="doLogin">
       <input class="login-input" type="password" v-model="password" placeholder="密码" autocomplete="current-password" @keyup.enter="doLogin">
