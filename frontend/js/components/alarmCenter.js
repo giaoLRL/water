@@ -1,4 +1,4 @@
-/* 全站告警中心：聚合所有灯杆的告警记录与类型分布，可查看快照、跳转到对应灯杆。 */
+/* 全站告警中心：聚合所有机房的告警记录与类型分布，可查看快照、跳转到对应机房。 */
 window.ViewAlarmCenter = {
   name: "AlarmCenterView",
   emits: ["back", "goto"],
@@ -28,7 +28,8 @@ window.ViewAlarmCenter = {
       return r;
     },
     async load() {
-      await this.fetchAlarms(this.page);
+      // 告警记录与类型统计并行加载：统计接口很快，不必等慢的告警列表完成后再出图
+      this.fetchAlarms(this.page);
       this.fetchStats();
     },
     async fetchAlarms(page) {
@@ -78,7 +79,7 @@ window.ViewAlarmCenter = {
     <div class="detail-head">
       <button class="btn-ghost" @click="$emit('back')">← 返回</button>
       <h2>全站告警中心</h2>
-      <span class="desc">聚合所有灯杆的告警记录，点击可查看快照或跳转灯杆</span>
+      <span class="desc">聚合所有机房的告警记录，点击可查看快照或跳转机房</span>
     </div>
 
     <div class="section">
@@ -98,7 +99,7 @@ window.ViewAlarmCenter = {
       </div>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>时间</th><th>灯杆</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th><th>快照</th><th>操作</th></tr></thead>
+          <thead><tr><th>时间</th><th>机房</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th><th>快照</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="(a, i) in alarms" :key="i">
               <td>{{ a.ts }}</td>
@@ -109,7 +110,7 @@ window.ViewAlarmCenter = {
               <td>{{ a.direction === 'above' ? '超上限' : '低于下限' }}</td>
               <td><span class="badge" :class="a.status === 'active' ? 'danger' : 'ok'">{{ a.status === 'active' ? '告警中' : '已恢复' }}</span></td>
               <td><button class="btn-ghost" :disabled="!a.has_image" @click="viewAlarm(a.id)">{{ a.has_image ? '查看快照' : '无' }}</button></td>
-              <td><button class="btn-ghost" @click="goLamp(a.lamp_id)">前往灯杆</button></td>
+              <td><button class="btn-ghost" @click="goLamp(a.lamp_id)">前往机房</button></td>
             </tr>
             <tr v-if="!alarms.length"><td colspan="9" style="text-align:center;color:#6b7a90;">暂无告警记录</td></tr>
           </tbody>
@@ -134,7 +135,7 @@ window.ViewAlarmCenter = {
           <button class="close" @click="closeAlarm">×</button>
         </div>
         <div v-if="alarmDetail" class="detect-summary">
-          <span>灯杆 {{ alarmDetail.lamp_id }}</span>
+          <span>机房 {{ alarmDetail.lamp_id }}</span>
           <span>数值 <b>{{ alarmDetail.value }}</b>（阈值 {{ alarmDetail.threshold }}）</span>
           <span>{{ alarmDetail.direction === 'above' ? '超上限' : '低于下限' }}</span>
           <span class="badge" :class="alarmDetail.status === 'active' ? 'danger' : 'ok'">{{ alarmDetail.status === 'active' ? '告警中' : '已恢复' }}</span>

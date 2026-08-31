@@ -40,6 +40,8 @@ window.ViewLampDetail = {
       logKeyword: "", logStart: "", logEnd: "",
       // 灯光滑块（请求中禁用，防连点）
       lightBusy: false,
+      // 视频流时间戳：切换 tab / 重新进入时更新，强制 <img> 发起新连接避免黑屏
+      videoTs: Date.now(),
       // 历史明细（前端分页）
       histPage: 1, histPageSize: 10,
       timer: null,
@@ -47,10 +49,10 @@ window.ViewLampDetail = {
   },
   computed: {
     videoUrl() {
-      return API.videoUrl(this.lampId);
+      return API.videoUrl(this.lampId, this.videoTs);
     },
     detectVideoUrl() {
-      return API.detectVideoUrl(this.lampId);
+      return API.detectVideoUrl(this.lampId, this.videoTs);
     },
     sensorTag() {
       if (this.lamp.sensor_source === "esp32") {
@@ -99,6 +101,11 @@ window.ViewLampDetail = {
     }, 2000);
   },
   beforeUnmount() {
+    // 强制中止 MJPEG 视频流：直接移除 <img> 的 src，让浏览器立刻断开连接。
+    // 否则残留的视频流会持续占用浏览器连接池（连续进出详情页约三次后接口全部卡死）。
+    if (this.$el) {
+      this.$el.querySelectorAll("img.video-frame").forEach((im) => im.removeAttribute("src"));
+    }
     if (this.timer) clearInterval(this.timer);
   },
   methods: {
@@ -141,6 +148,8 @@ window.ViewLampDetail = {
         push(t.humidity, this.lamp.humidity || 0);
         push(t.luminance, this.lamp.luminance || 0);
         push(t.smoke, this.lamp.smoke || 0);
+        // 首次进入时图表实例尚未创建，refresh* 仅做 setOption 会空转；
+        // 这里用 render*（内部 init + setOption，幂等），保证首屏即渲染仪表盘与迷你曲线
         this.renderSparks();
         this.renderGauges();
       } catch (e) { /* silent */ }
@@ -163,9 +172,18 @@ window.ViewLampDetail = {
           this.trend.humidity = this.histPoints.map((p) => p.humidity).slice(-60);
           this.trend.luminance = this.histPoints.map((p) => p.luminance).slice(-60);
           this.trend.smoke = this.histPoints.map((p) => p.smoke).slice(-60);
+          this.renderSparks();
         }
         this.renderChart();
       } catch (err) { /* silent */ }
+    },
+    queryCustomHistory() {
+      // 自定义时间范围必须选起止时间，缺任一值时提示而不是静默回退
+      if (!this.customStart || !this.customEnd) {
+        alert("请选择自定义时间范围的开始和结束时间");
+        return;
+      }
+      this.fetchHistory("custom", this.customStart, this.customEnd);
     },
     async fetchStats(key) {
       const s = this.rangeStart(key || this.histRangeKey);
@@ -251,12 +269,23 @@ window.ViewLampDetail = {
       }
     },
     setTab(t) {
+      if (t === this.tab) return;
       this.tab = t;
+      // 每次切换强制刷新视频连接，避免 <img> 复用旧 MJPEG 连接不显示画面
+      this.videoTs = Date.now();
+      if (t === "monitor") {
+        // 切回监控立即重绘仪表盘/迷你曲线（容器从隐藏转可见，需按可见尺寸重绘）
+        this.$nextTick(() => {
+          this.renderGauges();
+          this.renderSparks();
+          setTimeout(() => window.Charts.resizeAll(), 120);
+        });
+      }
       if (t === "alarm") this.fetchAlarms(1);
       if (t === "detections") this.fetchDetections(1);
       if (t === "logs") this.fetchLogs(1);
       if (t === "history") { this.histPage = 1; this.fetchHistory(this.histRangeKey); }
-      setTimeout(() => window.Charts.resizeAll(), 120);
+      setTimeout(() => window.Charts.resizeAll(), 150);
     },
     async doControl(action) {
       try {
@@ -380,7 +409,7 @@ window.ViewLampDetail = {
         if (!Array.isArray(data) || data.length < 2) return;
         window.Charts.init(id, {
           grid: { left: 2, right: 2, top: 5, bottom: 2 },
-          xAxis: { type: "category", show: false, data },
+          xAxis: { type: "category", show: false, data: data.map((_, i) => i) },
           yAxis: { type: "value", show: false, min: "dataMin", max: "dataMax" },
           series: [{
             type: "line", data, showSymbol: false, smooth: true,
@@ -388,6 +417,20 @@ window.ViewLampDetail = {
             areaStyle: { color, opacity: 0.12 },
           }],
         });
+      });
+    },
+    refreshSparks() {
+      // 轻量更新：仅 setOption 数据，不重建图表实例
+      const defs = [
+        ["spark-temp", "temperature"],
+        ["spark-hum", "humidity"],
+        ["spark-lux", "luminance"],
+        ["spark-smoke", "smoke"],
+      ];
+      defs.forEach(([id, key]) => {
+        const data = this.trend[key];
+        if (!Array.isArray(data) || data.length < 2) return;
+        window.Charts.set(id, { series: [{ data }] });
       });
     },
     renderGauges() {
@@ -400,6 +443,18 @@ window.ViewLampDetail = {
       defs.forEach(([id, v, min, max, unit, color]) => {
         if (!document.getElementById(id)) return;
         window.Charts.init(id, window.Charts.gaugeOption(v, min, max, unit, color), false);
+      });
+    },
+    refreshGauges() {
+      // 轻量更新：仅更新仪表盘数值和烟雾报警颜色
+      const defs = [
+        ["gauge-temp", this.lamp.temperature || 0, -10, 60, "℃", "#2dd4bf"],
+        ["gauge-hum", this.lamp.humidity || 0, 0, 100, "%", "#38bdf8"],
+        ["gauge-lux", Math.min(this.lamp.luminance || 0, 100000), 0, 100000, "lx", "#fbbf24"],
+        ["gauge-smoke", Math.min(this.lamp.smoke || 0, 4095), 0, 4095, "AO", this.lamp.smoke_alarm ? "#f87171" : "#f472b6"],
+      ];
+      defs.forEach(([id, v, min, max, unit, color]) => {
+        window.Charts.set(id, window.Charts.gaugeOption(v, min, max, unit, color));
       });
     },
     renderDetectionChart() {
@@ -433,7 +488,7 @@ window.ViewLampDetail = {
     <div class="view-page">
       <div class="detail-head">
         <button class="btn-ghost" @click="$emit('back')">← 返回列表</button>
-        <h2>{{ lamp.name || '灯杆' + lampId }}</h2>
+        <h2>{{ lamp.name || '机房' + lampId }}</h2>
         <span class="desc">{{ lamp.location }}</span>
         <span class="lamp-dot" :class="lamp.light_state === 'on' ? 'on' : 'off'"></span>
         <div class="detail-controls">
@@ -483,7 +538,7 @@ window.ViewLampDetail = {
         <div class="grid-2 detail-cols">
           <div class="section" style="margin-bottom:0;">
             <h3>视频监控 <span class="desc">{{ lamp.video_source === 'rtsp' ? '实时视频' : '模拟画面' }}</span></h3>
-            <img class="video-frame" :src="videoUrl" alt="视频流">
+            <img class="video-frame" v-if="videoUrl" :src="videoUrl" alt="视频流">
           </div>
           <div class="section" style="margin-bottom:0;">
             <h3>人员智能监测 <span class="desc">持续自动识别</span></h3>
@@ -493,7 +548,7 @@ window.ViewLampDetail = {
               <span class="badge" :class="curDetect && curDetect.alarm_active ? 'danger' : 'ok'">{{ curDetect && curDetect.alarm_active ? '人流量告警' : '正常' }}</span>
               <span class="desc">{{ curDetect && curDetect.ts ? curDetect.ts : '识别启动中…' }}</span>
             </div>
-            <img class="video-frame" :src="detectVideoUrl" alt="标注视频流">
+            <img class="video-frame" v-if="detectVideoUrl" :src="detectVideoUrl" alt="标注视频流">
             <div v-if="!curDetect || !curDetect.enabled" class="note">人数告警规则未启用或识别服务尚未返回，可在“告警记录”页配置人数阈值。</div>
           </div>
         </div>
@@ -513,7 +568,7 @@ window.ViewLampDetail = {
             <input type="datetime-local" v-model="customStart">
             <span>至</span>
             <input type="datetime-local" v-model="customEnd">
-            <button class="btn-ghost" @click="fetchHistory('custom', customStart, customEnd)">查询</button>
+            <button class="btn-ghost" @click="queryCustomHistory">查询</button>
           </div>
           <div class="tabs">
             <span class="tab" :class="{ active: histType === 'all' }" @click="pickHistType('all')">全部</span>

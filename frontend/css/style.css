@@ -44,7 +44,7 @@ header {
   background: var(--bg-deep);
   border-bottom: 1px solid var(--border);
   padding: 0 20px;
-  height: 52px;
+  min-height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -661,6 +661,7 @@ td { font-variant-numeric: tabular-nums; }
 .lamp-light.on { color: var(--ok); border-color: var(--ok-soft); background: var(--ok-soft); }
 .lamp-video { color: var(--text-dim); }
 .lamp-video.real { color: var(--ok); }
+.lamp-video.offline { color: var(--danger); }
 .lamp-alarm { color: var(--danger); margin-left: auto; }
 .lamp-alarm b { font-family: var(--mono); }
 .lamp-alarm.none { color: var(--text-dim); margin-left: auto; }

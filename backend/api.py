@@ -3,6 +3,7 @@
 统一返回 {"code":0,"msg":"ok","data":...}；前端页面通过 /api/* 调用，
 接口文档在启动后访问 /docs 自动生成。
 """
+import asyncio
 import time
 import urllib.error
 from datetime import datetime
@@ -177,20 +178,28 @@ def video(lamp_id: str, _: dict = Depends(auth.require_perm("view_monitor"))):
     except LookupError as exc:
         return err(40004, str(exc))
 
-    def gen():
-        while True:
-            frame = lamp.video.get_frame()
-            if frame is None:
-                time.sleep(0.08)
-                continue
-            ok_flag, buf = cv2.imencode(".jpg", frame)
-            if not ok_flag:
-                continue
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + buf.tobytes() + b"\r\n")
-            time.sleep(0.08)
+    async def gen():
+        # 异步生成器：不占线程池线程，客户端断开时 Starlette 会立即取消并回收连接
+        try:
+            while True:
+                frame = lamp.video.get_frame()
+                if frame is None:
+                    await asyncio.sleep(0.08)
+                    continue
+                ok_flag, buf = await asyncio.to_thread(cv2.imencode, ".jpg", frame)
+                if not ok_flag:
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+                await asyncio.sleep(0.08)
+        except asyncio.CancelledError:
+            raise
 
-    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(
+        gen(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 # ---------- 截图与人员智能监测 ----------
@@ -278,22 +287,30 @@ def detect_video(lamp_id: str, _: dict = Depends(auth.require_perm("view_detect"
     except LookupError as exc:
         return err(40004, str(exc))
 
-    def gen():
-        while True:
-            detector = services.lamps.detector(lamp_id) if services.lamps else None
-            frame = detector.get_labeled_frame() if detector else None
-            if frame is None:
-                time.sleep(0.5)
-                continue
-            ok_flag, buf = cv2.imencode(".jpg", frame)
-            if not ok_flag:
-                time.sleep(0.5)
-                continue
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + buf.tobytes() + b"\r\n")
-            time.sleep(0.08)
+    async def gen():
+        # 异步生成器：无标注帧时睡眠等待；客户端断开立即取消，避免线程/连接泄漏
+        try:
+            while True:
+                detector = services.lamps.detector(lamp_id) if services.lamps else None
+                frame = detector.get_labeled_frame() if detector else None
+                if frame is None:
+                    await asyncio.sleep(0.5)
+                    continue
+                ok_flag, buf = await asyncio.to_thread(cv2.imencode, ".jpg", frame)
+                if not ok_flag:
+                    await asyncio.sleep(0.5)
+                    continue
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+                await asyncio.sleep(0.08)
+        except asyncio.CancelledError:
+            raise
 
-    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(
+        gen(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 # ---------- 人员监测记录 ----------

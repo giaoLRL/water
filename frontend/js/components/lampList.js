@@ -22,8 +22,8 @@ window.ViewLampList = {
     },
     overview() {
       return [
-        { ico: "lamp", label: "灯杆总数", num: this.lamps.length, cls: "" },
-        { ico: "signal", label: "在线灯杆", num: this.onlineCount, cls: "green" },
+        { ico: "lamp", label: "机房总数", num: this.lamps.length, cls: "" },
+        { ico: "signal", label: "在线机房", num: this.onlineCount, cls: "green" },
         { ico: "bulb", label: "灯光开启", num: this.lightOnCount, cls: "amber" },
         { ico: "bell", label: "活跃告警", num: this.alarmTotal, cls: this.alarmTotal ? "red" : "" },
       ];
@@ -45,7 +45,6 @@ window.ViewLampList = {
         this.drawAlarmPie();
         this.drawAlarmTree();
       },
-      deep: true,
     },
   },
   mounted() {
@@ -79,6 +78,14 @@ window.ViewLampList = {
     },
     statusCls(s) {
       return { online: "running", offline: "offline", sim: "sim", detecting: "detecting" }[s] || "";
+    },
+    /* 真实传感器（ESP32）对应指标是否明确离线：离线时页面应显示 "--" 而非 0 值假数据 */
+    sensorOff(l, kind) {
+      if (l.sensor_source !== "esp32") return false;
+      if (kind === "temp_hum") return l.sensor_online === false;
+      if (kind === "lux") return l.light_online === false;
+      if (kind === "smoke") return l.smoke_online === false;
+      return false;
     },
     /* 灯杆分布图：示意图坐标 + 实时状态着色，点击进入详情 */
     drawLampMap() {
@@ -185,7 +192,11 @@ window.ViewLampList = {
       });
       const names = Object.keys(byType).sort((x, y) => this.typeOrder(x) - this.typeOrder(y));
       const data = names.map((t) => ({ name: t, children: byType[t] }));
-      if (!data.length) return;
+      if (!data.length) {
+        // 全部告警恢复时清空旧图
+        window.Charts.init("lamp-alarm-tree", { series: [] });
+        return;
+      }
       window.Charts.init("lamp-alarm-tree", {
         tooltip: { backgroundColor: "#1a222d", borderColor: "#2a3442", textStyle: { color: "#d7e0ea" } },
         series: [{
@@ -209,8 +220,8 @@ window.ViewLampList = {
   template: `
     <div class="view-page">
       <div class="view-title">
-        <h2>智慧灯杆导航</h2>
-        <span class="desc">共 {{ lamps.length }} 个灯杆 · 点击卡片或地图点位进入详细信息</span>
+        <h2>智慧机房导航</h2>
+        <span class="desc">共 {{ lamps.length }} 个机房 · 点击卡片或地图点位进入详细信息</span>
       </div>
 
       <div class="overview-grid">
@@ -225,7 +236,7 @@ window.ViewLampList = {
 
       <div class="grid-2" style="margin-bottom:14px;">
         <div class="section" style="margin-bottom:0;">
-          <h3>灯杆分布图</h3>
+          <h3>机房分布图</h3>
           <div class="chart map-chart" id="lamp-map-chart"></div>
         </div>
         <div class="section" style="margin-bottom:0;">
@@ -237,7 +248,7 @@ window.ViewLampList = {
               <div class="empty-chart" v-if="!alarmItems.length">暂无活跃告警</div>
             </div>
             <div class="half">
-              <div class="half-title">类型 × 灯杆（占比占满）</div>
+              <div class="half-title">类型 × 机房（占比占满）</div>
               <div class="chart alarm-tree" id="lamp-alarm-tree"></div>
             </div>
           </div>
@@ -273,19 +284,19 @@ window.ViewLampList = {
           <div class="lamp-metrics">
             <div class="lamp-metric">
               <div class="l-label">环境温度</div>
-              <div class="l-value">{{ (l.temperature || 0).toFixed(1) }}<span class="l-unit">℃</span></div>
+              <div class="l-value">{{ sensorOff(l, 'temp_hum') ? '--' : (l.temperature || 0).toFixed(1) }}<span class="l-unit">℃</span></div>
             </div>
             <div class="lamp-metric">
               <div class="l-label">空气湿度</div>
-              <div class="l-value">{{ (l.humidity || 0).toFixed(1) }}<span class="l-unit">%</span></div>
+              <div class="l-value">{{ sensorOff(l, 'temp_hum') ? '--' : (l.humidity || 0).toFixed(1) }}<span class="l-unit">%</span></div>
             </div>
             <div class="lamp-metric">
               <div class="l-label">光照强度</div>
-              <div class="l-value">{{ fmtLux(l.luminance) }}<span class="l-unit">lx</span></div>
+              <div class="l-value">{{ sensorOff(l, 'lux') ? '--' : fmtLux(l.luminance) }}<span class="l-unit">lx</span></div>
             </div>
             <div class="lamp-metric" :class="{ 'smoke-warn': l.smoke_alarm }">
               <div class="l-label">{{ l.smoke_alarm ? '烟雾报警！' : '烟雾浓度' }}</div>
-              <div class="l-value">{{ fmtSmoke(l.smoke) }}</div>
+              <div class="l-value">{{ sensorOff(l, 'smoke') ? '--' : fmtSmoke(l.smoke) }}</div>
             </div>
           </div>
           <div class="lamp-card-foot">
@@ -293,7 +304,7 @@ window.ViewLampList = {
               灯光 {{ l.light_state === 'on' ? '开启' : '关闭' }}
             </span>
             <span class="lamp-video">{{ l.video_source === 'rtsp' ? '实时视频' : '模拟画面' }}</span>
-            <span class="lamp-video" :class="{ real: l.sensor_source === 'esp32' }">{{ l.sensor_source === 'esp32' ? '真实温湿度' : '无真实传感器' }}</span>
+            <span class="lamp-video" :class="{ real: l.sensor_source === 'esp32' && l.sensor_online !== false, offline: l.sensor_source === 'esp32' && l.sensor_online === false }">{{ l.sensor_source === 'esp32' ? (l.sensor_online === false ? '温湿度离线' : '真实温湿度') : '无真实传感器' }}</span>
             <span class="lamp-alarm" v-if="l.alarm_count">
               <b>{{ l.alarm_count }}</b> 告警
             </span>
@@ -302,7 +313,7 @@ window.ViewLampList = {
         </div>
       </div>
       <div class="section" v-if="!lamps.length">
-        <div style="text-align:center;color:#7d8b99;padding:20px;">暂无灯杆数据</div>
+        <div style="text-align:center;color:#7d8b99;padding:20px;">暂无机房数据</div>
       </div>
     </div>
   `,

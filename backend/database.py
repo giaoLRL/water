@@ -55,7 +55,11 @@ _TABLE_COLUMNS = {
 
 # 业务表的新增列：存在表结构时温和补列（不删表），避免丢失历史数据
 _EXTRA_COLUMNS = {
-    "alarms": {"image": "LONGTEXT NULL"},
+    "alarms": {
+        "image": "LONGTEXT NULL",
+        # 冗余标记：列表查询用 has_image 判断有无快照，避免全表读取 LONGTEXT 大图
+        "has_image": "TINYINT NOT NULL DEFAULT 0",
+    },
     "lamp_sensors": {
         "smoke": "DOUBLE NOT NULL DEFAULT 0",
         "smoke_alarm": "TINYINT NOT NULL DEFAULT 0",
@@ -159,8 +163,11 @@ def init_database() -> None:
                     status       VARCHAR(16) NOT NULL DEFAULT 'active',
                     recovered_at DATETIME NULL,
                     image        LONGTEXT NULL,
+                    has_image    TINYINT NOT NULL DEFAULT 0,
                     PRIMARY KEY (id),
-                    KEY idx_alarm_lamp_ts (lamp_id, ts)
+                    KEY idx_alarm_lamp_ts (lamp_id, ts),
+                    KEY idx_alarm_lamp_type_status (lamp_id, type, status),
+                    KEY idx_alarm_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
@@ -226,6 +233,25 @@ def init_database() -> None:
                     UNIQUE KEY uk_username (username)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
+            )
+            # 告警表增量索引（幂等迁移，不删表不丢数据）：
+            # 批量恢复 UPDATE 与分页查询按 (灯杆, 类型, 状态) 过滤，缺索引时全表扫描 + 行锁，
+            # 曾导致告警接口 10~30 秒卡顿；ts 索引加速全库倒序分页。
+            for index_name, columns in (
+                ("idx_alarm_lamp_type_status", "lamp_id, type, status"),
+                ("idx_alarm_ts", "ts"),
+            ):
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM information_schema.statistics "
+                    "WHERE table_schema = DATABASE() AND table_name = 'alarms' AND index_name = %s",
+                    (index_name,),
+                )
+                if cur.fetchone()["n"] == 0:
+                    cur.execute(f"ALTER TABLE alarms ADD INDEX `{index_name}` ({columns})")
+            # has_image 一次性回填：旧数据逐行判断一次（约十余秒），此后列表查询不再读大图
+            cur.execute(
+                "UPDATE alarms SET has_image = 1 "
+                "WHERE has_image = 0 AND image IS NOT NULL AND image <> ''"
             )
     finally:
         conn.close()
@@ -320,15 +346,17 @@ def update_or_insert_alarm(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s, image=%s "
+                "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s, "
+                "image=%s, has_image=%s "
                 "WHERE lamp_id=%s AND type=%s AND status='active'",
-                (ts, value, threshold, direction, message, image, lamp_id, type_),
+                (ts, value, threshold, direction, message, image, 1 if image else 0, lamp_id, type_),
             )
             if cur.rowcount == 0:
                 cur.execute(
-                    "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, status, image) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s)",
-                    (lamp_id, ts, type_, value, threshold, direction, message, image),
+                    "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, "
+                    "status, image, has_image) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)",
+                    (lamp_id, ts, type_, value, threshold, direction, message, image, 1 if image else 0),
                 )
     finally:
         conn.close()
@@ -400,7 +428,7 @@ def query_alarms(lamp_id: str | None, start: str | None, end: str | None,
             offset = (page - 1) * page_size
             sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
                    "threshold, direction, message, status, "
-                   "(image IS NOT NULL AND image <> '') AS has_image FROM alarms"
+                   "has_image FROM alarms"
                    + where + " ORDER BY ts DESC LIMIT %s OFFSET %s")
             cur.execute(sql, params + [page_size, offset])
             items = list(cur.fetchall())

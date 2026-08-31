@@ -6,6 +6,7 @@
 - 多线程安全：采集已改为线程池并行，内部状态通过可重入锁保护。
 """
 import threading
+import time
 from datetime import datetime
 
 import config
@@ -23,6 +24,7 @@ class AlarmEngine:
         self._lock = threading.RLock()
         self._thresholds = {}
         self._active = {}  # (lamp_id, type) -> item
+        self._last_sweep: dict[str, float] = {}  # 每机房兜底恢复扫表的时间戳（限频用）
         self.reload()
 
     def reload(self) -> None:
@@ -38,18 +40,30 @@ class AlarmEngine:
         with self._lock:
             return dict(self._thresholds)
 
-    def check(self, lamp_id: str, sensors: dict, image: str | None = None) -> list[dict]:
-        """检查一次采样，返回该灯杆当前全部活跃告警；处理新告警入库（携带异常快照图）与恢复。"""
-        with self._lock:
-            return self._check_locked(lamp_id, sensors, image)
+    def check(self, lamp_id: str, sensors: dict, image: str | None = None,
+              online: dict | None = None) -> list[dict]:
+        """检查一次采样，返回该灯杆当前全部活跃告警；处理新告警入库（携带异常快照图）与恢复。
 
-    def _check_locked(self, lamp_id: str, sensors: dict, image: str | None) -> list[dict]:
-        checks = [
-            ("temperature", "环境温度", sensors.get("temperature", 0.0), "temp_max", "temp_min"),
-            ("humidity", "空气湿度", sensors.get("humidity", 0.0), "humidity_max", "humidity_min"),
-            ("luminance", "光照强度", sensors.get("luminance", 0.0), "luminance_max", "luminance_min"),
-            ("smoke", "烟雾浓度", sensors.get("smoke", 0.0) or 0.0, "smoke_max", "smoke_min"),
-        ]
+        online: 真实传感器各指标在线状态 {temperature/humidity/luminance/smoke: bool}；
+                对应指标明确离线时不按 0 值判阈值，避免离线制造"低温/低湿"假告警。
+        """
+        with self._lock:
+            return self._check_locked(lamp_id, sensors, image, online)
+
+    def _check_locked(self, lamp_id: str, sensors: dict, image: str | None,
+                      online: dict | None = None) -> list[dict]:
+        # 真实传感器明确离线时跳过对应指标的阈值检查：离线时读数为 0，
+        # 若仍按阈值判定会产生"温度过低/湿度过低"等假告警（设备离线另有独立告警）。
+        checks = []
+        for key, label, hi_key, lo_key in (
+            ("temperature", "环境温度", "temp_max", "temp_min"),
+            ("humidity", "空气湿度", "humidity_max", "humidity_min"),
+            ("luminance", "光照强度", "luminance_max", "luminance_min"),
+            ("smoke", "烟雾浓度", "smoke_max", "smoke_min"),
+        ):
+            if online and online.get(key) is False:
+                continue
+            checks.append((key, label, sensors.get(key, 0.0), hi_key, lo_key))
         active_now: dict[str, dict] = {}
 
         for key, label, value, hi_key, lo_key in checks:
@@ -119,8 +133,13 @@ class AlarmEngine:
         # 兜底恢复：本轮不活跃的环境类型，把数据库中残留的 active 记录置为已恢复，
         # 保证进程重启后数据库 status 与内存真实活跃一致（幂等、每轮执行开销极小）。
         not_active = [t for t in ("temperature", "humidity", "luminance", "smoke") if t not in active_now]
+        # 兜底恢复是重启后的安全网，且为全表范围 UPDATE；正常切换由上方逐类型恢复处理，
+        # 这里限频每机房 60 秒一次，避免每轮（2 秒）批量 UPDATE 锁表拖垮接口。
         if not_active:
-            database.recover_alarms_for_types(lamp_id, not_active)
+            now = time.time()
+            if now - self._last_sweep.get(lamp_id, 0.0) >= 60.0:
+                database.recover_alarms_for_types(lamp_id, not_active)
+                self._last_sweep[lamp_id] = now
         return new_alarms
 
     def check_offline(self, lamp_id: str, snap: dict, image: str | None = None) -> list[dict]:
