@@ -103,6 +103,8 @@ def main() -> None:
     check("包含至少 3 个灯杆", len(lamps) >= 3, "count=" + str(len(lamps)))
     fields = ("id", "name", "location", "temperature", "humidity", "luminance", "light_state")
     check("灯杆摘要字段完整", all(k in lamps[0] for k in fields), str(lamps[0].keys()))
+    soil_fields = ("soil_raw", "soil_moisture", "soil_online", "valve_state")
+    check("灯杆含地面湿度与阀门字段", all(k in lamps[0] for k in soil_fields), str(lamps[0].keys()))
     lamp_id = lamps[0]["id"]
     r = request("GET", f"/api/lampposts/{lamp_id}")
     check("灯杆详情返回", r["code"] == 0 and r["data"]["id"] == lamp_id, str(r))
@@ -119,6 +121,14 @@ def main() -> None:
     check("关灯成功", r["code"] == 0 and r["data"]["light_state"] == "off", str(r))
     r = request("POST", f"/api/lampposts/{lamp_id}/control", {"action": "invalid"})
     check("非法指令返回 40002", r["code"] == 40002, str(r))
+
+    print("== 3.1 阀门控制（舵机） ==")
+    r = request("POST", f"/api/lampposts/{lamp_id}/valve", {"action": "on"})
+    check("开阀成功", r["code"] == 0 and r["data"]["valve_state"] == "on", str(r))
+    r = request("POST", f"/api/lampposts/{lamp_id}/valve", {"action": "off"})
+    check("关阀成功", r["code"] == 0 and r["data"]["valve_state"] == "off", str(r))
+    r = request("POST", f"/api/lampposts/{lamp_id}/valve", {"action": "invalid"})
+    check("非法阀门指令返回 40002", r["code"] == 40002, str(r))
 
     print("== 4. 历史数据 ==")
     start, end = now_fmt(-10), now_fmt(1)
@@ -167,6 +177,27 @@ def main() -> None:
     check("系统状态返回", r["code"] == 0 and "lamp_count" in r["data"] and "server_time" in r["data"], str(r))
     r = request("GET", "/api/sysconfig")
     check("系统配置可读取(cfg_system)", r["code"] == 0 and "lamp_posts" in r["data"], str(r))
+
+    print("== 9.0 阀门与土壤湿度配置 ==")
+    sc = request("GET", "/api/sysconfig")["data"]
+    old_valve = sc.get("valve", {})
+    old_soil = sc.get("soil", {})
+    try:
+        r = request("POST", "/api/sysconfig", {
+            "valve": {"open_angle": 45, "close_angle": 0,
+                      "valve_ctrl_default": {"path": "/api/servo/set", "angle_param": "angle",
+                                              "status": "status", "field": "angle", "method": "GET"}},
+            "soil": {"auto_close_enabled": 0, "close_threshold": 60},
+        })
+        check("保存阀门与土壤配置", r["code"] == 0, str(r))
+        sc2 = request("GET", "/api/sysconfig")["data"]
+        check("阀门配置已生效", sc2["valve"]["open_angle"] == 45 and sc2["valve"]["close_angle"] == 0, str(sc2["valve"]))
+        check("土壤配置已生效", sc2["soil"]["close_threshold"] == 60 and sc2["soil"]["auto_close_enabled"] == 0, str(sc2["soil"]))
+    finally:
+        request("POST", "/api/sysconfig", {
+            "valve": old_valve,
+            "soil": old_soil,
+        })
 
     print("== 9.1 设备不在线告警 ==")
     # 用灯杆02（光照可正常读取的设备）测试：改地址→离线告警→恢复→告警解除

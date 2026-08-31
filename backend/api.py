@@ -35,6 +35,10 @@ class ControlRequest(BaseModel):
     action: str = Field(pattern="^(on|off)$")
 
 
+class ValveRequest(BaseModel):
+    action: str = Field(pattern="^(on|off)$")
+
+
 class AlarmConfigRequest(BaseModel):
     temp_max: float | None = Field(default=None, ge=-50, le=100)
     temp_min: float | None = Field(default=None, ge=-50, le=100)
@@ -79,6 +83,8 @@ class SysConfigRequest(BaseModel):
     service: dict | None = None
     sensor_fields: dict | None = None
     lamp_ctrl_default: dict | None = None
+    valve: dict | None = None
+    soil: dict | None = None
 
 
 def _validate_range(start: str | None, end: str | None) -> None:
@@ -167,6 +173,23 @@ def control(lamp_id: str, body: ControlRequest, _: dict = Depends(auth.require_p
         return err(40003, f"控制指令执行失败: {exc}")
     exec_ms = round((time.perf_counter() - t0) * 1000, 1)
     database.insert_control_log(lamp_id, body.action, "success", f"响应 {exec_ms}ms")
+    return ok(_lamp_summary(lamp))
+
+
+@router.post("/lampposts/{lamp_id}/valve")
+def valve_control(lamp_id: str, body: ValveRequest, _: dict = Depends(auth.require_perm("ctrl_light"))):
+    """阀门（舵机）开关：开阀转开启角度，关阀转关闭角度（角度在配置页设置）。"""
+    try:
+        lamp = _get_lamp(lamp_id)
+    except LookupError as exc:
+        return err(40004, str(exc))
+    t0 = time.perf_counter()
+    try:
+        lamp.set_valve(body.action)
+    except Exception as exc:  # noqa: BLE001
+        return err(40003, f"阀门控制指令执行失败: {exc}")
+    exec_ms = round((time.perf_counter() - t0) * 1000, 1)
+    database.insert_control_log(lamp_id, f"valve_{body.action}", "success", f"响应 {exec_ms}ms")
     return ok(_lamp_summary(lamp))
 
 
@@ -425,6 +448,15 @@ def sysconfig_get(_: dict = Depends(auth.require_perm("cfg_system"))):
         "sensor_trip": store.sensor_trip(),
         "sensor_cooldown": store.sensor_cooldown(),
         "sensor_fields": store.sensor_fields(),
+        "valve": {
+            "open_angle": store.valve_open_angle(),
+            "close_angle": store.valve_close_angle(),
+            "valve_ctrl_default": store.valve_ctrl_default(),
+        },
+        "soil": {
+            "auto_close_enabled": int(bool(services.alarm.thresholds.get("soil_auto_close_enabled"))) if services.alarm else 0,
+            "close_threshold": float(services.alarm.thresholds.get("soil_close_threshold", 60.0)) if services.alarm else 60.0,
+        },
         "running_lamps": [l.id for l in lamps],
     })
 
@@ -484,6 +516,14 @@ def sysconfig_set(body: SysConfigRequest, _: dict = Depends(auth.require_perm("c
         # 烟雾字段可选：未填写则回退默认（适配无 MQ-2 的设备）
         sf.setdefault("smoke", "smokeRaw")
         sf.setdefault("smoke_alarm", "smokeAlarm")
+        # 地面湿度字段可选：留空则删除键，读取时回退默认 soilRaw/soilMoisture
+        for key in ("soil_raw", "soil_moisture"):
+            if key in sf:
+                v = str(sf.get(key) or "").strip()
+                if v:
+                    sf[key] = v
+                else:
+                    sf.pop(key, None)
         store.set_json("sensor_fields", sf)
         if services.lamps:
             # 字段映射变化 → 所有灯杆指纹变化 → 重建（生效）
@@ -496,6 +536,45 @@ def sysconfig_set(body: SysConfigRequest, _: dict = Depends(auth.require_perm("c
             # 全局灯控格式变化 → 未单独配置灯控接口的灯杆指纹变化 → 重建
             changed = services.lamps.reload()
         msgs.append("灯控全局默认格式已保存并生效")
+
+    if body.valve is not None:
+        v = body.valve
+        try:
+            open_a = float(v.get("open_angle", store.valve_open_angle()))
+            close_a = float(v.get("close_angle", store.valve_close_angle()))
+            if not (0 <= open_a <= 180 and 0 <= close_a <= 180):
+                raise ValueError
+            store.set("valve_open_angle", str(open_a))
+            store.set("valve_close_angle", str(close_a))
+        except (TypeError, ValueError):
+            return err(40002, "阀门角度必须是 0~180 的数字")
+        if "valve_ctrl_default" in v:
+            vc = dict(v["valve_ctrl_default"])
+            vc.setdefault("path", "/api/servo/set")
+            vc.setdefault("angle_param", "angle")
+            vc.setdefault("status", "status")
+            vc.setdefault("field", "angle")
+            vc.setdefault("method", "GET")
+            store.set_json("valve_ctrl_default", vc)
+            if services.lamps:
+                # 阀门接口格式变化 → 灯杆指纹变化 → 重建生效
+                changed = services.lamps.reload()
+        msgs.append("阀门配置已保存并生效")
+
+    if body.soil is not None:
+        s = body.soil
+        try:
+            enabled = 1.0 if s.get("auto_close_enabled") else 0.0
+            threshold = float(s.get("close_threshold", 60.0))
+            if not (0 <= threshold <= 100):
+                raise ValueError
+            database.set_config("soil_auto_close_enabled", str(enabled))
+            database.set_config("soil_close_threshold", str(threshold))
+            if services.alarm:
+                services.alarm.reload()
+        except (TypeError, ValueError):
+            return err(40002, "地面湿度阈值必须是 0~100 的数字")
+        msgs.append("地面湿度配置已保存并生效")
 
     return ok({"msg": "；".join(msgs), "changed": changed})
 

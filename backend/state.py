@@ -65,6 +65,7 @@ class Services:
                 sensor_ok = snap["sensor_online"]
                 light_ok = snap["light_online"]
                 smoke_ok = snap.get("smoke_online")
+                soil_ok = snap.get("soil_online")
                 if snap["sensor_source"] == "esp32":
                     s_status = "online" if sensor_ok is True else ("offline" if sensor_ok is False else "detecting")
                     s_detail = "ESP32 + DHT11"
@@ -72,10 +73,13 @@ class Services:
                     l_detail = "GY-302 (BH1750)"
                     m_status = "online" if smoke_ok is True else ("offline" if smoke_ok is False else "detecting")
                     m_detail = "MQ-2 (AO/DO)"
+                    soil_status = "online" if soil_ok is True else ("offline" if soil_ok is False else "detecting")
+                    soil_detail = "地面湿度传感器"
                 else:
                     s_status, s_detail = "sim", "无真实传感器"
                     l_status, l_detail = "sim", "无真实传感器"
                     m_status, m_detail = "sim", "无真实传感器"
+                    soil_status, soil_detail = "sim", "无真实传感器"
                 v_status = "online" if snap["video_online"] else "offline"
                 groups.append({
                     "group": snap["name"],
@@ -86,6 +90,8 @@ class Services:
                          "status": l_status, "detail": l_detail},
                         {"name": "烟雾", "type": "sensor_smoke",
                          "status": m_status, "detail": m_detail},
+                        {"name": "地面湿度", "type": "sensor_soil",
+                         "status": soil_status, "detail": soil_detail},
                         {"name": "视频", "type": "video",
                          "status": v_status,
                          "detail": "RTSP 实时" if snap["video_source"] == "rtsp" else "模拟画面"},

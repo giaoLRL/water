@@ -183,6 +183,8 @@ header h1 { font-size: 15px; font-weight: 600; color: var(--text); letter-spacin
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+/* 实时监控指标区：自动流式排列，容纳 5 张卡片（含地面湿度） */
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 
 /* ===== 实时仪表（等宽读数，无彩色竖条） ===== */
 .metric {

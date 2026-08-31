@@ -7,6 +7,7 @@
 """
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -49,18 +50,26 @@ def _collect_lamp(lamp) -> None:
         snap["light_state"],
         smoke=snap["smoke"],
         smoke_alarm=snap["smoke_alarm"],
+        soil_raw=snap["soil_raw"],
+        soil_moisture=snap["soil_moisture"],
     )
     # 异常快照：取当前视频帧（仅在触发新告警时写库）
     frame = lamp.video.get_frame()
     image = infer.frame_to_dataurl(frame) if frame is not None else None
+    # 快照兜底：首帧未就绪时稍等再取，确保新告警都能带上异常快照
+    if image is None:
+        time.sleep(0.5)
+        frame = lamp.video.get_frame()
+        image = infer.frame_to_dataurl(frame) if frame is not None else None
     # 真实传感器（ESP32）各指标在线状态：离线时告警引擎跳过数值阈值检查，避免 0 值假告警
     online = None
-    if getattr(lamp, "sensor_source", "") == "esp32":
+    if snap["sensor_source"] == "esp32":
         online = {
             "temperature": lamp.sensor_online,
             "humidity": lamp.sensor_online,
             "luminance": lamp.light_online,
             "smoke": lamp.smoke_online,
+            "soil": lamp.soil_online,
         }
     active = services.alarm.check(lamp.id, sensors, image=image, online=online)
     # 设备不在线告警：指标/传感器掉线本身即告警，全部在线自动恢复
@@ -68,6 +77,8 @@ def _collect_lamp(lamp) -> None:
     services.set_lamp_alarms(lamp.id, active)
     # 周期性读回真实灯状态（ESP32），保持页面显示与物理一致
     lamp.sync_light()
+    # 周期性读回舵机角度，保持阀门状态与物理一致
+    lamp.sync_valve()
 
 
 async def collect_loop() -> None:

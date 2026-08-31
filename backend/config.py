@@ -90,6 +90,9 @@ DEFAULT_THRESHOLDS = {
     # 人员数量告警规则：识别到人数 >= person_alert_min 时告警
     "person_alert_min": 3.0,
     "person_alert_enabled": 1.0,
+    # 地面湿度自动关阀规则：湿度百分比 >= soil_close_threshold 时自动关闭阀门
+    "soil_auto_close_enabled": 0.0,
+    "soil_close_threshold": 60.0,
 }
 
 # ---------- 路径 ----------

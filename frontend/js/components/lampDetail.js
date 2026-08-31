@@ -19,7 +19,7 @@ window.ViewLampDetail = {
       customStart: "",
       customEnd: "",
       // 实时趋势（仪表盘迷你曲线累积缓冲）
-      trend: { temperature: [], humidity: [], luminance: [], smoke: [] },
+      trend: { temperature: [], humidity: [], luminance: [], smoke: [], soil: [] },
       // 告警
       alarms: [],
       alarmTotal: 0, alarmPage: 1, alarmPageSize: 10,
@@ -40,6 +40,8 @@ window.ViewLampDetail = {
       logKeyword: "", logStart: "", logEnd: "",
       // 灯光滑块（请求中禁用，防连点）
       lightBusy: false,
+      // 阀门开关（请求中禁用，防连点）
+      valveBusy: false,
       // 视频流时间戳：切换 tab / 重新进入时更新，强制 <img> 发起新连接避免黑屏
       videoTs: Date.now(),
       // 历史明细（前端分页）
@@ -69,6 +71,12 @@ window.ViewLampDetail = {
     smokeTag() {
       if (this.lamp.sensor_source === "esp32") {
         return this.lamp.smoke_online === false ? "烟雾离线" : "烟雾浓度(MQ-2)";
+      }
+      return "无真实传感器";
+    },
+    soilTag() {
+      if (this.lamp.sensor_source === "esp32") {
+        return this.lamp.soil_online === false ? "地面湿度离线" : "地面湿度传感器";
       }
       return "无真实传感器";
     },
@@ -148,6 +156,7 @@ window.ViewLampDetail = {
         push(t.humidity, this.lamp.humidity || 0);
         push(t.luminance, this.lamp.luminance || 0);
         push(t.smoke, this.lamp.smoke || 0);
+        push(t.soil, this.lamp.soil_moisture || 0);
         // 首次进入时图表实例尚未创建，refresh* 仅做 setOption 会空转；
         // 这里用 render*（内部 init + setOption，幂等），保证首屏即渲染仪表盘与迷你曲线
         this.renderSparks();
@@ -172,6 +181,7 @@ window.ViewLampDetail = {
           this.trend.humidity = this.histPoints.map((p) => p.humidity).slice(-60);
           this.trend.luminance = this.histPoints.map((p) => p.luminance).slice(-60);
           this.trend.smoke = this.histPoints.map((p) => p.smoke).slice(-60);
+          this.trend.soil = this.histPoints.map((p) => p.soil_moisture).slice(-60);
           this.renderSparks();
         }
         this.renderChart();
@@ -313,6 +323,24 @@ window.ViewLampDetail = {
         this.lightBusy = false;
       }
     },
+    async onValveToggle(e) {
+      // 阀门滑块：目标态与当前一致则忽略
+      const target = e.target.checked ? "on" : "off";
+      if (this.lamp.valve_state === target) {
+        e.target.checked = this.lamp.valve_state === "on";
+        return;
+      }
+      this.valveBusy = true;
+      try {
+        const d = await API.valve(this.lampId, target);
+        this.lamp = d;
+      } catch (err) {
+        e.target.checked = this.lamp.valve_state === "on";
+        alert(err.message);
+      } finally {
+        this.valveBusy = false;
+      }
+    },
     async fetchDetectCurrent() {
       try {
         this.curDetect = await API.detectCurrent(this.lampId);
@@ -377,13 +405,16 @@ window.ViewLampDetail = {
           series: [
             window.Charts.lineSeries("环境温度", pts.map((p) => p.temperature), "#2dd4bf", 0),
             window.Charts.lineSeries("空气湿度", pts.map((p) => p.humidity), "#38bdf8", 0),
+            window.Charts.lineSeries("地面湿度", pts.map((p) => p.soil_moisture), "#34d399", 0),
             window.Charts.lineSeries("光照强度", pts.map((p) => p.luminance), "#fbbf24", 1),
           ],
         });
         return;
       }
       let data, name, color, unit;
-      if (this.histType === "humidity") {
+      if (this.histType === "soil") {
+        data = pts.map((p) => p.soil_moisture); name = "地面湿度"; color = "#34d399"; unit = "%";
+      } else if (this.histType === "humidity") {
         data = pts.map((p) => p.humidity); name = "空气湿度"; color = "#38bdf8"; unit = "%";
       } else if (this.histType === "luminance") {
         data = pts.map((p) => p.luminance); name = "光照强度"; color = "#fbbf24"; unit = "lx";
@@ -403,6 +434,7 @@ window.ViewLampDetail = {
         ["spark-hum", "humidity", "#38bdf8"],
         ["spark-lux", "luminance", "#fbbf24"],
         ["spark-smoke", "smoke", "#f472b6"],
+        ["spark-soil", "soil", "#34d399"],
       ];
       defs.forEach(([id, key, color]) => {
         const data = this.trend[key];
@@ -426,6 +458,7 @@ window.ViewLampDetail = {
         ["spark-hum", "humidity"],
         ["spark-lux", "luminance"],
         ["spark-smoke", "smoke"],
+        ["spark-soil", "soil"],
       ];
       defs.forEach(([id, key]) => {
         const data = this.trend[key];
@@ -439,6 +472,7 @@ window.ViewLampDetail = {
         ["gauge-hum", this.lamp.humidity || 0, 0, 100, "%", "#38bdf8"],
         ["gauge-lux", Math.min(this.lamp.luminance || 0, 100000), 0, 100000, "lx", "#fbbf24"],
         ["gauge-smoke", Math.min(this.lamp.smoke || 0, 4095), 0, 4095, "AO", this.lamp.smoke_alarm ? "#f87171" : "#f472b6"],
+        ["gauge-soil", Math.min(this.lamp.soil_moisture || 0, 100), 0, 100, "%", "#34d399"],
       ];
       defs.forEach(([id, v, min, max, unit, color]) => {
         if (!document.getElementById(id)) return;
@@ -452,6 +486,7 @@ window.ViewLampDetail = {
         ["gauge-hum", this.lamp.humidity || 0, 0, 100, "%", "#38bdf8"],
         ["gauge-lux", Math.min(this.lamp.luminance || 0, 100000), 0, 100000, "lx", "#fbbf24"],
         ["gauge-smoke", Math.min(this.lamp.smoke || 0, 4095), 0, 4095, "AO", this.lamp.smoke_alarm ? "#f87171" : "#f472b6"],
+        ["gauge-soil", Math.min(this.lamp.soil_moisture || 0, 100), 0, 100, "%", "#34d399"],
       ];
       defs.forEach(([id, v, min, max, unit, color]) => {
         window.Charts.set(id, window.Charts.gaugeOption(v, min, max, unit, color));
@@ -481,7 +516,7 @@ window.ViewLampDetail = {
       });
     },
     typeName(t) {
-      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量", smoke: "烟雾浓度", device_offline: "设备离线" }[t] || t;
+      return { temperature: "环境温度", humidity: "空气湿度", luminance: "光照强度", person: "人员数量", smoke: "烟雾浓度", soil: "地面湿度", device_offline: "设备离线" }[t] || t;
     },
   },
   template: `
@@ -499,6 +534,12 @@ window.ViewLampDetail = {
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
             <span class="toggle-state">{{ lamp.light_state === 'on' ? '灯光已开' : '灯光已关' }}</span>
+            <!-- 阀门（舵机）开关：与灯控一致 -->
+            <label class="toggle" :class="{ on: lamp.valve_state === 'on' }">
+              <input type="checkbox" :checked="lamp.valve_state === 'on'" :disabled="valveBusy" @change="onValveToggle">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+            <span class="toggle-state">{{ lamp.valve_state === 'on' ? '阀门已开' : '阀门已关' }}</span>
           </template>
           <span v-else class="toggle-state" style="color:var(--text-dim);">无灯光控制权限</span>
         </div>
@@ -514,7 +555,7 @@ window.ViewLampDetail = {
 
       <!-- 实时监控 -->
       <div v-show="tab === 'monitor'">
-        <div class="grid-4" style="margin-bottom:14px;">
+        <div class="metrics-grid" style="margin-bottom:14px;">
           <div class="metric gauge-box">
             <div class="label">环境温度 <span class="desc">{{ sensorTag }} · 阈值 {{ thresholds.temp_min ?? '--' }}~{{ thresholds.temp_max ?? '--' }}℃</span></div>
             <div class="gauge" id="gauge-temp"></div>
@@ -534,6 +575,11 @@ window.ViewLampDetail = {
             <div class="label" :class="{ 'smoke-alarm-label': lamp.smoke_alarm }">{{ lamp.smoke_alarm ? '烟雾报警！' : '烟雾浓度' }} <span class="desc">{{ smokeTag }}</span></div>
             <div class="gauge" id="gauge-smoke"></div>
             <div class="spark" id="spark-smoke"></div>
+          </div>
+          <div class="metric gauge-box">
+            <div class="label">地面湿度 <span class="desc">{{ soilTag }}</span></div>
+            <div class="gauge" id="gauge-soil"></div>
+            <div class="spark" id="spark-soil"></div>
           </div>
         </div>
         <div class="grid-2 detail-cols">
@@ -574,7 +620,8 @@ window.ViewLampDetail = {
           <div class="tabs">
             <span class="tab" :class="{ active: histType === 'all' }" @click="pickHistType('all')">全部</span>
             <span class="tab" :class="{ active: histType === 'temperature' }" @click="pickHistType('temperature')">温度</span>
-            <span class="tab" :class="{ active: histType === 'humidity' }" @click="pickHistType('humidity')">湿度</span>
+            <span class="tab" :class="{ active: histType === 'humidity' }" @click="pickHistType('humidity')">空气湿度</span>
+            <span class="tab" :class="{ active: histType === 'soil' }" @click="pickHistType('soil')">地面湿度</span>
             <span class="tab" :class="{ active: histType === 'luminance' }" @click="pickHistType('luminance')">光照</span>
             <span class="tab" :class="{ active: histType === 'smoke' }" @click="pickHistType('smoke')">烟雾</span>
           </div>
@@ -751,7 +798,7 @@ window.ViewLampDetail = {
                 <tr v-for="(l, i) in logs" :key="i">
                   <td>{{ l.ts }}</td>
                   <td>{{ l.lamp_id }}</td>
-                  <td>{{ l.action === 'on' ? '开灯' : '关灯' }}</td>
+                  <td>{{ l.action === 'on' ? '开灯' : l.action === 'off' ? '关灯' : l.action === 'valve_on' ? '开阀' : l.action === 'valve_off' ? '关阀' : l.action }}</td>
                   <td><span class="badge" :class="l.result === 'success' ? 'ok' : 'fail'">{{ l.result === 'success' ? '成功' : '失败' }}</span></td>
                   <td>{{ l.detail || '' }}</td>
                 </tr>

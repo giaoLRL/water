@@ -63,6 +63,8 @@ _EXTRA_COLUMNS = {
     "lamp_sensors": {
         "smoke": "DOUBLE NOT NULL DEFAULT 0",
         "smoke_alarm": "TINYINT NOT NULL DEFAULT 0",
+        "soil_raw": "DOUBLE NOT NULL DEFAULT 0",
+        "soil_moisture": "DOUBLE NOT NULL DEFAULT 0",
     },
 }
 
@@ -142,6 +144,8 @@ def init_database() -> None:
                     temperature  DOUBLE NOT NULL,
                     humidity     DOUBLE NOT NULL,
                     luminance    DOUBLE NOT NULL,
+                    soil_raw     DOUBLE NOT NULL DEFAULT 0,
+                    soil_moisture DOUBLE NOT NULL DEFAULT 0,
                     light_state  VARCHAR(8) NOT NULL,
                     PRIMARY KEY (id),
                     KEY idx_lamp_ts (lamp_id, ts)
@@ -285,14 +289,18 @@ def insert_sensor_data(
     light_state: str,
     smoke: float = 0.0,
     smoke_alarm: bool = False,
+    soil_raw: float = 0.0,
+    soil_moisture: float = 0.0,
 ) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO lamp_sensors (lamp_id, ts, temperature, humidity, luminance, light_state, smoke, smoke_alarm) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (lamp_id, ts, temperature, humidity, luminance, light_state, smoke, int(smoke_alarm)),
+                "INSERT INTO lamp_sensors (lamp_id, ts, temperature, humidity, luminance, "
+                "light_state, smoke, smoke_alarm, soil_raw, soil_moisture) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (lamp_id, ts, temperature, humidity, luminance, light_state,
+                 smoke, int(smoke_alarm), soil_raw, soil_moisture),
             )
     finally:
         conn.close()
@@ -304,7 +312,7 @@ def query_history(lamp_id: str, start: str, end: str, limit: int = 5000) -> list
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, temperature, humidity, luminance, "
-                "smoke, smoke_alarm, light_state FROM lamp_sensors "
+                "smoke, smoke_alarm, soil_raw, soil_moisture, light_state FROM lamp_sensors "
                 "WHERE lamp_id=%s AND ts BETWEEN %s AND %s ORDER BY ts ASC LIMIT %s",
                 (lamp_id, start, end, limit),
             )
@@ -347,9 +355,10 @@ def update_or_insert_alarm(
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s, "
-                "image=%s, has_image=%s "
+                "image=COALESCE(%s, image), "
+                "has_image=CASE WHEN %s IS NOT NULL THEN 1 ELSE has_image END "
                 "WHERE lamp_id=%s AND type=%s AND status='active'",
-                (ts, value, threshold, direction, message, image, 1 if image else 0, lamp_id, type_),
+                (ts, value, threshold, direction, message, image, image, lamp_id, type_),
             )
             if cur.rowcount == 0:
                 cur.execute(

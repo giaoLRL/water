@@ -85,6 +85,7 @@ window.API = (() => {
     stats: (id, start, end) =>
       req("GET", `/api/lampposts/${id}/stats?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
     control: (id, action) => req("POST", `/api/lampposts/${id}/control`, { action }),
+    valve: (id, action) => req("POST", `/api/lampposts/${id}/valve`, { action }),
     detect: (id) => req("POST", `/api/lampposts/${id}/detect`),
     detectCurrent: (id) => req("GET", `/api/lampposts/${id}/detect/current`),
     detections: (lampId, params) => req("GET", "/api/detections" + qs(lampId, params)),

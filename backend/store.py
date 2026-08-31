@@ -81,6 +81,27 @@ def lamp_ctrl_default() -> dict:
     }))
 
 
+def valve_open_angle() -> float:
+    """阀门开启角度（舵机 0~180）。"""
+    return get_float("valve_open_angle", 45.0)
+
+
+def valve_close_angle() -> float:
+    """阀门关闭角度（舵机 0~180）。"""
+    return get_float("valve_close_angle", 0.0)
+
+
+def valve_ctrl_default() -> dict:
+    """阀门接口全局默认格式：路径 / 角度参数名 / status 字段 / 角度字段 / 请求方式。"""
+    return dict(get_json("valve_ctrl_default", {
+        "path": "/api/servo/set",
+        "angle_param": "angle",
+        "status": "status",
+        "field": "angle",
+        "method": "GET",
+    }))
+
+
 def infer_url() -> str:
     return get("infer_url", config.INFER_URL)
 

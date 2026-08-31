@@ -24,8 +24,13 @@ window.ViewSysConfig = {
       monitor: { interval: 10, timeout: 1.5 },
       // 灯控接口全局默认格式（fallback）
       lampCtrlDefault: { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status" },
+      // 阀门（舵机）接口全局默认格式（fallback）
+      valveCtrlDefault: { path: "/api/servo/set", angle_param: "angle", status: "status", field: "angle", method: "GET" },
+      // 阀门与土壤湿度
+      valve: { openAngle: 45, closeAngle: 0 },
+      soil: { autoCloseEnabled: 0, closeThreshold: 60 },
       // 传感器格式映射
-      sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light", smoke: "smokeRaw", smoke_alarm: "smokeAlarm" },
+      sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light", smoke: "smokeRaw", smoke_alarm: "smokeAlarm", soil_raw: "soilRaw", soil_moisture: "soilMoisture" },
       msg: "",
       msgType: "",
     };
@@ -92,7 +97,12 @@ window.ViewSysConfig = {
         };
         this.monitor = { interval: d.monitor_interval, timeout: d.monitor_timeout };
         this.lampCtrlDefault = { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status", ...d.lamp_ctrl_default };
-        this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", ...d.sensor_fields };
+        this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", soil_raw: "soilRaw", soil_moisture: "soilMoisture", ...d.sensor_fields };
+        const v = d.valve || {};
+        this.valve = { openAngle: v.open_angle ?? 45, closeAngle: v.close_angle ?? 0 };
+        this.valveCtrlDefault = { path: "/api/servo/set", angle_param: "angle", status: "status", field: "angle", method: "GET", ...(v.valve_ctrl_default || {}) };
+        const s = d.soil || {};
+        this.soil = { autoCloseEnabled: s.auto_close_enabled ? 1 : 0, closeThreshold: s.close_threshold ?? 60 };
         // 账号与权限（有管理权限才拉取）
         if (this.canManageAccount) {
           await this.loadAccount();
@@ -154,6 +164,41 @@ window.ViewSysConfig = {
         this.showMsg(e.message, "error");
       } finally {
         this.saving = false;
+      }
+    },
+    async saveValve() {
+      this.saving = true;
+      try {
+        const d = await API.sysConfigSet({
+          valve: {
+            open_angle: this.valve.openAngle,
+            close_angle: this.valve.closeAngle,
+            valve_ctrl_default: this.valveCtrlDefault,
+          },
+        });
+        this.showMsg(d.msg, "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+        this.load();
+      }
+    },
+    async saveSoil() {
+      this.saving = true;
+      try {
+        const d = await API.sysConfigSet({
+          soil: {
+            auto_close_enabled: this.soil.autoCloseEnabled ? 1 : 0,
+            close_threshold: this.soil.closeThreshold,
+          },
+        });
+        this.showMsg(d.msg, "ok");
+      } catch (e) {
+        this.showMsg(e.message, "error");
+      } finally {
+        this.saving = false;
+        this.load();
       }
     },
     async saveMonitor() {
@@ -323,7 +368,7 @@ window.ViewSysConfig = {
           </span>
         </div>
         <div v-if="showSpec" class="spec-body">
-          <h4>① 传感器接口 GET {sensor_url}（对应下方"传感器格式映射"六项）</h4>
+          <h4>① 传感器接口 GET {sensor_url}（对应下方"传感器格式映射"八项）</h4>
 <pre>{
   "status": "ok",              // ok=全部正常 / partial=部分不可用
   "temperature": 24.1,         // 温度 ℃
@@ -331,13 +376,17 @@ window.ViewSysConfig = {
   "light": 19.2,               // 光照 lx（读不到时为 null）
   "smokeRaw": 1234,            // 烟雾浓度（MQ-2 AO 原始值 0~4095，可空）
   "smokeAlarm": false,         // 烟雾报警（MQ-2 DO，true=超标，可空）
+  "soilRaw": 1234,             // 地面湿度原始值（0~4095，可空）
+  "soilMoisture": 69.9,        // 地面湿度百分比 0~100（可空）
   "unit": { "temperature": "C", "humidity": "%", "light": "lx" },
   "lastUpdateMs": 616
 }</pre>
           <h4>② 灯控接口 GET {esp32_base}{on|off|state 路径}（路径可在"机房管理"或"灯控全局默认格式"配置）</h4>
 <pre>{ "status": "ok", "lamp": true }      // lamp: true=亮 false=灭；on 须返回 true、off 须返回 false 才算生效
 // 未单独配置灯控接口的机房，使用"灯控全局默认格式"里的 on/off/state/字段 组装请求</pre>
-          <h4>③ 系统接口统一返回格式（所有 /api/*）</h4>
+          <h4>③ 阀门接口（舵机）GET/POST {esp32_base}/api/servo/set?angle=0~180（路径/参数/请求方式可在"阀门接口全局默认格式"配置）</h4>
+<pre>{ "status": "ok", "angle": 45 }      // status=ok 即认为设置成功；angle 为当前角度</pre>
+          <h4>④ 系统接口统一返回格式（所有 /api/*）</h4>
 <pre>{
   "code": 0,        // 0=成功，见下方错误码
   "msg": "ok",
@@ -407,6 +456,45 @@ window.ViewSysConfig = {
         <div class="note">说明：未在"机房管理"里单独填写灯控接口的机房，用这里的 on/off/state/字段 组装请求 URL 与解析返回；在机房管理里填了就覆盖此项。</div>
       </div>
 
+      <!-- 阀门接口全局默认格式 -->
+      <div class="section">
+        <h3>阀门接口全局默认格式 <span class="desc">ESP32 舵机阀门（/api/servo/set）</span></h3>
+        <div class="alarm-rule">
+          <label class="rule-item cfg-item"><span>设置路径</span>
+            <input class="cfg-input" style="width:150px;" v-model="valveCtrlDefault.path"></label>
+          <label class="rule-item cfg-item"><span>角度参数名</span>
+            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.angle_param"></label>
+          <label class="rule-item cfg-item"><span>status 字段</span>
+            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.status"></label>
+          <label class="rule-item cfg-item"><span>角度字段</span>
+            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.field"></label>
+          <label class="rule-item cfg-item"><span>请求方式</span>
+            <select class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+            </select></label>
+          <button class="btn-primary" :disabled="saving" @click="saveValve">保存默认格式</button>
+        </div>
+        <div class="note">说明：阀门开/关通过该接口设置舵机角度（0~180）。GET 方式带 ?角度参数名=角度；POST 方式提交 JSON 参数。</div>
+      </div>
+
+      <!-- 阀门与土壤湿度 -->
+      <div class="section">
+        <h3>阀门与土壤湿度 <span class="desc">阀门角度 · 自动关阀（地面湿度达到阈值即关闭阀门）</span></h3>
+        <div class="alarm-rule">
+          <label class="rule-item cfg-item"><span>开启角度</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="valve.openAngle" min="0" max="180"></label>
+          <label class="rule-item cfg-item"><span>关闭角度</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="valve.closeAngle" min="0" max="180"></label>
+          <label class="rule-item cfg-item"><span>自动关阀</span>
+            <input type="checkbox" v-model="soil.autoCloseEnabled" :true-value="1" :false-value="0"></label>
+          <label class="rule-item cfg-item"><span>湿度阈值(%)</span>
+            <input class="cfg-input" style="width:70px;" type="number" v-model.number="soil.closeThreshold" min="0" max="100"></label>
+          <button class="btn-primary" :disabled="saving" @click="saveSoil">保存阀门与土壤配置</button>
+        </div>
+        <div class="note">说明：开启角度用于手动开阀；关闭角度用于手动关阀与自动关阀。开启自动关阀后，地面湿度百分比 ≥ 阈值时自动关闭阀门（恢复需手动开阀）。</div>
+      </div>
+
       <!-- 服务接口参数 -->
       <div class="section">
         <h3>服务接口参数 <span class="desc">AI 识别地址 / 超时 / 识别间隔 / 采样间隔 / 传感器超时与熔断</span></h3>
@@ -460,10 +548,14 @@ window.ViewSysConfig = {
             <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke"></label>
           <label class="rule-item cfg-item"><span>烟雾报警字段</span>
             <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke_alarm"></label>
+          <label class="rule-item cfg-item"><span>地面湿度原始值字段</span>
+            <input class="cfg-input" style="width:110px;" v-model="sensorFields.soil_raw"></label>
+          <label class="rule-item cfg-item"><span>地面湿度百分比字段</span>
+            <input class="cfg-input" style="width:110px;" v-model="sensorFields.soil_moisture"></label>
           <button class="btn-primary" :disabled="saving" @click="saveSensor">保存格式映射</button>
         </div>
-        <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..} 为默认，
-        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾字段可选（无 MQ-2 的设备留空即可，自动回退默认）。保存后机房会重建以立即采用新格式。</div>
+        <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..,"soilRaw":..,"soilMoisture":..} 为默认，
+        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾/地面湿度字段可选（无对应传感器的设备留空即可，自动回退默认）。保存后机房会重建以立即采用新格式。</div>
       </div>
 
       <!-- 账号与权限 -->

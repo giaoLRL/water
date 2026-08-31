@@ -11,6 +11,7 @@ from datetime import datetime
 
 import config
 import database
+from state import services
 
 
 class AlarmEngine:
@@ -98,6 +99,23 @@ class AlarmEngine:
                 "message": f"检测到烟雾超标（硬件报警），浓度 {smoke_val}",
             }
 
+        # 地面湿度：达到阈值自动关闭阀门（开关/阈值可在配置页修改；离线跳过）
+        soil_val = sensors.get("soil_moisture")
+        soil_enabled = bool(self._thresholds.get("soil_auto_close_enabled", 0.0))
+        soil_threshold = float(self._thresholds.get("soil_close_threshold", 60.0))
+        # online 为 None 表示无真实传感器（模拟机房），不参与地面湿度检查
+        if (soil_enabled and online is not None and soil_val is not None
+                and float(soil_val) >= soil_threshold
+                and not (online and online.get("soil") is False)):
+            active_now["soil"] = {
+                "lamp_id": lamp_id,
+                "type": "soil",
+                "label": "地面湿度",
+                "value": round(float(soil_val), 2),
+                "threshold": soil_threshold,
+                "direction": "above",
+            }
+
         # 恢复已回正常范围的告警（人员告警由 check_person 单独管理，此处跳过）
         for (lid, key) in list(self._active):
             if lid == lamp_id and key != "person" and key not in active_now:
@@ -118,6 +136,9 @@ class AlarmEngine:
                     message,
                     image=image,
                 )
+                # 地面湿度达到阈值：新告警首次触发时自动关闭阀门
+                if key == "soil":
+                    self._auto_close_valve(lamp_id)
 
         # 更新活跃集合（保留人员活跃项，便于本方法将其并入快照）
         for lid_key in list(self._active):
@@ -132,7 +153,7 @@ class AlarmEngine:
 
         # 兜底恢复：本轮不活跃的环境类型，把数据库中残留的 active 记录置为已恢复，
         # 保证进程重启后数据库 status 与内存真实活跃一致（幂等、每轮执行开销极小）。
-        not_active = [t for t in ("temperature", "humidity", "luminance", "smoke") if t not in active_now]
+        not_active = [t for t in ("temperature", "humidity", "luminance", "smoke", "soil") if t not in active_now]
         # 兜底恢复是重启后的安全网，且为全表范围 UPDATE；正常切换由上方逐类型恢复处理，
         # 这里限频每机房 60 秒一次，避免每轮（2 秒）批量 UPDATE 锁表拖垮接口。
         if not_active:
@@ -141,6 +162,18 @@ class AlarmEngine:
                 database.recover_alarms_for_types(lamp_id, not_active)
                 self._last_sweep[lamp_id] = now
         return new_alarms
+
+    def _auto_close_valve(self, lamp_id: str) -> None:
+        """地面湿度达到阈值：自动关闭阀门并记录操作日志（失败不阻塞告警）。"""
+        try:
+            lamp = services.lamps.get(lamp_id) if services.lamps else None
+            if lamp is None:
+                return
+            lamp.set_valve("off")
+            database.insert_control_log(lamp_id, "valve_off", "success", "地面湿度达到阈值自动关阀")
+        except Exception as exc:  # noqa: BLE001
+            database.insert_control_log(lamp_id, "valve_off", "failed",
+                                        f"地面湿度达到阈值自动关阀失败: {exc}")
 
     def check_offline(self, lamp_id: str, snap: dict, image: str | None = None) -> list[dict]:
         """设备不在线告警：设备/指标掉线本身即告警（非数值异常）。

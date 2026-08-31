@@ -217,6 +217,8 @@ class HttpTempSensor:
                 "light": payload.get(self.fields["light"]),
                 "smoke": payload.get(self.fields.get("smoke", "smokeRaw")),
                 "smoke_alarm": payload.get(self.fields.get("smoke_alarm", "smokeAlarm")),
+                "soil_raw": payload.get(self.fields.get("soil_raw") or "soilRaw"),
+                "soil_moisture": payload.get(self.fields.get("soil_moisture") or "soilMoisture"),
             }
             with self._lock:
                 self._cache = {"data": data, "ts": time.time()}
@@ -276,11 +278,59 @@ class HttpLightControl:
         return self._call(self.paths["state"])
 
 
+class HttpValveControl:
+    """ESP32 舵机阀门控制：设置角度（0~180）。
+
+    接口约定（ESP32）：GET {base}/api/servo/set?angle=45 返回 {"status":"ok","angle":45}；
+    路径 / 角度参数名 / 字段名 / 请求方式可在"系统配置页 → 阀门接口全局默认格式"修改。
+    """
+
+    def __init__(self, base_url: str, fields: dict | None = None, timeout: float = 3.0):
+        self.base = base_url.rstrip("/")
+        self.timeout = timeout
+        f = fields or {}
+        self.path = f.get("path", "/api/servo/set")
+        self.angle_param = f.get("angle_param", "angle")
+        self.status_field = f.get("status", "status")
+        self.angle_field = f.get("field", "angle")
+        self.method = (f.get("method", "GET") or "GET").upper()
+
+    def set_angle(self, angle: int) -> bool | None:
+        """下发任意角度，返回是否确认 status=ok；None=不可达/解析失败。"""
+        url = self.base + (self.path if self.path.startswith("/") else "/" + self.path)
+        data = None
+        headers = {}
+        if self.method == "POST":
+            data = json.dumps({self.angle_param: angle}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+        else:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{self.angle_param}={angle}"
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=self.method)
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            return payload.get(self.status_field) == "ok"
+        except Exception:  # noqa: BLE001
+            return None
+
+    def health_angle(self) -> int | None:
+        """从 ESP32 /api/health 读回当前舵机角度，用于状态同步；失败返回 None。"""
+        try:
+            with urllib.request.urlopen(self.base + "/api/health", timeout=self.timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            a = payload.get("servoAngle")
+            return int(a) if a is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+
 class LampDevice:
     """单灯杆：传感器（真实 HTTP，无数据时为 0）+ 灯光（电磁阀）控制 + 视频流。"""
 
     def __init__(self, lamp: dict, sensor_fields: dict | None = None,
-                 lamp_ctrl_fields: dict | None = None):
+                 lamp_ctrl_fields: dict | None = None,
+                 valve_ctrl_fields: dict | None = None):
         self.id = lamp["id"]
         self.name = lamp["name"]
         self.location = lamp["location"]
@@ -289,15 +339,19 @@ class LampDevice:
         self.fp = (self.id, self.name, self.location, self.rtsp_url,
                    lamp.get("sensor_url", ""), lamp.get("esp32_base", ""),
                    json.dumps(sensor_fields or {}, ensure_ascii=False, sort_keys=True),
-                   json.dumps(lamp_ctrl_fields or {}, ensure_ascii=False, sort_keys=True))
+                   json.dumps(lamp_ctrl_fields or {}, ensure_ascii=False, sort_keys=True),
+                   json.dumps(valve_ctrl_fields or {}, ensure_ascii=False, sort_keys=True))
         self._lock = threading.Lock()
         self._light_state = "off"
+        self.valve_state = "off"
         # 无真实数据时数值为 0（不使用模拟数据）
         self._temperature = 0.0
         self._humidity = 0.0
         self._luminance = 0.0
         self._smoke = 0.0            # 烟雾浓度（MQ-2 AO 原始值 0~4095）
         self._smoke_alarm = False    # 烟雾报警状态（MQ-2 DO，低电平=超标）
+        self._soil_raw = 0.0         # 地面湿度原始值（0~4095）
+        self._soil_moisture = 0.0    # 地面湿度百分比（0~100）
         self.online = True
         # 真实温湿度/光照传感器（ESP32 HTTP 接口），未配置时为 None
         sensor_url = lamp.get("sensor_url", "") or ""
@@ -305,11 +359,14 @@ class LampDevice:
         # 真实灯控（ESP32 + MOS 继电器），未配置时为 None
         light_base = lamp.get("esp32_base", "") or ""
         self._light_ctrl = HttpLightControl(light_base, fields=lamp_ctrl_fields) if light_base else None
+        # 阀门（舵机），与灯控共用 esp32_base；未配置时为 None（仅本地状态）
+        self._valve_ctrl = HttpValveControl(light_base, fields=valve_ctrl_fields) if light_base else None
         self._sync_counter = 0
         # None=未检测, True=在线, False=离线（真实传感器）
         self.sensor_online: bool | None = None   # ESP32 接口整体在线状态（温湿度）
         self.light_online: bool | None = None    # GY-302 光照传感器在线状态
         self.smoke_online: bool | None = None    # MQ-2 烟雾传感器在线状态（读到 smoke 字段即在线）
+        self.soil_online: bool | None = None     # 地面湿度传感器在线状态（读到土壤字段即在线）
         # 先占位，避免视频线程起来时 snapshot() 访问 self.video 报错
         self.video = None
         self.video = VideoStream(self, self.rtsp_url)
@@ -320,11 +377,14 @@ class LampDevice:
             temp = hum = lux = 0.0
             smoke = 0.0
             smoke_alarm = False
+            soil_raw = 0.0
+            soil_moisture = 0.0
             if self._http_sensor is not None:
                 real, ok = self._http_sensor.read()
                 self.sensor_online = ok
                 light_ok = False
                 smoke_ok = False
+                soil_ok = False
                 if ok:
                     t = real.get("temperature")
                     h = real.get("humidity")
@@ -340,26 +400,40 @@ class LampDevice:
                     if s is not None:
                         smoke = max(0.0, float(s))
                         smoke_ok = True
+                    sr = real.get("soil_raw")
+                    sm = real.get("soil_moisture")
+                    if sr is not None:
+                        soil_raw = float(sr)
+                        soil_ok = True
+                    if sm is not None:
+                        soil_moisture = max(0.0, min(100.0, float(sm)))
+                        soil_ok = True
                     # MQ-2 报警：truthy 字符串/数字均视为 true
                     sa = real.get("smoke_alarm")
                     smoke_alarm = sa is True or str(sa).lower() in ("1", "true", "yes", "on")
                 self.light_online = light_ok
                 self.smoke_online = smoke_ok
+                self.soil_online = soil_ok
             else:
                 self.sensor_online = False
                 self.light_online = False
                 self.smoke_online = False
+                self.soil_online = False
             self._temperature = temp
             self._humidity = hum
             self._luminance = lux
             self._smoke = smoke
             self._smoke_alarm = smoke_alarm
+            self._soil_raw = soil_raw
+            self._soil_moisture = soil_moisture
             return {
                 "temperature": round(self._temperature, 2),
                 "humidity": round(self._humidity, 2),
                 "luminance": round(self._luminance, 1),
                 "smoke": round(self._smoke, 1),
                 "smoke_alarm": bool(self._smoke_alarm),
+                "soil_raw": round(self._soil_raw, 1),
+                "soil_moisture": round(self._soil_moisture, 1),
             }
 
     def set_light(self, action: str) -> None:
@@ -383,6 +457,34 @@ class LampDevice:
             with self._lock:
                 self._light_state = "on" if st else "off"
 
+    def set_valve(self, action: str) -> None:
+        """开关阀门：开阀转"开启角度"，关阀转"关闭角度"（角度可在配置页修改）。"""
+        if action not in ("on", "off"):
+            raise ValueError("非法指令")
+        if self._valve_ctrl is not None:
+            import store
+
+            angle = int(store.valve_open_angle()) if action == "on" else int(store.valve_close_angle())
+            ok = self._valve_ctrl.set_angle(angle)
+            if not ok:
+                raise ValueError("阀门指令发送失败（ESP32 不可达或未确认角度）")
+        with self._lock:
+            self.valve_state = action
+
+    def sync_valve(self) -> None:
+        """定期从 ESP32 /api/health 读回 servoAngle，保持阀门状态与物理一致。"""
+        if self._valve_ctrl is None or self._sync_counter % 5 != 0:
+            return
+        import store
+
+        angle = self._valve_ctrl.health_angle()
+        if angle is None:
+            return
+        open_a = int(store.valve_open_angle())
+        close_a = int(store.valve_close_angle())
+        with self._lock:
+            self.valve_state = "on" if abs(angle - open_a) <= abs(angle - close_a) else "off"
+
     def snapshot(self) -> dict:
         video_online = True
         if self.video is not None:
@@ -401,6 +503,7 @@ class LampDevice:
                     and self.sensor_online is True
                     and self.light_online is True
                     and self.smoke_online is True
+                    and self.soil_online is True
                 )
             else:
                 lamp_online = bool(video_online)
@@ -413,13 +516,17 @@ class LampDevice:
                 "luminance": round(self._luminance, 1),
                 "smoke": round(self._smoke, 1),
                 "smoke_alarm": bool(self._smoke_alarm),
+                "soil_raw": round(self._soil_raw, 1),
+                "soil_moisture": round(self._soil_moisture, 1),
                 "light_state": self._light_state,
+                "valve_state": self.valve_state,
                 "online": self.online,          # 灯杆单元恒定存在
                 "lamp_online": lamp_online,     # 真实在线：全部设备在线
                 "sensor_source": "esp32" if self._http_sensor is not None else "sim",
                 "sensor_online": self.sensor_online,
                 "light_online": self.light_online,
                 "smoke_online": self.smoke_online,
+                "soil_online": self.soil_online,
                 "video_source": self.video.source if self.video is not None else "sim",
                 "video_online": video_online,
             }
@@ -436,12 +543,14 @@ class LampManager:
         posts = posts if posts is not None else store.lamp_posts()
         fields = store.sensor_fields()
         ctrl_default = store.lamp_ctrl_default()
+        valve_default = store.valve_ctrl_default()
         self._lamps: dict[str, LampDevice] = {}
         self._detectors = {}
         for lamp in posts:
             # 灯杆级灯控接口，未配置时回退全局默认格式
             light_cfg = lamp.get("lamp_ctrl") or ctrl_default
-            dev = LampDevice(lamp, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
+            dev = LampDevice(lamp, sensor_fields=fields, lamp_ctrl_fields=light_cfg,
+                             valve_ctrl_fields=valve_default)
             self._lamps[lamp["id"]] = dev
             self._detectors[lamp["id"]] = PersonDetector(dev)
 
@@ -457,12 +566,13 @@ class LampManager:
         posts = posts if posts is not None else store.lamp_posts()
         fields = store.sensor_fields()
         ctrl_default = store.lamp_ctrl_default()
+        valve_default = store.valve_ctrl_default()
         changed: list[str] = []
 
         # 先停止被删除或配置变化的旧灯杆线程
         for lamp_id, dev in list(self._lamps.items()):
             kept = next((p for p in posts if p["id"] == lamp_id), None)
-            if kept is None or dev.fp != _post_fp(kept, fields, ctrl_default):
+            if kept is None or dev.fp != _post_fp(kept, fields, ctrl_default, valve_default):
                 det = self._detectors.pop(lamp_id, None)
                 if det is not None:
                     det.stop()
@@ -475,12 +585,13 @@ class LampManager:
         for post in posts:
             lamp_id = post["id"]
             old = self._lamps.get(lamp_id)
-            if old is not None and old.fp == _post_fp(post, fields, ctrl_default):
+            if old is not None and old.fp == _post_fp(post, fields, ctrl_default, valve_default):
                 new_lamps[lamp_id] = old
                 new_dets[lamp_id] = self._detectors.get(lamp_id)
             else:
                 light_cfg = post.get("lamp_ctrl") or ctrl_default
-                dev = LampDevice(post, sensor_fields=fields, lamp_ctrl_fields=light_cfg)
+                dev = LampDevice(post, sensor_fields=fields, lamp_ctrl_fields=light_cfg,
+                                 valve_ctrl_fields=valve_default)
                 new_lamps[lamp_id] = dev
                 new_dets[lamp_id] = PersonDetector(dev)
         self._lamps = new_lamps
@@ -497,11 +608,12 @@ class LampManager:
         return self._detectors.get(lamp_id)
 
 
-def _post_fp(post: dict, fields: dict, ctrl_default: dict) -> tuple:
-    """按灯杆配置 + 传感器字段映射 + 灯控格式计算指纹（与 LampDevice.fp 对齐）。"""
+def _post_fp(post: dict, fields: dict, ctrl_default: dict, valve_default: dict) -> tuple:
+    """按灯杆配置 + 传感器字段映射 + 灯控/阀门格式计算指纹（与 LampDevice.fp 对齐）。"""
     light_cfg = post.get("lamp_ctrl") or ctrl_default
     return (post["id"], post.get("name", ""), post.get("location", ""),
             post.get("rtsp_url", ""), post.get("sensor_url", ""),
             post.get("esp32_base", ""),
             json.dumps(fields or {}, ensure_ascii=False, sort_keys=True),
-            json.dumps(light_cfg or {}, ensure_ascii=False, sort_keys=True))
+            json.dumps(light_cfg or {}, ensure_ascii=False, sort_keys=True),
+            json.dumps(valve_default or {}, ensure_ascii=False, sort_keys=True))
