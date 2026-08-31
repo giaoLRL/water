@@ -9,6 +9,8 @@ import threading
 import time
 from datetime import datetime
 
+import cv2
+
 import database
 import infer
 import store
@@ -22,6 +24,7 @@ class PersonDetector:
         self.lamp = lamp
         self._lock = threading.Lock()
         self._labeled_frame = None   # 最近一次标注帧（np.ndarray），用于标注视频流
+        self._boxes = []             # 最近一次识别结果（含 bbox），供本地实时画框
         self._last_result = None     # 最近一次识别结果摘要
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -48,6 +51,9 @@ class PersonDetector:
         result = infer.call_infer(original)
         inference_results = result.get("inference_results", []) or []
         processed = result.get("processed_image")
+        # 保存最新识别框（含像素坐标），供标注视频流在每一帧上本地实时绘制
+        with self._lock:
+            self._boxes = list(inference_results)
         person_count = len(inference_results)
         max_conf = max((float(i.get("confidence", 0)) for i in inference_results), default=0.0)
         ts = datetime.now()
@@ -81,6 +87,25 @@ class PersonDetector:
     def get_labeled_frame(self):
         with self._lock:
             return None if self._labeled_frame is None else self._labeled_frame.copy()
+
+    def annotate(self, frame):
+        """在给定帧上绘制最新识别框（本地绘制，毫秒级），供标注视频流全帧率实时使用。"""
+        with self._lock:
+            boxes = list(self._boxes)
+        if not boxes:
+            return frame
+        annotated = frame.copy()
+        for item in boxes:
+            bb = item.get("bbox")
+            if not bb or len(bb) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bb]
+            conf = float(item.get("confidence", 0))
+            label = item.get("label") or "person"
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(0, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        return annotated
 
     def last_result(self) -> dict | None:
         with self._lock:

@@ -292,10 +292,14 @@ def detect_video(lamp_id: str, _: dict = Depends(auth.require_perm("view_detect"
         try:
             while True:
                 detector = services.lamps.detector(lamp_id) if services.lamps else None
-                frame = detector.get_labeled_frame() if detector else None
+                # 取实时原始帧并在本地绘制最新识别框：全帧率实时标注，
+                # 不再依赖每 5 秒一次的整张标注图往返传输
+                frame = lamp.video.get_frame()
                 if frame is None:
                     await asyncio.sleep(0.5)
                     continue
+                if detector is not None:
+                    frame = detector.annotate(frame)
                 ok_flag, buf = await asyncio.to_thread(cv2.imencode, ".jpg", frame)
                 if not ok_flag:
                     await asyncio.sleep(0.5)

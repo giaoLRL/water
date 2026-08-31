@@ -502,6 +502,7 @@ window.ViewLampDetail = {
           </template>
           <span v-else class="toggle-state" style="color:var(--text-dim);">无灯光控制权限</span>
         </div>
+      </div>
 
       <div class="tabs">
         <span class="tab" :class="{ active: tab === 'monitor' }" @click="setTab('monitor')">实时监控</span>

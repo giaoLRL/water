@@ -68,7 +68,7 @@ LAMP_POSTS = [
 # ---------- 人员智能识别接口（YOLO） ----------
 INFER_URL = _env("LAMP_INFER_URL", "http://127.0.0.1:5000/infer")
 INFER_TIMEOUT = _env_float("LAMP_INFER_TIMEOUT", 60.0)
-PERSON_DETECT_INTERVAL = _env_float("LAMP_PERSON_DETECT_INTERVAL", 5.0)
+PERSON_DETECT_INTERVAL = _env_float("LAMP_PERSON_DETECT_INTERVAL", 1.0)
 
 # ---------- 账号与令牌 ----------
 JWT_SECRET = _env("IOT_JWT_SECRET", "iot-smart-lamp-secret")
