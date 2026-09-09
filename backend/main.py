@@ -1,20 +1,17 @@
-"""FastAPI 应用入口：初始化数据库 / 灯杆 / 告警引擎 / 设备监控，并启动采样循环。
+"""FastAPI 应用入口：初始化数据库/设备/告警/PID/判定，启动1Hz采集循环。
 
-- lifespan 启动阶段完成资源初始化，创建采集任务；
-- 采集循环把各灯杆的同步工作（真实传感器 HTTP、数据库写入）放进线程池并行执行，
-  避免阻塞 uvicorn 异步事件循环，保证视频流与接口不因传感器慢而周期卡顿。
+主流程(每周期)：
+    采集 → 恒温控制(PID) → 入库 → 告警 → 判定上报 → 判定指令执行
+用后台线程循环，避免阻塞 uvicorn 事件循环。
 启动: python main.py（默认 http://0.0.0.0:8000）
 """
-import asyncio
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, Request
-
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-_log = logging.getLogger("main")
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -22,134 +19,127 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 import config
 import database
-import infer
 import store
 from alarm import AlarmEngine
 from api import router
 from auth import ensure_admin
-from device import LampManager
-from monitor import DeviceMonitor
+from judge_service import JudgeService
+from pid_control import PID, heater_action
 from state import services
+from water_device import WaterPlant
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_log = logging.getLogger("water")
+
+# 调试开关：1=打印每次采集与控制动作，0=仅打印错误，比赛现场可关
+DEBUG_ENABLE = 1
 
 
-def _collect_lamp(lamp) -> None:
-    """单灯杆一次同步采集（在线程池执行）：写历史库 + 异常告警检查。
+def run_cycle() -> None:
+    """执行一个采集周期(采集→控制→入库→告警→判定)。"""
+    plant = services.plant
+    data = plant.read()
 
-    涉及网络请求（真实传感器 HTTP）与数据库写入，均为同步阻塞操作，
-    必须在线程池中执行，避免阻塞 uvicorn 异步事件循环（否则所有视频流/接口会周期性卡顿）。
-    """
-    now = datetime.now()
-    sensors = lamp.read_sensors()
-    snap = lamp.snapshot()
-    database.insert_sensor_data(
-        lamp.id,
-        now,
-        snap["temperature"],
-        snap["humidity"],
-        snap["luminance"],
-        snap["light_state"],
-        smoke=snap["smoke"],
-        smoke_alarm=snap["smoke_alarm"],
-        soil_raw=snap["soil_raw"],
-        soil_moisture=snap["soil_moisture"],
+    # 采集端真实上报数据优先(任务二网络链路)；无则用模拟
+    ing = services.ingest
+    if ing and isinstance(ing, dict) and (time.time() - ing.get("ts", 0)) < 2.0:
+        for k in ("storage_temp", "heater_temp", "flow_rate", "pressure"):
+            if k in ing and ing[k] is not None:
+                data[k] = float(ing[k])
+
+    # 恒温闭环控制(PID)：PID输出占空比→加热器开关(任务六)
+    if store.pid_enabled():
+        target = store.target_temp()
+        duty = services.pid.update(target, data["heater_temp"], store.period())
+        act = heater_action(duty)
+        if act != plant.heater_state:
+            plant.heater_control(act)
+            name = "开启加热" if act == "on" else "关闭加热"
+            database.insert_control_log(f"heater_{act}", "success", f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)")
+            if DEBUG_ENABLE:
+                _log.info("[CONTROL] 恒温闭环 → %s (heater_temp=%.2f target=%.1f duty=%.0f%%)",
+                          name, data["heater_temp"], target, duty)
+
+    # 数据入库(任务三：持久化)
+    database.insert_water_sensor(
+        datetime.now(), data["storage_temp"], data["heater_temp"],
+        data["flow_rate"], data["pressure"],
+        data["pump_state"], data["heater_state"],
+        data.get("total_flow", 0.0),
     )
-    # 异常快照：取当前视频帧（仅在触发新告警时写库）
-    frame = lamp.video.get_frame()
-    image = infer.frame_to_dataurl(frame) if frame is not None else None
-    # 快照兜底：首帧未就绪时稍等再取，确保新告警都能带上异常快照
-    if image is None:
-        time.sleep(0.5)
-        frame = lamp.video.get_frame()
-        image = infer.frame_to_dataurl(frame) if frame is not None else None
-    # 真实传感器（ESP32）各指标在线状态：离线时告警引擎跳过数值阈值检查，避免 0 值假告警
-    online = None
-    if snap["sensor_source"] == "esp32":
-        online = {
-            "temperature": lamp.sensor_online,
-            "humidity": lamp.sensor_online,
-            "luminance": lamp.light_online,
-            "smoke": lamp.smoke_online,
-            "soil": lamp.soil_online,
-        }
-    active = services.alarm.check(lamp.id, sensors, image=image, online=online)
-    # 设备不在线告警：指标/传感器掉线本身即告警，全部在线自动恢复
-    active.extend(services.alarm.check_offline(lamp.id, snap, image=image))
-    services.set_lamp_alarms(lamp.id, active)
-    # 周期性读回真实灯状态（ESP32），保持页面显示与物理一致
-    lamp.sync_light()
-    # 周期性读回舵机角度，保持阀门状态与物理一致
-    lamp.sync_valve()
+
+    # 告警检查(任务六异常告警)
+    services.alarm.check(data)
+
+    # 判定服务：上报 + 轮询指令 + 执行反馈(任务五)
+    judge = services.judge
+    judge.report(data)
+    judge.poll()
+    cmd = judge.take_command()
+    if cmd:
+        device = str(cmd.get("device") or cmd.get("type") or "")
+        action = str(cmd.get("action") or cmd.get("command") or "")
+        if action in ("on", "off"):
+            if device == "pump":
+                plant.pump_control(action)
+            elif device == "heater":
+                plant.heater_control(action)
+            database.insert_control_log(f"{device}_{action}", "success", "判定服务指令执行")
+        judge.feedback("ok", {"pump_state": plant.pump_state, "heater_state": plant.heater_state})
+
+    if DEBUG_ENABLE:
+        _log.info("[SENSOR] storage=%.2f heater=%.2f flow=%.2f pressure=%.2f pump=%s heater_m=%s",
+                  data["storage_temp"], data["heater_temp"], data["flow_rate"], data["pressure"],
+                  data["pump_state"], data["heater_state"])
 
 
-async def collect_loop() -> None:
-    """周期采样所有灯杆：各灯杆并行投入线程池，事件循环不被同步阻塞。"""
+def collect_loop() -> None:
+    """采集线程：按配置周期循环执行采集周期。"""
     while True:
         try:
-            lamps = list(services.lamps.all())
-            loop = asyncio.get_running_loop()
-            await asyncio.gather(
-                *(loop.run_in_executor(None, _collect_lamp, lamp) for lamp in lamps)
-            )
+            run_cycle()
         except Exception:  # noqa: BLE001
-            _log.exception("采集循环异常，跳过本轮")
-            await asyncio.sleep(1.0)  # 异常后短暂冷却，避免高频重试
-        # 采样间隔可在系统配置页调整（每轮读取，即时生效）
-        await asyncio.sleep(store.sample_interval())
+            _log.exception("[ERROR] 采集循环异常，跳过本轮")
+            time.sleep(1.0)
+        time.sleep(store.period())
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_database()
-    # 首次启动创建默认管理员账号（admin/admin123），已存在则跳过
     ensure_admin()
-    services.lamps = LampManager()
+    services.plant = WaterPlant()
     services.alarm = AlarmEngine()
-    services.monitor = DeviceMonitor()
-    services.monitor.start()
-
-    task = asyncio.create_task(collect_loop())
+    services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
+    services.judge = JudgeService()
+    threading.Thread(target=collect_loop, daemon=True).start()
     try:
         yield
     finally:
-        task.cancel()
+        pass
 
 
-app = FastAPI(title="基于物联网的分布式机房监控系统", lifespan=lifespan)
+app = FastAPI(title="智能水循环监测与温控物联网系统", lifespan=lifespan)
 app.include_router(router)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=200,
-        content={"code": 40002, "msg": "参数错误", "data": str(exc.errors())},
-    )
+    return JSONResponse(status_code=200, content={"code": 40002, "msg": "参数错误", "data": str(exc.errors())})
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     if request.url.path.startswith("/api"):
-        # 认证/权限错误用专属错误码区分（未登录 40101，无权限 40301）
         if exc.status_code == 401:
-            return JSONResponse(
-                status_code=200,
-                content={"code": 40101, "msg": f"未登录或登录已过期: {exc.detail}", "data": None},
-            )
+            return JSONResponse(status_code=200, content={"code": 40101, "msg": f"未登录或登录已过期: {exc.detail}", "data": None})
         if exc.status_code == 403:
-            return JSONResponse(
-                status_code=200,
-                content={"code": 40301, "msg": f"无权限执行此操作: {exc.detail}", "data": None},
-            )
-        return JSONResponse(
-            status_code=200,
-            content={"code": 40002, "msg": f"接口不存在或请求错误: {exc.detail}", "data": None},
-        )
+            return JSONResponse(status_code=200, content={"code": 40301, "msg": f"无权限执行此操作: {exc.detail}", "data": None})
+        return JSONResponse(status_code=200, content={"code": 40002, "msg": f"接口不存在或请求错误: {exc.detail}", "data": None})
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 class NoCacheStaticFiles(StarletteStaticFiles):
-    """静态资源彻底禁用缓存：no-store 强制不缓存，避免浏览器拿到旧版前端文件。"""
-
     def file_response(self, *args, **kwargs):
         resp = super().file_response(*args, **kwargs)
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"

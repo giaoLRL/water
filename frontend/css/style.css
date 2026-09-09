@@ -335,17 +335,61 @@ header h1 { font-size: 15px; font-weight: 600; color: var(--text); letter-spacin
 /* ===== 登录页 ===== */
 .login-wrap {
   min-height: 100vh;
+  position: relative;
+  overflow: hidden;
   display: flex; align-items: center; justify-content: center;
-  background: radial-gradient(1200px 600px at 50% -10%, #101826 0%, var(--bg) 55%);
+  background:
+    radial-gradient(1400px 700px at 50% -12%, rgba(45, 212, 191, 0.09), transparent 55%),
+    radial-gradient(1200px 600px at 50% -10%, #101826 0%, var(--bg) 58%),
+    var(--bg);
   padding: 20px;
+}
+/* 机房地面网格：缓慢漂移 */
+.login-wrap::before {
+  content: "";
+  position: absolute;
+  inset: -60% -25%;
+  background-image:
+    linear-gradient(rgba(45, 212, 191, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45, 212, 191, 0.06) 1px, transparent 1px);
+  background-size: 48px 48px;
+  animation: loginGridDrift 70s linear infinite;
+  pointer-events: none;
+}
+/* 纵向扫描光带 */
+.login-wrap::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; height: 34vh; top: -40vh;
+  background: linear-gradient(180deg, transparent, rgba(45, 212, 191, 0.085), transparent);
+  animation: loginScan 11s linear infinite;
+  pointer-events: none;
+}
+@keyframes loginGridDrift {
+  to { transform: translate3d(48px, 48px, 0); }
+}
+@keyframes loginScan {
+  0% { top: -40vh; }
+  100% { top: 120vh; }
+}
+.login-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
 }
 .login-card {
   width: 380px; max-width: 94vw;
+  position: relative;
+  z-index: 1;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 30px 28px;
   display: flex; flex-direction: column; gap: 4px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(45, 212, 191, 0.04);
 }
 .login-logo { color: var(--accent); margin-bottom: 6px; }
 .login-card h2 { font-size: 17px; font-weight: 600; line-height: 1.4; }
@@ -538,6 +582,72 @@ td { font-variant-numeric: tabular-nums; }
   font-family: var(--mono);
 }
 .toast .close { background: none; border: none; color: var(--text-dim); font-size: 16px; cursor: pointer; margin-left: 6px; }
+
+/* ===== 全局告警弹窗（小尺寸提醒，点击跳转机房告警页） ===== */
+.alarm-popups {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 300px;
+  max-width: 320px;
+}
+.alarm-popup {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  animation: popupIn 0.25s ease;
+}
+.alarm-popup:hover { border-color: var(--danger); background: var(--panel); }
+.ap-badge {
+  flex: none;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.ap-body { flex: 1; min-width: 0; }
+.ap-title { font-size: 12.5px; color: var(--text); font-weight: 600; }
+.ap-desc {
+  font-size: 11.5px;
+  color: var(--text-sub);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ap-close {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ap-close:hover { color: var(--text); }
+@keyframes popupIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@media (max-width: 860px) {
+  .alarm-popups {
+    right: 12px;
+    left: 12px;
+    bottom: 74px;   /* 避开底部导航栏 */
+    width: auto;
+    max-width: none;
+  }
+}
 .toast .close:hover { color: var(--text); }
 
 /* ===== 手机底部导航 ===== */
@@ -803,3 +913,9 @@ td { font-variant-numeric: tabular-nums; }
 @media (max-width: 860px) {
   .detect-imgs { grid-template-columns: 1fr; }
 }
+
+/* ===== 判定服务页 ==== */
+.stat-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 14px; }
+.stat-box { background: var(--bg-deep); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+.stat-box .label { font-size: 12px; color: var(--text-sub); margin-bottom: 8px; }
+.stat-box .value { font-size: 20px; color: var(--text); word-break: break-all; }

@@ -2,19 +2,14 @@
 window.API = (() => {
   const BASE = "";
 
-  /* 401 登录失效 → 通知 app 跳登录页；403 无权限 → 静默（由调用处提示） */
   function notify(...args) {
     window.dispatchEvent(new CustomEvent("api-error", { detail: args[0] }));
   }
 
   async function req(method, path, body, opts = {}) {
     const headers = {};
-    if (window.Auth && window.Auth.token) {
-      headers["Authorization"] = "Bearer " + window.Auth.token;
-    }
-    if (body !== undefined) {
-      headers["Content-Type"] = "application/json";
-    }
+    if (window.Auth && window.Auth.token) headers["Authorization"] = "Bearer " + window.Auth.token;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
     const fetchOpts = { method, headers };
     if (body !== undefined) fetchOpts.body = JSON.stringify(body);
     let resp;
@@ -25,27 +20,21 @@ window.API = (() => {
     }
     const json = await resp.json().catch(() => ({ code: -1, msg: "响应解析失败", data: null }));
     if (json.code === 40101) {
-      // 登录失效：清空凭证，广播跳登录
       if (window.Auth) window.Auth.logout();
       notify({ code: 40101, msg: json.msg });
       if (opts.silent) throw new Error(json.msg || "登录已过期");
       return json.data;
     }
     if (json.code === 40301) {
-      if (!opts.silent) {
-        // 有明确交互时提示；轮询等静默场景不打扰
-        notify({ code: 40301, msg: json.msg || "无权限执行此操作" });
-      }
+      if (!opts.silent) notify({ code: 40301, msg: json.msg || "无权限执行此操作" });
       throw new Error(json.msg || "无权限");
     }
     if (json.code !== 0) throw new Error(json.msg || "请求失败");
     return json.data;
   }
 
-  // 拼接查询串：自动合并 lamp_id，过滤 undefined 值，避免 URLSearchParams 把它们序列化成 "undefined" 字符串
-  function qs(lampId, params) {
+  function qs(params) {
     const p = {};
-    if (lampId) p.lamp_id = lampId;
     if (params) {
       for (const [k, v] of Object.entries(params)) {
         if (v !== undefined && v !== null && v !== "") p[k] = v;
@@ -53,14 +42,6 @@ window.API = (() => {
     }
     const s = new URLSearchParams(p).toString();
     return s ? "?" + s : "";
-  }
-
-  function videoUrlOf(path, ts) {
-    // 视频流用 <img> 直连，token 挂 query；未登录时返回空串（前端不会渲染）
-    // ts 为时间戳：每次挂载/切换强制新 URL，避免浏览器复用旧的 MJPEG 连接导致黑屏
-    const token = (window.Auth && window.Auth.token) || "";
-    const t = ts || Date.now();
-    return token ? `${path}?token=${encodeURIComponent(token)}&t=${t}` : "";
   }
 
   return {
@@ -77,29 +58,27 @@ window.API = (() => {
     roles: () => req("GET", "/api/auth/roles"),
     saveRoles: (roles) => req("POST", "/api/auth/roles", { roles }),
 
-    // 业务
-    lamps: () => req("GET", "/api/lampposts"),
-    lamp: (id) => req("GET", `/api/lampposts/${id}`),
-    history: (id, start, end) =>
-      req("GET", `/api/lampposts/${id}/history?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
-    stats: (id, start, end) =>
-      req("GET", `/api/lampposts/${id}/stats?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
-    control: (id, action) => req("POST", `/api/lampposts/${id}/control`, { action }),
-    valve: (id, action) => req("POST", `/api/lampposts/${id}/valve`, { action }),
-    detect: (id) => req("POST", `/api/lampposts/${id}/detect`),
-    detectCurrent: (id) => req("GET", `/api/lampposts/${id}/detect/current`),
-    detections: (lampId, params) => req("GET", "/api/detections" + qs(lampId, params)),
-    detection: (id) => req("GET", `/api/detections/${id}`),
-    alarms: (lampId, params) => req("GET", "/api/alarms" + qs(lampId, params)),
-    alarm: (id) => req("GET", `/api/alarms/${id}`),
-    alarmStats: (lampId) => req("GET", "/api/alarm/stats" + qs(lampId, {})),
-    alarmConfigGet: () => req("GET", "/api/alarm/config"),
-    alarmConfigSet: (cfg) => req("POST", "/api/alarm/config", cfg),
-    logs: (lampId, params) => req("GET", "/api/logs" + qs(lampId, params)),
-    system: () => req("GET", "/api/system"),
-    sysConfigGet: () => req("GET", "/api/sysconfig"),
-    sysConfigSet: (body) => req("POST", "/api/sysconfig", body),
-    videoUrl: (id, ts) => videoUrlOf(`/api/lampposts/${id}/video`, ts),
-    detectVideoUrl: (id, ts) => videoUrlOf(`/api/lampposts/${id}/detect_video`, ts),
+    // 水循环业务
+    realtime: () => req("GET", "/api/water/realtime"),
+    history: (start, end) =>
+      req("GET", `/api/water/history?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
+    stats: (start, end) =>
+      req("GET", `/api/water/stats?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
+    pump: (action) => req("POST", "/api/water/pump", { action }),
+    heater: (action) => req("POST", "/api/water/heater", { action }),
+    ingest: (data) => req("POST", "/api/water/ingest", data),
+    setTarget: (temp) => req("POST", "/api/water/target", { temp }),
+    pidMode: (enabled) => req("POST", "/api/water/pid/mode", { enabled }),
+    pidGet: () => req("GET", "/api/water/pid"),
+    pidSet: (p) => req("POST", "/api/water/pid", p),
+    setPeriod: (period) => req("POST", "/api/water/period", { period }),
+    alarmConfigGet: () => req("GET", "/api/water/alarm/config"),
+    alarmConfigSet: (cfg) => req("POST", "/api/water/alarm/config", cfg),
+    alarms: (params) => req("GET", "/api/water/alarms" + qs(params)),
+    alarmStats: () => req("GET", "/api/water/alarm/stats"),
+    logs: (params) => req("GET", "/api/water/logs" + qs(params)),
+    judgeStatus: () => req("GET", "/api/water/judge/status"),
+    judgeEnable: (enabled) => req("POST", "/api/water/judge/enable", { enabled: enabled ? 1 : 0 }),
+    system: () => req("GET", "/api/water/system"),
   };
 })();

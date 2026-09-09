@@ -1,10 +1,7 @@
-"""动态配置存储：把能够在"系统配置"页面修改的配置持久化到 MySQL config 表。
+"""动态配置存储：把运行期可修改配置持久化到 MySQL config 表(sys.* 前缀)。
 
-设计：
-- 所有可动态配置项以 sys.* 前缀保存在 config 表（config_key/value）；
-- 标量（服务地址、超时、间隔）用 get/set；结构（灯杆列表、传感器字段映射）用 get_json/set_json；
-- 各模块通过本模块读取配置：要么每次操作时读（改完即时生效），要么按自身节奏重读；
-- 数据库为空时回退到 config.py 里的代码默认值，保证"零配置也能跑"。
+标量用 get/set，结构用 get_json/set_json；数据库为空时回退 config.py 默认值。
+各模块每次读取即时生效，无需重启。
 """
 import json
 
@@ -14,7 +11,6 @@ import database
 _PREFIX = "sys."
 
 
-# ---------- 标量 ----------
 def get(key: str, default: str | None = None) -> str | None:
     return database.get_config(_PREFIX + key, default)
 
@@ -37,7 +33,6 @@ def get_int(key: str, default: int) -> int:
         return default
 
 
-# ---------- 结构（JSON） ----------
 def get_json(key: str, default):
     raw = get(key, None)
     if raw is None:
@@ -52,97 +47,31 @@ def set_json(key: str, value) -> None:
     database.set_config(_PREFIX + key, json.dumps(value, ensure_ascii=False))
 
 
-# ---------- 领域便捷读取 ----------
-def lamp_posts() -> list[dict]:
-    """当前灯杆列表（前端可增删改），回退到代码默认。"""
-    return [dict(item) for item in get_json("lamp_posts", config.LAMP_POSTS)]
+# ---------- 领域运行期配置 ----------
+def period() -> float:
+    """采集周期(秒)，前端系统配置可调，默认 1.0。"""
+    return get_float("period", config.SAMPLE_PERIOD_S)
 
 
-def sensor_fields() -> dict:
-    """传感器返回字段映射（前端可编辑，适配不同品牌的 ESP32/传感器）。"""
-    return dict(get_json("sensor_fields", {
-        "status": "status",
-        "temperature": "temperature",
-        "humidity": "humidity",
-        "light": "light",
-        "smoke": "smokeRaw",
-        "smoke_alarm": "smokeAlarm",
-    }))
+def target_temp() -> float:
+    return get_float("target_temp", config.TARGET_TEMP_DEFAULT)
 
 
-def lamp_ctrl_default() -> dict:
-    """灯控接口全局默认格式（fallback，逐灯杆未配置灯控接口时使用）。"""
-    return dict(get_json("lamp_ctrl_default", {
-        "on": "/api/lamp/on",
-        "off": "/api/lamp/off",
-        "state": "/api/lamp/state",
-        "field": "lamp",
-        "status": "status",
-    }))
+def pid_kp() -> float:
+    return get_float("pid_kp", config.PID_KP)
 
 
-def valve_open_angle() -> float:
-    """阀门开启角度（舵机 0~180）。"""
-    return get_float("valve_open_angle", 45.0)
+def pid_ki() -> float:
+    return get_float("pid_ki", config.PID_KI)
 
 
-def valve_close_angle() -> float:
-    """阀门关闭角度（舵机 0~180）。"""
-    return get_float("valve_close_angle", 0.0)
+def pid_kd() -> float:
+    return get_float("pid_kd", config.PID_KD)
 
 
-def valve_ctrl_default() -> dict:
-    """阀门接口全局默认格式：路径 / 角度参数名 / status 字段 / 角度字段 / 请求方式。"""
-    return dict(get_json("valve_ctrl_default", {
-        "path": "/api/servo/set",
-        "angle_param": "angle",
-        "status": "status",
-        "field": "angle",
-        "method": "GET",
-    }))
+def pid_enabled() -> int:
+    return get_int("pid_enabled", config.PID_ENABLED_DEFAULT)
 
 
-def infer_url() -> str:
-    return get("infer_url", config.INFER_URL)
-
-
-def infer_timeout() -> float:
-    return get_float("infer_timeout", config.INFER_TIMEOUT)
-
-
-def person_detect_interval() -> float:
-    return get_float("person_detect_interval", config.PERSON_DETECT_INTERVAL)
-
-
-def sample_interval() -> float:
-    return get_float("sample_interval", config.SAMPLE_INTERVAL)
-
-
-def monitor_interval() -> float:
-    """设备在线状态探测间隔（秒）。"""
-    return get_float("monitor_interval", 10.0)
-
-
-def monitor_timeout() -> float:
-    """设备在线状态单次探测超时（秒）。"""
-    return get_float("monitor_timeout", 1.5)
-
-
-def sensor_timeout() -> float:
-    """传感器 HTTP 请求超时（秒）。ESP32 /api/data 读取较慢，默认 3 秒。"""
-    return get_float("sensor_timeout", 3.0)
-
-
-def sensor_ttl() -> float:
-    """传感器响应缓存时长（秒），避免高频请求。"""
-    return get_float("sensor_ttl", 5.0)
-
-
-def sensor_trip() -> int:
-    """传感器熔断：连续失败次数阈值。"""
-    return get_int("sensor_trip", 3)
-
-
-def sensor_cooldown() -> float:
-    """传感器熔断：冷却时长（秒），冷却期内不再发请求。"""
-    return get_float("sensor_cooldown", 15.0)
+def judge_enabled() -> int:
+    return get_int("judge_enabled", config.JUDGE_ENABLED_DEFAULT)

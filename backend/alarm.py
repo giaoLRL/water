@@ -1,34 +1,26 @@
-"""灯杆异常告警引擎：按温度 / 湿度 / 光照阈值检查环境参数，并按自定义人数规则检查人员告警。
+"""水循环异常告警引擎：按温度/流量/压力阈值检查，超限/恢复自动入库并更新活跃态。
 
-- 环境参数：由采集循环周期调用 check() 检查阈值，超限/恢复自动入库并更新状态；
-- 人数告警：持续识别线程把检测人数实时写入 check_person()，规则（启用 + 阈值）可在前端自定义；
-- 新告警可携带异常快照图（人员标注图 / 环境帧），供报警记录页点开查看；
-- 多线程安全：采集已改为线程池并行，内部状态通过可重入锁保护。
+类型：storage_temp 储水槽温度, heater_temp 加热槽温度, flow_rate 流量, pressure 压力。
+阈值在"系统配置"页可改，存数据库 config 表覆盖 config.py 默认值。
 """
 import threading
-import time
 from datetime import datetime
 
 import config
 import database
-from state import services
 
 
 class AlarmEngine:
-    """告警引擎。
-
-    collect_loop 已改为线程池并行采集（3 个灯杆线程 + 持续识别线程都会调用本引擎），
-    因此 _active / _thresholds 的读写均通过可重入锁保护。
-    """
+    """简单阈值告警引擎(单套系统，无设备维度)。"""
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._thresholds = {}
-        self._active = {}  # (lamp_id, type) -> item
-        self._last_sweep: dict[str, float] = {}  # 每机房兜底恢复扫表的时间戳（限频用）
+        self._thresholds: dict[str, float] = {}
+        self._active: dict[str, dict] = {}   # type -> 告警项
         self.reload()
 
     def reload(self) -> None:
+        """从数据库读取最新阈值(覆盖默认值)。"""
         cfg = database.get_all_config()
         with self._lock:
             self._thresholds = {
@@ -41,220 +33,59 @@ class AlarmEngine:
         with self._lock:
             return dict(self._thresholds)
 
-    def check(self, lamp_id: str, sensors: dict, image: str | None = None,
-              online: dict | None = None) -> list[dict]:
-        """检查一次采样，返回该灯杆当前全部活跃告警；处理新告警入库（携带异常快照图）与恢复。
+    def check(self, data: dict) -> list[dict]:
+        """检查一次采样，返回当前全部活跃告警；处理新告警入库与恢复。
 
-        online: 真实传感器各指标在线状态 {temperature/humidity/luminance/smoke: bool}；
-                对应指标明确离线时不按 0 值判阈值，避免离线制造"低温/低湿"假告警。
+        data 需含 storage_temp/heater_temp/flow_rate/pressure 四个读数。
         """
         with self._lock:
-            return self._check_locked(lamp_id, sensors, image, online)
+            checks = [
+                ("storage_temp", "储水槽温度",    "storage_temp_max", "storage_temp_min"),
+                ("heater_temp",  "加热槽温度",    "heater_temp_max",  "heater_temp_min"),
+                ("flow_rate",    "水流量",        "flow_max",         "flow_min"),
+                ("pressure",     "水压",          "pressure_max",     "pressure_min"),
+            ]
+            active_now: dict[str, dict] = {}
+            for key, label, hi_key, lo_key in checks:
+                value = float(data.get(key, 0.0))
+                low = self._thresholds[lo_key]
+                high = self._thresholds[hi_key]
+                if value > high:
+                    active_now[key] = {"label": label, "value": value,
+                                       "threshold": high, "direction": "above"}
+                elif value < low:
+                    active_now[key] = {"label": label, "value": value,
+                                       "threshold": low, "direction": "below"}
 
-    def _check_locked(self, lamp_id: str, sensors: dict, image: str | None,
-                      online: dict | None = None) -> list[dict]:
-        # 真实传感器明确离线时跳过对应指标的阈值检查：离线时读数为 0，
-        # 若仍按阈值判定会产生"温度过低/湿度过低"等假告警（设备离线另有独立告警）。
-        checks = []
-        for key, label, hi_key, lo_key in (
-            ("temperature", "环境温度", "temp_max", "temp_min"),
-            ("humidity", "空气湿度", "humidity_max", "humidity_min"),
-            ("luminance", "光照强度", "luminance_max", "luminance_min"),
-            ("smoke", "烟雾浓度", "smoke_max", "smoke_min"),
-        ):
-            if online and online.get(key) is False:
-                continue
-            checks.append((key, label, sensors.get(key, 0.0), hi_key, lo_key))
-        active_now: dict[str, dict] = {}
+            # 恢复已回正常范围的告警
+            for key in list(self._active):
+                if key not in active_now:
+                    database.recover_alarm(key)
+                    del self._active[key]
 
-        for key, label, value, hi_key, lo_key in checks:
-            low, high = self._thresholds[lo_key], self._thresholds[hi_key]
-            direction = None
-            threshold = None
-            if value > high:
-                direction, threshold = "above", high
-            elif value < low:
-                direction, threshold = "below", low
-
-            if direction:
-                active_now[key] = {
-                    "lamp_id": lamp_id,
-                    "type": key,
-                    "label": label,
-                    "value": round(float(value), 2),
-                    "threshold": threshold,
-                    "direction": direction,
-                }
-
-        # 烟雾的 DO 硬件电平作为辅助触发源：AO 未超阈值但 DO 报警时也告警
-        if sensors.get("smoke_alarm") and "smoke" not in active_now:
-            smoke_val = round(float(sensors.get("smoke", 0.0) or 0.0), 2)
-            active_now["smoke"] = {
-                "lamp_id": lamp_id,
-                "type": "smoke",
-                "label": "烟雾浓度",
-                "value": smoke_val,
-                "threshold": self._thresholds.get("smoke_max", 3000.0),
-                "direction": "above",
-                "message": f"检测到烟雾超标（硬件报警），浓度 {smoke_val}",
-            }
-
-        # 地面湿度：达到阈值自动关闭阀门（开关/阈值可在配置页修改；离线跳过）
-        soil_val = sensors.get("soil_moisture")
-        soil_enabled = bool(self._thresholds.get("soil_auto_close_enabled", 0.0))
-        soil_threshold = float(self._thresholds.get("soil_close_threshold", 60.0))
-        # online 为 None 表示无真实传感器（模拟机房），不参与地面湿度检查
-        if (soil_enabled and online is not None and soil_val is not None
-                and float(soil_val) >= soil_threshold
-                and not (online and online.get("soil") is False)):
-            active_now["soil"] = {
-                "lamp_id": lamp_id,
-                "type": "soil",
-                "label": "地面湿度",
-                "value": round(float(soil_val), 2),
-                "threshold": soil_threshold,
-                "direction": "above",
-            }
-
-        # 恢复已回正常范围的告警（人员告警由 check_person 单独管理，此处跳过）
-        for (lid, key) in list(self._active):
-            if lid == lamp_id and key != "person" and key not in active_now:
-                database.recover_alarm(lid, key)
-
-        # 新告警入库（携带异常快照图；同类型活跃期间只保留一条 active 记录）
-        for key, item in active_now.items():
-            if (lamp_id, key) not in self._active:
-                direction_text = "超上限" if item["direction"] == "above" else "低于下限"
-                message = item.get("message") or f'{item["label"]} {item["value"]} {direction_text} {item["threshold"]}'
-                database.update_or_insert_alarm(
-                    lamp_id,
-                    datetime.now(),
-                    item["type"],
-                    item["value"],
-                    item["threshold"],
-                    item["direction"],
-                    message,
-                    image=image,
-                )
-                # 地面湿度达到阈值：新告警首次触发时自动关闭阀门
-                if key == "soil":
-                    self._auto_close_valve(lamp_id)
-
-        # 更新活跃集合（保留人员活跃项，便于本方法将其并入快照）
-        for lid_key in list(self._active):
-            if lid_key[0] == lamp_id and lid_key[1] != "person":
-                del self._active[lid_key]
-        for key, item in active_now.items():
-            self._active[(lamp_id, key)] = item
-
-        new_alarms = list(active_now.values())
-        # 补充人员数量告警（由持续识别线程实时写入，此处归并到快照）
-        new_alarms.extend(self._person_active_locked(lamp_id))
-
-        # 兜底恢复：本轮不活跃的环境类型，把数据库中残留的 active 记录置为已恢复，
-        # 保证进程重启后数据库 status 与内存真实活跃一致（幂等、每轮执行开销极小）。
-        not_active = [t for t in ("temperature", "humidity", "luminance", "smoke", "soil") if t not in active_now]
-        # 兜底恢复是重启后的安全网，且为全表范围 UPDATE；正常切换由上方逐类型恢复处理，
-        # 这里限频每机房 60 秒一次，避免每轮（2 秒）批量 UPDATE 锁表拖垮接口。
-        if not_active:
-            now = time.time()
-            if now - self._last_sweep.get(lamp_id, 0.0) >= 60.0:
-                database.recover_alarms_for_types(lamp_id, not_active)
-                self._last_sweep[lamp_id] = now
-        return new_alarms
-
-    def _auto_close_valve(self, lamp_id: str) -> None:
-        """地面湿度达到阈值：自动关闭阀门并记录操作日志（失败不阻塞告警）。"""
-        try:
-            lamp = services.lamps.get(lamp_id) if services.lamps else None
-            if lamp is None:
-                return
-            lamp.set_valve("off")
-            database.insert_control_log(lamp_id, "valve_off", "success", "地面湿度达到阈值自动关阀")
-        except Exception as exc:  # noqa: BLE001
-            database.insert_control_log(lamp_id, "valve_off", "failed",
-                                        f"地面湿度达到阈值自动关阀失败: {exc}")
-
-    def check_offline(self, lamp_id: str, snap: dict, image: str | None = None) -> list[dict]:
-        """设备不在线告警：设备/指标掉线本身即告警（非数值异常）。
-
-        - esp32 灯杆：温湿度(sensor_online)、光照(light_online)、烟雾(smoke_online)
-          任一明确离线(False)即告警；检测中(None)不告警
-        - 视频流离线(video_online is False)也告警
-        - 全部设备在线时自动恢复
-        - 未配置真实传感器的灯杆（sim）不产生离线告警
-        """
-        with self._lock:
-            offline: list[str] = []
-            if snap.get("sensor_source") == "esp32":
-                if snap.get("sensor_online") is False:
-                    offline.append("温湿度")
-                if snap.get("light_online") is False:
-                    offline.append("光照")
-                if snap.get("smoke_online") is False:
-                    offline.append("烟雾")
-            if snap.get("video_online") is False:
-                offline.append("视频")
-
-            key = "device_offline"
-            if offline:
-                message = "、".join(f"{n}不在线" for n in offline)
-                item = {
-                    "lamp_id": lamp_id,
-                    "type": key,
-                    "label": "设备离线",
-                    "value": round(float(len(offline)), 2),
-                    "threshold": 1.0,
-                    "direction": "above",
-                    "message": message,
-                }
-                if (lamp_id, key) not in self._active:
+            # 新告警入库并更新活跃态
+            for key, item in active_now.items():
+                if key not in self._active:
+                    text = "超上限" if item["direction"] == "above" else "低于下限"
                     database.update_or_insert_alarm(
-                        lamp_id, datetime.now(), key, item["value"], item["threshold"],
-                        "above", message, image=image,
+                        datetime.now(), key,
+                        round(item["value"], 2), item["threshold"],
+                        item["direction"],
+                        f'{item["label"]} {item["value"]:.2f} {text} {item["threshold"]}',
                     )
-                self._active[(lamp_id, key)] = item
-                return [item]
-            # 全部在线：恢复已有离线告警
-            if (lamp_id, key) in self._active:
-                database.recover_alarm(lamp_id, key)
-                del self._active[(lamp_id, key)]
-            return []
+                self._active[key] = item
 
-    def check_person(self, lamp_id: str, person_count: int, image: str | None = None) -> list[dict]:
-        """按前端自定义规则检查人数告警；返回该灯杆当前人员活跃告警。"""
+            return [
+                {"type": k, "label": v["label"], "value": round(v["value"], 2),
+                 "threshold": v["threshold"], "direction": v["direction"]}
+                for k, v in active_now.items()
+            ]
+
+    def active_alarms(self) -> list[dict]:
+        """当前活跃告警(供实时接口返回)。"""
         with self._lock:
-            enabled = bool(self._thresholds.get(
-                "person_alert_enabled", config.DEFAULT_THRESHOLDS["person_alert_enabled"]))
-            threshold = float(self._thresholds.get(
-                "person_alert_min", config.DEFAULT_THRESHOLDS["person_alert_min"]))
-            if not enabled or person_count < threshold:
-                # 规则关闭或人数回落：恢复已有人员告警
-                if (lamp_id, "person") in self._active:
-                    database.recover_alarm(lamp_id, "person")
-                    del self._active[(lamp_id, "person")]
-                return []
-            item = {
-                "lamp_id": lamp_id,
-                "type": "person",
-                "label": "人员数量",
-                "value": round(float(person_count), 2),
-                "threshold": threshold,
-                "direction": "above",
-            }
-            if (lamp_id, "person") not in self._active:
-                database.update_or_insert_alarm(
-                    lamp_id, datetime.now(), "person", person_count, threshold, "above",
-                    f"检测到 {int(person_count)} 人，超过告警阈值 {int(threshold)} 人",
-                    image=image,
-                )
-                self._active[(lamp_id, "person")] = item
-            return [item]
-
-    def person_active(self, lamp_id: str) -> list[dict]:
-        """返回某灯杆当前人员数量的活跃告警项。"""
-        with self._lock:
-            return self._person_active_locked(lamp_id)
-
-    def _person_active_locked(self, lamp_id: str) -> list[dict]:
-        return [it for (lid, t), it in self._active.items() if lid == lamp_id and t == "person"]
+            return [
+                {"type": k, "label": v["label"], "value": round(v["value"], 2),
+                 "threshold": v["threshold"], "direction": v["direction"]}
+                for k, v in self._active.items()
+            ]

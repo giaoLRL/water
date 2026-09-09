@@ -1,345 +1,169 @@
-/* 系统配置视图：灯杆管理 + 服务接口参数 + 传感器格式映射 + 账号与权限，修改即时生效。 */
+/* 系统配置页：告警阈值 + 恒温PID参数 + 采集周期。账号/角色管理复用后端接口。 */
 window.ViewSysConfig = {
   name: "SysConfigView",
   emits: ["back"],
   data() {
     return {
-      loading: true,
-      saving: false,
-      showSpec: false,   // 接口数据格式说明展开/收起
-      // 账号与权限
+      tab: "alarm",   // alarm / pid / account
+      thresholds: {},
+      pid: { kp: 16, ki: 0.3, kd: 25 },
+      period: 1.0,
+      // 账号
       users: [],
-      permsList: [],            // [[key, label], ...]
-      roleMatrix: {},           // {role: [label, perms[]] }
+      roles: [],
+      permMatrix: [],          // 权限点列表 [key, 显示名]
+      selRoles: {},            // 各角色勾选的权限 { key: {label, perms:[...]} }
       newUser: { username: "", password: "", role: "viewer" },
-      rolePerms: {},            // 勾选态 {role: {permKey: bool}}（仅非 admin）
-      newRoleKey: "",
-      newRoleLabel: "",
-      pwd: { old: "", new: "", new2: "" },   // 修改自己的密码
-      // 灯杆管理
-      lampSeeds: [ { id: "", name: "", location: "", rtsp_url: "", sensor_url: "", esp32_base: "", cfgStr: "" } ],
-      // 服务接口参数
-      service: { infer_url: "", infer_timeout: 60, person_detect_interval: 5, sample_interval: 2, sensor_timeout: 3, sensor_ttl: 5, sensor_trip: 3, sensor_cooldown: 15 },
-      // 设备在线检测参数
-      monitor: { interval: 10, timeout: 1.5 },
-      // 灯控接口全局默认格式（fallback）
-      lampCtrlDefault: { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status" },
-      // 阀门（舵机）接口全局默认格式（fallback）
-      valveCtrlDefault: { path: "/api/servo/set", angle_param: "angle", status: "status", field: "angle", method: "GET" },
-      // 阀门与土壤湿度
-      valve: { openAngle: 45, closeAngle: 0 },
-      soil: { autoCloseEnabled: 0, closeThreshold: 60 },
-      // 传感器格式映射
-      sensorFields: { status: "status", temperature: "temperature", humidity: "humidity", light: "light", smoke: "smokeRaw", smoke_alarm: "smokeAlarm", soil_raw: "soilRaw", soil_moisture: "soilMoisture" },
-      msg: "",
-      msgType: "",
+      newRoleName: "",   // 新增角色名
     };
-  },
-  computed: {
-    lampPosts() {
-      // 灯杆提交数据：把"灯控接口"简写串解析为 lamp_ctrl 配置
-      return this.lampSeeds.filter((l) => l.id && String(l.id).trim()).map((l) => {
-        const p = { ...l };
-        const s = String(l.cfgStr || "").trim();
-        if (s) {
-          const parts = s.split("|").map((x) => x.trim());
-          const o = {};
-          ["on", "off", "state", "field"].forEach((k, i) => { if (parts[i]) o[k] = parts[i]; });
-          p.lamp_ctrl = o;
-        } else {
-          delete p.lamp_ctrl;
-        }
-        delete p.cfgStr;
-        return p;
-      });
-    },
-    roleRows() {
-      // 矩阵表格行：角色 key + 显示名 + 权限列表（可编辑的勾选态）
-      return Object.keys(this.roleMatrix).map((key) => {
-        const item = this.roleMatrix[key];
-        const label = Array.isArray(item) && item.length ? item[0] : key;
-        const perms = Array.isArray(item) && item.length > 1 && Array.isArray(item[1]) ? item[1] : [];
-        return { key, label, perms: perms.slice() };
-      });
-    },
-    canManageAccount() {
-      return window.Auth ? window.Auth.has("account_manage") : false;
-    },
   },
   mounted() {
     this.load();
   },
   methods: {
-    perm(p) {
-      return window.Auth ? window.Auth.has(p) : false;
+    perm(p) { return window.Auth ? window.Auth.has(p) : false; },
+    _decodeRole(item, key) {
+      // roles[key] 可能是 [label, perms] / [perms] / '*'，统一为 {label, perms}
+      let label = key, perms = [];
+      if (Array.isArray(item)) {
+        if (typeof item[0] === "string") { label = item[0]; perms = (item[1] === "*" || item[1] === undefined) ? "*" : item[1]; }
+        else { perms = item; }
+      } else if (item === "*") { perms = "*"; }
+      return { label, perms: perms === "*" ? this.permMatrix.map((p) => p[0]) : (perms || []) };
     },
     async load() {
-      this.loading = true;
       try {
-        const d = await API.sysConfigGet();
-        this.lampSeeds = (d.lamp_posts || []).map((l) => {
-          const lc = l.lamp_ctrl || {};
-          return {
-            ...l,
-            // 灯杆级灯控接口简写：on|off|state|field
-            cfgStr: [lc.on, lc.off, lc.state, lc.field].filter(Boolean).join("|"),
-          };
-        });
-        this.service = {
-          infer_url: d.infer_url,
-          infer_timeout: d.infer_timeout,
-          person_detect_interval: d.person_detect_interval,
-          sample_interval: d.sample_interval,
-          sensor_timeout: d.sensor_timeout,
-          sensor_ttl: d.sensor_ttl,
-          sensor_trip: d.sensor_trip,
-          sensor_cooldown: d.sensor_cooldown,
-        };
-        this.monitor = { interval: d.monitor_interval, timeout: d.monitor_timeout };
-        this.lampCtrlDefault = { on: "/api/lamp/on", off: "/api/lamp/off", state: "/api/lamp/state", field: "lamp", status: "status", ...d.lamp_ctrl_default };
-        this.sensorFields = { smoke: "smokeRaw", smoke_alarm: "smokeAlarm", soil_raw: "soilRaw", soil_moisture: "soilMoisture", ...d.sensor_fields };
-        const v = d.valve || {};
-        this.valve = { openAngle: v.open_angle ?? 45, closeAngle: v.close_angle ?? 0 };
-        this.valveCtrlDefault = { path: "/api/servo/set", angle_param: "angle", status: "status", field: "angle", method: "GET", ...(v.valve_ctrl_default || {}) };
-        const s = d.soil || {};
-        this.soil = { autoCloseEnabled: s.auto_close_enabled ? 1 : 0, closeThreshold: s.close_threshold ?? 60 };
-        // 账号与权限（有管理权限才拉取）
-        if (this.canManageAccount) {
-          await this.loadAccount();
-        }
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.loading = false;
-      }
-    },
-    addLamp() {
-      this.lampSeeds.push({ id: "", name: "", location: "", rtsp_url: "", sensor_url: "", esp32_base: "" });
-    },
-    removeLamp(i) {
-      this.lampSeeds.splice(i, 1);
-    },
-    async saveLamps() {
-      if (!this.lampPosts.length) { this.showMsg("至少保留 1 个机房（或先只改不改删）", "error"); return; }
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({ lamp_posts: this.lampPosts });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-        this.load();
-      }
-    },
-    async saveService() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({ service: this.service });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-      }
-    },
-    async saveSensor() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({ sensor_fields: this.sensorFields });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-        this.load();
-      }
-    },
-    async saveLampCtrl() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({ lamp_ctrl_default: this.lampCtrlDefault });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-      }
-    },
-    async saveValve() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({
-          valve: {
-            open_angle: this.valve.openAngle,
-            close_angle: this.valve.closeAngle,
-            valve_ctrl_default: this.valveCtrlDefault,
-          },
-        });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-        this.load();
-      }
-    },
-    async saveSoil() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({
-          soil: {
-            auto_close_enabled: this.soil.autoCloseEnabled ? 1 : 0,
-            close_threshold: this.soil.closeThreshold,
-          },
-        });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-        this.load();
-      }
-    },
-    async saveMonitor() {
-      this.saving = true;
-      try {
-        const d = await API.sysConfigSet({ service: { monitor_interval: this.monitor.interval, monitor_timeout: this.monitor.timeout } });
-        this.showMsg(d.msg, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-      }
-    },
-    // ---- 账号与权限 ----
-    async loadAccount() {
-      try {
-        const [u, r] = await Promise.all([API.users(), API.roles()]);
-        this.users = u.users || [];
-        this.permsList = (r.permissions || []).map((p) => (Array.isArray(p) ? p : [p, p]));
-        this.roleMatrix = r.roles || {};
+        const cfg = await API.alarmConfigGet();
+        this.thresholds = cfg.thresholds || {};
       } catch (e) { /* silent */ }
-    },
-    roleLabel(key) {
-      const item = this.roleMatrix[key];
-      if (Array.isArray(item) && item.length) return item[0];
-      return key;
-    },
-    roleHas(key, perm) {
-      const item = this.roleMatrix[key];
-      if (!Array.isArray(item) || item.length < 2) return false;
-      if (!Array.isArray(item[1])) return false;
-      return item[1].includes(perm);
-    },
-    toggleRolePerm(key, perm) {
-      const item = this.roleMatrix[key];
-      if (!Array.isArray(item) || item.length < 2 || !Array.isArray(item[1])) return;
-      const list = item[1];
-      if (list.includes(perm)) item[1] = list.filter((p) => p !== perm);
-      else item[1] = list.concat([perm]);
-      // 触发视图更新
-      this.roleMatrix = Object.assign({}, this.roleMatrix);
-    },
-    async saveRolesMatrix() {
-      const roles = {};
-      for (const row of this.roleRows) {
-        const item = this.roleMatrix[row.key];
-        const perms = Array.isArray(item) && item.length > 1 && Array.isArray(item[1]) ? item[1] : [];
-        roles[row.key] = { label: row.label, perms };
+      try { this.pid = await API.pidGet(); } catch (e) { /* silent */ }
+      try { const s = await API.system(); this.period = s.period || 1.0; } catch (e) { /* silent */ }
+      if (this.perm("account_manage")) {
+        try { this.users = (await API.users()).users || []; } catch (e) { /* silent */ }
+        try {
+          const r = await API.roles();
+          this.roles = r.roles || {};
+          this.permMatrix = r.permissions || [];
+          this.selRoles = {};
+          for (const k of Object.keys(this.roles)) {
+            if (k === "admin") continue;   // 管理员固定全权限
+            this.selRoles[k] = this._decodeRole(this.roles[k], k);
+          }
+        } catch (e) { /* silent */ }
       }
-      this.saving = true;
+    },
+    async saveEnvUsed() {},
+    async saveThresh() {
+      const keys = ["storage_temp_max", "storage_temp_min", "heater_temp_max", "heater_temp_min",
+                    "flow_max", "flow_min", "pressure_max", "pressure_min"];
+      const cfg = {};
+      for (const k of keys) {
+        const v = parseFloat(this.thresholds[k]);
+        if (isNaN(v)) { alert(`请填写有效数值: ${k}`); return; }
+        cfg[k] = v;
+      }
       try {
-        const d = await API.saveRoles(roles);
-        this.roleMatrix = d.roles;
-        this.showMsg("角色矩阵已保存", "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-      }
+        const d = await API.alarmConfigSet(cfg);
+        this.thresholds = d.thresholds || {};
+        alert("告警阈值已保存");
+      } catch (e) { alert(e.message); }
     },
-    addRole() {
-      const key = String(this.newRoleKey || "").trim();
-      const label = String(this.newRoleLabel || "").trim() || key;
-      if (!key) { this.showMsg("请输入角色标识（英文/数字）", "error"); return; }
-      if (this.roleMatrix[key]) { this.showMsg("角色已存在", "error"); return; }
-      this.roleMatrix[key] = [label, []];
-      this.roleMatrix = Object.assign({}, this.roleMatrix);
-      this.newRoleKey = "";
-      this.newRoleLabel = "";
-      this.showMsg(`已新增角色 ${key}（点击下方勾选权限后保存生效）`, "ok");
+    async savePid() {
+      try {
+        await API.pidSet({ kp: this.pid.kp, ki: this.pid.ki, kd: this.pid.kd });
+        alert("PID 参数已保存");
+      } catch (e) { alert(e.message); }
+    },
+    async savePeriod() {
+      try {
+        const d = await API.setPeriod(this.period);
+        this.period = d.period;
+        alert("采集周期已保存（即时生效）");
+      } catch (e) { alert(e.message); }
     },
     async createUser() {
-      const u = String(this.newUser.username || "").trim();
-      const p = this.newUser.password || "";
-      if (!u || !p) { this.showMsg("请填写用户名和密码", "error"); return; }
-      if (!this.roleMatrix[this.newUser.role]) { this.showMsg("角色不存在", "error"); return; }
-      this.saving = true;
+      const u = this.newUser.username.trim();
+      if (!u || !this.newUser.password) { alert("请输入用户名和密码"); return; }
       try {
-        await API.createUser({ username: u, password: p, role: this.newUser.role });
-        this.showMsg("用户已创建", "ok");
+        await API.createUser({ username: u, password: this.newUser.password, role: this.newUser.role });
+        alert("用户已创建");
         this.newUser = { username: "", password: "", role: "viewer" };
-        await this.loadAccount();
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      } finally {
-        this.saving = false;
-      }
+        this.users = (await API.users()).users || [];
+      } catch (e) { alert(e.message); }
     },
-    async resetPwd(user) {
-      const p = window.prompt(`输入 ${user.username} 的新密码：`);
-      if (p == null) return;
-      if (!p.trim()) { this.showMsg("密码不能为空", "error"); return; }
+    async resetPwd(id) {
+      const p = prompt("请输入新密码");
+      if (!p) return;
+      try { await API.resetPassword(id, p); alert("密码已重置"); } catch (e) { alert(e.message); }
+    },
+    roleLabel(role) {
+      const item = this.roles[role];
+      return item ? (Array.isArray(item) ? item[0] : role) : role;
+    },
+    hasPerm(roleKey, permKey) {
+      const r = this.selRoles[roleKey];
+      return !!(r && r.perms.indexOf(permKey) !== -1);
+    },
+    togglePerm(roleKey, permKey, e) {
+      const r = this.selRoles[roleKey];
+      if (!r) return;
+      const i = r.perms.indexOf(permKey);
+      if (e.target.checked && i === -1) r.perms.push(permKey);
+      if (!e.target.checked && i !== -1) r.perms.splice(i, 1);
+    },
+    async saveMatrix() {
+      // 组装 { 角色: [显示名, 权限列表] }，admin 由后端强制为全权限
+      const payload = {};
+      for (const k of Object.keys(this.selRoles)) {
+        payload[k] = [this.selRoles[k].label || k, this.selRoles[k].perms];
+      }
       try {
-        await API.resetPassword(user.id, p.trim());
-        this.showMsg("密码已重置", "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      }
+        await API.saveRoles(payload);
+        await this._refreshRoles();
+        alert("角色权限矩阵已保存");
+      } catch (e) { alert(e.message); }
     },
-    async toggleUserStatus(user) {
-      const next = user.status === "active" ? "disabled" : "active";
+    addRole() {
+      const name = this.newRoleName.trim();
+      if (!name) { alert("请输入角色名"); return; }
+      if (name === "admin") { alert("不能新增 admin 角色"); return; }
+      if (this.selRoles[name] || this.roles[name]) { alert(`角色 ${name} 已存在`); return; }
+      this.selRoles[name] = { label: name, perms: [] };
+      this.newRoleName = "";
+    },
+    async delRole(key) {
+      if (!confirm(`确定删除角色 ${this.selRoles[key].label || key}？`)) return;
+      delete this.selRoles[key];
       try {
-        await API.setUserStatus(user.id, next);
-        await this.loadAccount();
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      }
+        await API.saveRoles(this._matrixPayload());
+        await this._refreshRoles();
+      } catch (e) { alert(e.message); }
     },
-    async removeUser(user) {
-      if (!window.confirm(`确认删除用户 ${user.username}？`)) return;
+    _matrixPayload() {
+      const payload = {};
+      for (const k of Object.keys(this.selRoles)) {
+        payload[k] = [this.selRoles[k].label || k, this.selRoles[k].perms];
+      }
+      return payload;
+    },
+    async _refreshRoles() {
+      // 保存/删除角色后重新拉取角色列表，让"创建用户"下拉与角色列即时出现新角色
       try {
-        await API.deleteUser(user.id);
-        this.showMsg("用户已删除", "ok");
-        await this.loadAccount();
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      }
+        const r = await API.roles();
+        this.roles = r.roles || {};
+      } catch (e) { /* silent */ }
     },
-    async setUserRole(user, role) {
-      try {
-        await API.setUserRole(user.id, role);
-        this.showMsg(`已将 ${user.username} 设为角色「${this.roleLabel(role)}」`, "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      }
+    async setRole(u) {
+      try { await API.setUserRole(u.id, u.role); alert("角色已更新"); } catch (e) { alert(e.message); this.load(); }
     },
-    async savePwd() {
-      if (!this.pwd.new) { this.showMsg("请输入新密码", "error"); return; }
-      if (this.pwd.new !== this.pwd.new2) { this.showMsg("两次输入的新密码不一致", "error"); return; }
-      try {
-        await API.changePassword(this.pwd.new);
-        this.pwd = { old: "", new: "", new2: "" };
-        this.showMsg("密码已修改", "ok");
-      } catch (e) {
-        this.showMsg(e.message, "error");
-      }
+    async toggleStatus(u) {
+      const target = u.status === "active" ? "disabled" : "active";
+      try { await API.setUserStatus(u.id, target); u.status = target; } catch (e) { alert(e.message); }
     },
-    showMsg(t, type) {
-      this.msg = t;
-      this.msgType = type || "";
-      setTimeout(() => { this.msg = ""; this.msgType = ""; }, 6000);
+    async delUser(u) {
+      if (!confirm(`确定删除用户 ${u.username}？`)) return;
+      try { await API.deleteUser(u.id); this.users = (await API.users()).users || []; }
+      catch (e) { alert(e.message); }
     },
   },
   template: `
@@ -347,312 +171,111 @@ window.ViewSysConfig = {
     <div class="detail-head">
       <button class="btn-ghost" @click="$emit('back')">← 返回</button>
       <h2>系统配置</h2>
-      <span class="desc">修改即时生效，无需改代码或重启后端</span>
+      <span class="desc">告警阈值 · 恒温PID · 采集周期</span>
     </div>
 
-    <div v-if="msg" class="config-msg" :class="msgType">{{ msg }}</div>
-    <p v-if="loading" class="note" style="padding:20px 0;">配置加载中…</p>
+    <div class="tabs">
+      <span class="tab" :class="{ active: tab==='alarm' }" @click="tab='alarm'">告警阈值 / PID / 周期</span>
+      <span class="tab" v-if="perm('account_manage')" :class="{ active: tab==='account' }" @click="tab='account'; load()">账号管理</span>
+    </div>
 
-    <template v-if="!loading">
-      <!-- 接口数据格式说明（可点开） -->
-      <div class="section" style="padding-bottom:0;">
-        <div class="spec-toggle" @click="showSpec = !showSpec">
-          <h3 style="margin-bottom:0;">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-            接口数据格式说明
-          </h3>
-          <span class="desc">
-            {{ showSpec ? '点击收起' : '点开查看传感器 / 灯控 / 系统接口的返回格式与错误码' }}
-            <svg v-if="showSpec" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;"><polyline points="18 15 12 9 6 15"/></svg>
-            <svg v-else viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;"><polyline points="6 9 12 15 18 9"/></svg>
-          </span>
-        </div>
-        <div v-if="showSpec" class="spec-body">
-          <h4>① 传感器接口 GET {sensor_url}（对应下方"传感器格式映射"八项）</h4>
-<pre>{
-  "status": "ok",              // ok=全部正常 / partial=部分不可用
-  "temperature": 24.1,         // 温度 ℃
-  "humidity": 53.7,            // 湿度 %
-  "light": 19.2,               // 光照 lx（读不到时为 null）
-  "smokeRaw": 1234,            // 烟雾浓度（MQ-2 AO 原始值 0~4095，可空）
-  "smokeAlarm": false,         // 烟雾报警（MQ-2 DO，true=超标，可空）
-  "soilRaw": 1234,             // 地面湿度原始值（0~4095，可空）
-  "soilMoisture": 69.9,        // 地面湿度百分比 0~100（可空）
-  "unit": { "temperature": "C", "humidity": "%", "light": "lx" },
-  "lastUpdateMs": 616
-}</pre>
-          <h4>② 灯控接口 GET {esp32_base}{on|off|state 路径}（路径可在"机房管理"或"灯控全局默认格式"配置）</h4>
-<pre>{ "status": "ok", "lamp": true }      // lamp: true=亮 false=灭；on 须返回 true、off 须返回 false 才算生效
-// 未单独配置灯控接口的机房，使用"灯控全局默认格式"里的 on/off/state/字段 组装请求</pre>
-          <h4>③ 阀门接口（舵机）GET/POST {esp32_base}/api/servo/set?angle=0~180（路径/参数/请求方式可在"阀门接口全局默认格式"配置）</h4>
-<pre>{ "status": "ok", "angle": 45 }      // status=ok 即认为设置成功；angle 为当前角度</pre>
-          <h4>④ 系统接口统一返回格式（所有 /api/*）</h4>
-<pre>{
-  "code": 0,        // 0=成功，见下方错误码
-  "msg": "ok",
-  "data": { ... }   // 业务数据
-}</pre>
-          <div style="overflow-x:auto;">
-            <table>
-              <thead><tr><th>错误码</th><th>含义</th></tr></thead>
-              <tbody>
-                <tr><td>0</td><td>成功</td></tr>
-                <tr><td>40002</td><td>参数错误</td></tr>
-                <tr><td>40003</td><td>控制指令执行失败（如灯控时 ESP32 离线）</td></tr>
-                <tr><td>40004</td><td>机房 / 记录不存在</td></tr>
-                <tr><td>40005</td><td>视频流暂无画面</td></tr>
-                <tr><td>50000</td><td>智能识别服务调用失败</td></tr>
-              </tbody>
-            </table>
+    <div class="grid-2 config-grid" v-show="tab==='alarm'">
+      <div class="section">
+        <h3>告警阈值 <span class="desc">温度/流量/压力上下限 · 超限即告警（任务六）</span></h3>
+        <div class="alarm-rule" style="flex-direction:column;align-items:stretch;gap:10px;">
+          <div class="grid-2">
+            <label class="rule-item"><span>储水槽温度上限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_max"></label>
+            <label class="rule-item"><span>储水槽温度下限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_min"></label>
+            <label class="rule-item"><span>加热槽温度上限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_max"></label>
+            <label class="rule-item"><span>加热槽温度下限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_min"></label>
+            <label class="rule-item"><span>水流量上限 L/min</span><input type="number" v-model.number="thresholds.flow_max"></label>
+            <label class="rule-item"><span>水流量下限 L/min</span><input type="number" v-model.number="thresholds.flow_min"></label>
+            <label class="rule-item"><span>水压上限 kPa</span><input type="number" v-model.number="thresholds.pressure_max"></label>
+            <label class="rule-item"><span>水压下限 kPa</span><input type="number" v-model.number="thresholds.pressure_min"></label>
           </div>
+          <button class="btn-primary" @click="saveThresh">保存告警阈值</button>
         </div>
       </div>
-
-      <!-- 灯杆管理 -->
       <div class="section">
-        <h3>机房管理 <span class="desc">ID / 名称 / 位置 / 视频流 / 传感器 / 灯控地址，支持增删</span></h3>
-        <div style="overflow-x:auto;">
-          <table>
-            <thead><tr>
-              <th>ID</th><th>名称</th><th>位置</th><th>RTSP 视频流</th><th>传感器 URL</th><th>灯控地址</th><th>灯控接口(on/off/state/字段)</th><th></th>
-            </tr></thead>
-            <tbody>
-              <tr v-for="(l, i) in lampSeeds" :key="i">
-                <td><input class="cfg-input" style="width:52px;" v-model="l.id" placeholder="01"></td>
-                <td><input class="cfg-input" style="width:86px;" v-model="l.name" placeholder="机房01"></td>
-                <td><input class="cfg-input" style="width:110px;" v-model="l.location" placeholder="机房A区"></td>
-                <td><input class="cfg-input" v-model="l.rtsp_url" placeholder="rtsp://... 空=无视频"></td>
-                <td><input class="cfg-input" style="width:200px;" v-model="l.sensor_url" placeholder="http://.../api/data"></td>
-                <td><input class="cfg-input" style="width:170px;" v-model="l.esp32_base" placeholder="http://...灯控"></td>
-                <td><input class="cfg-input" style="width:230px;" v-model="l.cfgStr" placeholder="如 /api/mos?state=1|/api/mos?state=0|/api/mos|mos（留空=默认 /api/lamp/*）"></td>
-                <td><button class="btn-ghost" style="color:var(--danger);" @click="removeLamp(i)">删除</button></td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="table-actions" style="margin-top:10px;">
-          <button class="btn-ghost" @click="addLamp">+ 新增机房</button>
-          <button class="btn-primary" :disabled="saving" @click="saveLamps">保存机房配置</button>
-          <span class="desc">保存仅重建/删除变化的机房，其余视频与识别不中断</span>
-        </div>
-      </div>
-
-      <!-- 灯控接口全局默认格式 -->
-      <div class="section">
-        <h3>灯控接口全局默认格式 <span class="desc">fallback：未单独配置灯控接口的机房使用</span></h3>
+        <h3>采集周期</h3>
         <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>开灯路径</span>
-            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.on"></label>
-          <label class="rule-item cfg-item"><span>关灯路径</span>
-            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.off"></label>
-          <label class="rule-item cfg-item"><span>状态路径</span>
-            <input class="cfg-input" style="width:150px;" v-model="lampCtrlDefault.state"></label>
-          <label class="rule-item cfg-item"><span>状态字段</span>
-            <input class="cfg-input" style="width:90px;" v-model="lampCtrlDefault.field"></label>
-          <label class="rule-item cfg-item"><span>status 字段</span>
-            <input class="cfg-input" style="width:90px;" v-model="lampCtrlDefault.status"></label>
-          <button class="btn-primary" :disabled="saving" @click="saveLampCtrl">保存默认格式</button>
+          <label class="rule-item"><span>采集周期(秒)</span><input type="number" v-model.number="period" min="0.5" step="0.5" style="width:90px;"></label>
+          <button class="btn-primary" @click="savePeriod">保存</button>
         </div>
-        <div class="note">说明：未在"机房管理"里单独填写灯控接口的机房，用这里的 on/off/state/字段 组装请求 URL 与解析返回；在机房管理里填了就覆盖此项。</div>
-      </div>
-
-      <!-- 阀门接口全局默认格式 -->
-      <div class="section">
-        <h3>阀门接口全局默认格式 <span class="desc">ESP32 舵机阀门（/api/servo/set）</span></h3>
+        <h3 style="margin-top:18px;">恒温PID参数 <span class="desc">任务六本地恒温</span></h3>
         <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>设置路径</span>
-            <input class="cfg-input" style="width:150px;" v-model="valveCtrlDefault.path"></label>
-          <label class="rule-item cfg-item"><span>角度参数名</span>
-            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.angle_param"></label>
-          <label class="rule-item cfg-item"><span>status 字段</span>
-            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.status"></label>
-          <label class="rule-item cfg-item"><span>角度字段</span>
-            <input class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.field"></label>
-          <label class="rule-item cfg-item"><span>请求方式</span>
-            <select class="cfg-input" style="width:90px;" v-model="valveCtrlDefault.method">
-              <option value="GET">GET</option>
-              <option value="POST">POST</option>
-            </select></label>
-          <button class="btn-primary" :disabled="saving" @click="saveValve">保存默认格式</button>
+          <label class="rule-item"><span>Kp</span><input type="number" v-model.number="pid.kp" style="width:90px;"></label>
+          <label class="rule-item"><span>Ki</span><input type="number" v-model.number="pid.ki" style="width:90px;"></label>
+          <label class="rule-item"><span>Kd</span><input type="number" v-model.number="pid.kd" style="width:90px;"></label>
+          <button class="btn-primary" @click="savePid">保存PID</button>
         </div>
-        <div class="note">说明：阀门开/关通过该接口设置舵机角度（0~180）。GET 方式带 ?角度参数名=角度；POST 方式提交 JSON 参数。</div>
+        <div class="note">判定服务地址 / 采集端 / 继电器地址等硬参数集中在 backend/config.py 修改。</div>
       </div>
+    </div>
 
-      <!-- 阀门与土壤湿度 -->
-      <div class="section">
-        <h3>阀门与土壤湿度 <span class="desc">阀门角度 · 自动关阀（地面湿度达到阈值即关闭阀门）</span></h3>
-        <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>开启角度</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="valve.openAngle" min="0" max="180"></label>
-          <label class="rule-item cfg-item"><span>关闭角度</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="valve.closeAngle" min="0" max="180"></label>
-          <label class="rule-item cfg-item"><span>自动关阀</span>
-            <input type="checkbox" v-model="soil.autoCloseEnabled" :true-value="1" :false-value="0"></label>
-          <label class="rule-item cfg-item"><span>湿度阈值(%)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="soil.closeThreshold" min="0" max="100"></label>
-          <button class="btn-primary" :disabled="saving" @click="saveSoil">保存阀门与土壤配置</button>
-        </div>
-        <div class="note">说明：开启角度用于手动开阀；关闭角度用于手动关阀与自动关阀。开启自动关阀后，地面湿度百分比 ≥ 阈值时自动关闭阀门（恢复需手动开阀）。</div>
+    <div class="section" v-show="tab==='account'" v-if="perm('account_manage')">
+      <h3>账号管理</h3>
+      <div class="alarm-rule">
+        <input class="login-input" style="width:150px;" v-model="newUser.username" placeholder="用户名">
+        <input class="login-input" style="width:150px;" type="password" v-model="newUser.password" placeholder="密码">
+        <select v-model="newUser.role">
+          <option v-for="(v,k) in roles" :key="k" :value="k">{{ roleLabel(k) }}</option>
+        </select>
+        <button class="btn-primary" @click="createUser">创建用户</button>
       </div>
+      <table>
+        <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="u in users" :key="u.id">
+            <td>{{ u.id }}</td><td>{{ u.username }}</td>
+            <td>
+              <select :value="u.role" :disabled="u.role==='admin'" @change="u.role=$event.target.value; setRole(u)">
+                <option v-for="(v,k) in roles" :key="k" :value="k">{{ roleLabel(k) }}</option>
+              </select>
+            </td>
+            <td><span class="badge" :class="u.status==='active' ? 'ok' : 'fail'">{{ u.status==='active' ? '正常':'禁用' }}</span></td>
+            <td class="cell-ops">
+              <button class="btn-ghost" @click="resetPwd(u.id)">重置密码</button>
+              <button class="btn-ghost" @click="toggleStatus(u)">{{ u.status==='active' ? '禁用' : '启用' }}</button>
+              <button class="btn-ghost" v-if="u.role!=='admin'" @click="delUser(u)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
-      <!-- 服务接口参数 -->
-      <div class="section">
-        <h3>服务接口参数 <span class="desc">AI 识别地址 / 超时 / 识别间隔 / 采样间隔 / 传感器超时与熔断</span></h3>
-        <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>AI 识别地址</span>
-            <input class="cfg-input" style="width:260px;" v-model="service.infer_url"></label>
-          <label class="rule-item cfg-item"><span>识别超时(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.infer_timeout" min="1"></label>
-          <label class="rule-item cfg-item"><span>识别间隔(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.person_detect_interval" min="1"></label>
-          <label class="rule-item cfg-item"><span>采样间隔(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sample_interval" min="0.5" step="0.5"></label>
-          <label class="rule-item cfg-item"><span>传感器超时(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_timeout" min="0.5" step="0.5"></label>
-          <label class="rule-item cfg-item"><span>传感器缓存(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_ttl" min="0.5" step="0.5"></label>
-          <label class="rule-item cfg-item"><span>熔断失败次数</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_trip" min="1" step="1"></label>
-          <label class="rule-item cfg-item"><span>熔断冷却(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="service.sensor_cooldown" min="1" step="1"></label>
-          <button class="btn-primary" :disabled="saving" @click="saveService">保存服务参数</button>
-        </div>
-        <div class="note">说明：ESP32 /api/data 读取温湿度/光照/烟雾较慢（约 1~2 秒），传感器超时太短会导致请求频繁失败并触发熔断、数据变 0；一般超时设 3 秒、缓存 5 秒即可。</div>
+    <div class="section" v-show="tab==='account'" v-if="perm('account_manage')">
+      <h3>角色权限矩阵 <span class="desc">新增/删除角色 · 勾选每个角色可访问的功能（管理员固定全权限）</span></h3>
+      <div class="alarm-rule">
+        <input class="login-input" style="width:160px;" v-model="newRoleName" placeholder="新角色名(英文/数字)" @keyup.enter="addRole">
+        <button class="btn-primary" @click="addRole">新增角色</button>
+        <span class="desc">新增后先在下方勾选权限并保存，即可在创建用户时选用。</span>
       </div>
-
-      <!-- 设备在线检测参数 -->
-      <div class="section">
-        <h3>设备在线检测参数 <span class="desc">后端服务 / 数据库 / AI 识别 / 传感器视频的在线状态探测</span></h3>
-        <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>探测间隔(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="monitor.interval" min="5" step="1"></label>
-          <label class="rule-item cfg-item"><span>探测超时(秒)</span>
-            <input class="cfg-input" style="width:70px;" type="number" v-model.number="monitor.timeout" min="0.5" step="0.5"></label>
-          <button class="btn-primary" :disabled="saving" @click="saveMonitor">保存检测参数</button>
-        </div>
+      <div class="matrix-wrap">
+        <table class="perm-matrix">
+          <thead>
+            <tr>
+              <th style="min-width:90px;">权限 \ 角色</th>
+              <th v-for="(r, k) in selRoles" :key="k">
+                {{ r.label || k }}
+                <button class="btn-ghost" v-if="true" title="删除该角色" style="padding:0 4px;font-size:11px;" @click="delRole(k)">×</button>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in permMatrix" :key="p[0]">
+              <td>{{ p[1] }}</td>
+              <td v-for="(r, k) in selRoles" :key="k" style="text-align:center;">
+                <input type="checkbox" :checked="hasPerm(k, p[0])" @change="togglePerm(k, p[0], $event)">
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-
-      <!-- 传感器格式映射 -->
-      <div class="section">
-        <h3>传感器格式映射 <span class="desc">接口返回的字段名（适配不同品牌传感器）</span></h3>
-        <div class="alarm-rule">
-          <label class="rule-item cfg-item"><span>状态字段</span>
-            <input class="cfg-input" style="width:90px;" v-model="sensorFields.status"></label>
-          <label class="rule-item cfg-item"><span>温度字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.temperature"></label>
-          <label class="rule-item cfg-item"><span>湿度字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.humidity"></label>
-          <label class="rule-item cfg-item"><span>光照字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.light"></label>
-          <label class="rule-item cfg-item"><span>烟雾浓度字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke"></label>
-          <label class="rule-item cfg-item"><span>烟雾报警字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.smoke_alarm"></label>
-          <label class="rule-item cfg-item"><span>地面湿度原始值字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.soil_raw"></label>
-          <label class="rule-item cfg-item"><span>地面湿度百分比字段</span>
-            <input class="cfg-input" style="width:110px;" v-model="sensorFields.soil_moisture"></label>
-          <button class="btn-primary" :disabled="saving" @click="saveSensor">保存格式映射</button>
-        </div>
-        <div class="note">说明：以 ESP32 返回 {"status":"ok","temperature":..,"humidity":..,"light":..,"smokeRaw":..,"smokeAlarm":..,"soilRaw":..,"soilMoisture":..} 为默认，
-        若换用其他设备只需把"字段名"改成其返回的 JSON key。烟雾/地面湿度字段可选（无对应传感器的设备留空即可，自动回退默认）。保存后机房会重建以立即采用新格式。</div>
+      <div class="alarm-rule" style="margin-top:12px;">
+        <button class="btn-primary" @click="saveMatrix">保存权限矩阵</button>
       </div>
-
-      <!-- 账号与权限 -->
-      <div class="section" v-if="perm('account_manage')">
-        <h3>账号与权限 <span class="desc">用户管理 + 角色权限矩阵，逐项勾选即时生效</span></h3>
-
-        <!-- 修改自己的密码 -->
-        <div class="alarm-rule" style="margin-bottom:14px;">
-          <span class="desc" style="flex:1;">修改我的密码</span>
-          <label class="rule-item cfg-item"><span>新密码</span>
-            <input class="cfg-input" style="width:140px;" type="password" v-model="pwd.new"></label>
-          <label class="rule-item cfg-item"><span>确认密码</span>
-            <input class="cfg-input" style="width:140px;" type="password" v-model="pwd.new2"></label>
-          <button class="btn-ghost" :disabled="saving" @click="savePwd">修改密码</button>
-        </div>
-
-        <!-- 用户列表 -->
-        <h4 class="sub-head">用户列表</h4>
-        <div style="overflow-x:auto;">
-          <table>
-            <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
-            <tbody>
-              <tr v-for="u in users" :key="u.id">
-                <td>{{ u.id }}</td>
-                <td>{{ u.username }}</td>
-                <td>
-                  <select class="cfg-input" style="width:110px;" :disabled="u.username === 'admin'" :value="u.role" @change="setUserRole(u, $event.target.value)">
-                    <option v-for="rk in Object.keys(roleMatrix)" :key="rk" :value="rk">{{ roleLabel(rk) }}</option>
-                  </select>
-                </td>
-                <td><span class="badge" :class="u.status === 'active' ? 'ok' : 'fail'">{{ u.status === 'active' ? '正常' : '已禁用' }}</span></td>
-                <td>{{ u.created_at }}</td>
-                <td>
-                  <button class="btn-ghost" @click="resetPwd(u)">重置密码</button>
-                  <button class="btn-ghost" :disabled="u.username === 'admin'" @click="toggleUserStatus(u)">{{ u.status === 'active' ? '禁用' : '启用' }}</button>
-                  <button class="btn-ghost" style="color:var(--danger);" :disabled="u.username === 'admin'" @click="removeUser(u)">删除</button>
-                </td>
-              </tr>
-              <tr v-if="!users.length"><td colspan="6" style="text-align:center;color:#6b7a90;">暂无用户</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <!-- 新增用户 -->
-        <div class="alarm-rule" style="margin-top:10px;">
-          <span class="desc" style="flex:1;">新增用户</span>
-          <input class="cfg-input" style="width:120px;" v-model="newUser.username" placeholder="用户名">
-          <input class="cfg-input" style="width:120px;" type="password" v-model="newUser.password" placeholder="初始密码">
-          <select class="cfg-input" style="width:110px;" v-model="newUser.role">
-            <option v-for="rk in Object.keys(roleMatrix).filter(r => r !== 'admin')" :key="rk" :value="rk">{{ roleLabel(rk) }}</option>
-          </select>
-          <button class="btn-primary" :disabled="saving" @click="createUser">创建用户</button>
-        </div>
-
-        <!-- 角色权限矩阵 -->
-        <h4 class="sub-head">角色权限矩阵 <span class="desc">勾选权限点（账号重登录后生效）</span></h4>
-        <div class="matrix-wrap">
-          <table class="perm-matrix">
-            <thead>
-              <tr>
-                <th class="matrix-role-col">角色 \\ 权限</th>
-                <th v-for="(p, pi) in permsList" :key="p[0]" :title="p[1]">{{ p[1] }}</th>
-                <th>说明</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in roleRows" :key="row.key">
-                <td class="matrix-role-col">
-                  <b>{{ row.label }}</b>
-                  <span class="matrix-role-key">{{ row.key }}</span>
-                  <em v-if="row.key === 'admin'" class="role-tag">全权限</em>
-                </td>
-                <td v-for="(p, pi) in permsList" :key="p[0]" class="matrix-cell">
-                  <input v-if="row.key !== 'admin'" type="checkbox"
-                    :checked="roleHas(row.key, p[0])" @change="toggleRolePerm(row.key, p[0])">
-                  <span v-else class="matrix-all">✓</span>
-                </td>
-                <td class="matrix-note">
-                  <span v-if="row.key === 'admin'">管理员必为全权限，不可修改</span>
-                  <span v-else>{{ row.perms.length }}/{{ permsList.length }} 项</span>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="table-actions" style="margin-top:10px;">
-          <input class="cfg-input" style="width:110px;" v-model="newRoleKey" placeholder="角色标识(如 guard)">
-          <input class="cfg-input" style="width:110px;" v-model="newRoleLabel" placeholder="角色名(如 安保)">
-          <button class="btn-ghost" @click="addRole">+ 新增角色</button>
-          <button class="btn-primary" :disabled="saving" @click="saveRolesMatrix">保存角色矩阵</button>
-          <span class="desc">已登录用户需重新登录后按新权限生效</span>
-        </div>
-      </div>
-
-      <div class="note" style="margin-top:6px;">
-        提示：数据库连接、后端端口等危险参数不支持在线修改；配置无鉴权，请仅在局域网内使用。
-      </div>
-    </template>
+    </div>
   </div>
   `,
 };

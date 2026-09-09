@@ -33,7 +33,7 @@ PERMISSIONS = [
     ("view_alarm", "告警记录"),
     ("view_log", "操作日志"),
     ("view_device", "设备状态"),
-    ("ctrl_light", "灯光控制"),
+    ("ctrl_light", "设备控制"),
     ("cfg_alarm", "告警阈值"),
     ("cfg_system", "系统配置"),
     ("account_manage", "账号管理"),

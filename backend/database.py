@@ -1,8 +1,7 @@
-"""MySQL 数据层：连接池、建库建表初始化、灯杆传感/告警/人员监测/日志等读写接口。
+"""MySQL 数据层：连接池、建表初始化、水循环传感/告警/日志/账号等读写接口。
 
-所有的 SQL 都封装在本模块，业务模块（api / alarm / 采集循环）只调用这里的函数，
-不直接写 SQL。启动时 init_database() 负责建库建表，并自动清理旧水循环遗留表结构、
-温和补充新增列（如告警快照图列），避免丢历史数据。
+所有 SQL 封装在本模块，业务模块(api / alarm / 采集循环)只调用这里的函数。
+启动时 init_database() 建库建表(幂等)。单套水循环系统，设备ID统一用 "water"。
 """
 import threading
 from datetime import datetime
@@ -14,6 +13,8 @@ import config
 
 _pool = None
 _pool_lock = threading.Lock()
+
+DEVICE_ID = "water"   # 单套水循环系统的统一设备ID
 
 
 def get_pool() -> PooledDB:
@@ -32,87 +33,16 @@ def get_pool() -> PooledDB:
 
 
 def _connect_server() -> pymysql.Connection:
-    """连接服务器（不指定库），用于建库。"""
+    """连接服务器(不指定库)，用于建库。"""
     return pymysql.connect(
-        host=config.DB_HOST,
-        port=config.DB_PORT,
-        user=config.DB_USER,
-        password=config.DB_PASSWORD,
-        charset="utf8mb4",
-        autocommit=True,
+        host=config.DB_HOST, port=config.DB_PORT,
+        user=config.DB_USER, password=config.DB_PASSWORD,
+        charset="utf8mb4", autocommit=True,
     )
 
 
-# 各业务表必备字段（用于检测并清理水循环系统遗留的旧表结构）
-_TABLE_COLUMNS = {
-    "lamp_sensors": {"lamp_id", "ts", "temperature", "humidity", "luminance", "light_state"},
-    "alarms": {"lamp_id", "ts", "type", "value", "threshold", "direction", "message", "status"},
-    "person_detections": {"lamp_id", "ts", "person_count", "max_confidence", "original_image", "processed_image"},
-    "control_log": {"lamp_id", "ts", "action", "result", "detail"},
-    "config": {"config_key", "value"},
-    "users": {"username", "password_hash", "role", "status"},
-}
-
-# 业务表的新增列：存在表结构时温和补列（不删表），避免丢失历史数据
-_EXTRA_COLUMNS = {
-    "alarms": {
-        "image": "LONGTEXT NULL",
-        # 冗余标记：列表查询用 has_image 判断有无快照，避免全表读取 LONGTEXT 大图
-        "has_image": "TINYINT NOT NULL DEFAULT 0",
-    },
-    "lamp_sensors": {
-        "smoke": "DOUBLE NOT NULL DEFAULT 0",
-        "smoke_alarm": "TINYINT NOT NULL DEFAULT 0",
-        "soil_raw": "DOUBLE NOT NULL DEFAULT 0",
-        "soil_moisture": "DOUBLE NOT NULL DEFAULT 0",
-    },
-}
-
-
-def _ensure_extra_columns(conn: pymysql.Connection, table: str) -> None:
-    """为已存在的表温和补充新增列（不删除表，保留历史数据）。"""
-    extra = _EXTRA_COLUMNS.get(table)
-    if not extra:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT column_name AS col FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s",
-            (config.DB_NAME, table),
-        )
-        existing = {row["col"] for row in cur.fetchall()}
-    for col, ddl in extra.items():
-        if col in existing:
-            continue
-        with conn.cursor() as cur:
-            cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}")
-
-
-def _ensure_table_schema(conn: pymysql.Connection, table: str) -> None:
-    """表结构不匹配（如旧水循环表的 control_log/alarms）时删除，由建表语句重建。"""
-    req = _TABLE_COLUMNS[table]
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) AS n FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s",
-            (config.DB_NAME, table),
-        )
-        if cur.fetchone()["n"] == 0:
-            return
-        cur.execute(
-            "SELECT column_name AS col FROM information_schema.columns "
-            "WHERE table_schema=%s AND table_name=%s",
-            (config.DB_NAME, table),
-        )
-        existing = {row["col"] for row in cur.fetchall()}
-        if req <= existing:
-            return
-    with conn.cursor() as cur:
-        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
-
-
 def init_database() -> None:
-    """创建数据库与业务表（幂等）。"""
+    """创建数据库与业务表(幂等)。"""
     conn = _connect_server()
     try:
         with conn.cursor() as cur:
@@ -127,37 +57,40 @@ def init_database() -> None:
     conn = pool.connection()
     try:
         with conn.cursor() as cur:
-            # 清理结构不匹配的旧表（水循环系统遗留）
-            for table in _TABLE_COLUMNS:
-                _ensure_table_schema(conn, table)
-            # 为已存在的表补充新增列（如 alarms.image），避免删表丢历史
-            for table in _EXTRA_COLUMNS:
-                _ensure_extra_columns(conn, table)
+            # 清理旧版(灯杆)遗留表结构：alarms/control_log 若仍是 lamp_id 结构则重建为 device_id
+            for table, need in (("alarms", "device_id"), ("control_log", "device_id")):
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                    (config.DB_NAME, table, need),
+                )
+                if cur.fetchone()["n"] == 0:
+                    cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
-            # 灯杆传感器数据
+            # 水循环传感数据表
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS lamp_sensors (
+                CREATE TABLE IF NOT EXISTS water_sensors (
                     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    lamp_id      VARCHAR(16) NOT NULL,
                     ts           DATETIME NOT NULL,
-                    temperature  DOUBLE NOT NULL,
-                    humidity     DOUBLE NOT NULL,
-                    luminance    DOUBLE NOT NULL,
-                    soil_raw     DOUBLE NOT NULL DEFAULT 0,
-                    soil_moisture DOUBLE NOT NULL DEFAULT 0,
-                    light_state  VARCHAR(8) NOT NULL,
+                    storage_temp DOUBLE NOT NULL,
+                    heater_temp  DOUBLE NOT NULL,
+                    flow_rate    DOUBLE NOT NULL,
+                    pressure     DOUBLE NOT NULL,
+                    pump_state   VARCHAR(8) NOT NULL,
+                    heater_state VARCHAR(8) NOT NULL,
+                    total_flow   DOUBLE NOT NULL DEFAULT 0,
                     PRIMARY KEY (id),
-                    KEY idx_lamp_ts (lamp_id, ts)
+                    KEY idx_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 告警记录（image：异常情况截图快照，base64 标注图）
+            # 告警记录
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS alarms (
                     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    lamp_id      VARCHAR(16) NOT NULL,
+                    device_id    VARCHAR(16) NOT NULL DEFAULT 'water',
                     ts           DATETIME NOT NULL,
                     type         VARCHAR(32) NOT NULL,
                     value        DOUBLE NOT NULL,
@@ -166,58 +99,36 @@ def init_database() -> None:
                     message      VARCHAR(255),
                     status       VARCHAR(16) NOT NULL DEFAULT 'active',
                     recovered_at DATETIME NULL,
-                    image        LONGTEXT NULL,
-                    has_image    TINYINT NOT NULL DEFAULT 0,
                     PRIMARY KEY (id),
-                    KEY idx_alarm_lamp_ts (lamp_id, ts),
-                    KEY idx_alarm_lamp_type_status (lamp_id, type, status),
                     KEY idx_alarm_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 人员监测记录
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS person_detections (
-                    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    lamp_id         VARCHAR(16) NOT NULL,
-                    ts              DATETIME NOT NULL,
-                    person_count    INT NOT NULL,
-                    max_confidence  DOUBLE NOT NULL DEFAULT 0,
-                    original_image  LONGTEXT NULL,
-                    processed_image LONGTEXT NULL,
-                    PRIMARY KEY (id),
-                    KEY idx_detect_lamp_ts (lamp_id, ts)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            # 设备操作日志
+            # 设备操作日志(水泵/加热器开关)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS control_log (
                     id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    lamp_id  VARCHAR(16) NOT NULL,
+                    device_id VARCHAR(16) NOT NULL DEFAULT 'water',
                     ts       DATETIME NOT NULL,
-                    action   VARCHAR(16) NOT NULL,
+                    action   VARCHAR(32) NOT NULL,
                     result   VARCHAR(16) NOT NULL,
                     detail   VARCHAR(255),
                     PRIMARY KEY (id),
-                    KEY idx_ctrl_lamp_ts (lamp_id, ts)
+                    KEY idx_ctrl_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 阈值配置
+            # 阈值/PID/判定服务动态配置
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS config (
                     config_key VARCHAR(64) NOT NULL,
-                    value      VARCHAR(255) NOT NULL,
+                    value      LONGTEXT NOT NULL,
                     PRIMARY KEY (config_key)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 配置值扩容：动态配置以 JSON 存入（灯杆列表等），255 字符不够
-            cur.execute("ALTER TABLE config MODIFY COLUMN value LONGTEXT NOT NULL")
             for key, value in config.DEFAULT_THRESHOLDS.items():
                 cur.execute(
                     "INSERT IGNORE INTO config (config_key, value) VALUES (%s, %s)",
@@ -238,25 +149,6 @@ def init_database() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 告警表增量索引（幂等迁移，不删表不丢数据）：
-            # 批量恢复 UPDATE 与分页查询按 (灯杆, 类型, 状态) 过滤，缺索引时全表扫描 + 行锁，
-            # 曾导致告警接口 10~30 秒卡顿；ts 索引加速全库倒序分页。
-            for index_name, columns in (
-                ("idx_alarm_lamp_type_status", "lamp_id, type, status"),
-                ("idx_alarm_ts", "ts"),
-            ):
-                cur.execute(
-                    "SELECT COUNT(*) AS n FROM information_schema.statistics "
-                    "WHERE table_schema = DATABASE() AND table_name = 'alarms' AND index_name = %s",
-                    (index_name,),
-                )
-                if cur.fetchone()["n"] == 0:
-                    cur.execute(f"ALTER TABLE alarms ADD INDEX `{index_name}` ({columns})")
-            # has_image 一次性回填：旧数据逐行判断一次（约十余秒），此后列表查询不再读大图
-            cur.execute(
-                "UPDATE alarms SET has_image = 1 "
-                "WHERE has_image = 0 AND image IS NOT NULL AND image <> ''"
-            )
     finally:
         conn.close()
 
@@ -266,7 +158,6 @@ def now_str() -> str:
 
 
 def ping() -> bool:
-    """探测数据库连接是否可用。"""
     try:
         conn = get_pool().connection()
         try:
@@ -279,277 +170,153 @@ def ping() -> bool:
         return False
 
 
-# ---------- 传感器数据 ----------
-def insert_sensor_data(
-    lamp_id: str,
-    ts: datetime,
-    temperature: float,
-    humidity: float,
-    luminance: float,
-    light_state: str,
-    smoke: float = 0.0,
-    smoke_alarm: bool = False,
-    soil_raw: float = 0.0,
-    soil_moisture: float = 0.0,
+# ---------- 水循环传感数据 ----------
+def insert_water_sensor(
+    ts: datetime, storage_temp: float, heater_temp: float,
+    flow_rate: float, pressure: float,
+    pump_state: str, heater_state: str, total_flow: float,
 ) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO lamp_sensors (lamp_id, ts, temperature, humidity, luminance, "
-                "light_state, smoke, smoke_alarm, soil_raw, soil_moisture) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (lamp_id, ts, temperature, humidity, luminance, light_state,
-                 smoke, int(smoke_alarm), soil_raw, soil_moisture),
+                "INSERT INTO water_sensors (ts, storage_temp, heater_temp, flow_rate, pressure, "
+                "pump_state, heater_state, total_flow) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (ts, storage_temp, heater_temp, flow_rate, pressure,
+                 pump_state, heater_state, total_flow),
             )
     finally:
         conn.close()
 
 
-def query_history(lamp_id: str, start: str, end: str, limit: int = 5000) -> list[dict]:
+def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, temperature, humidity, luminance, "
-                "smoke, smoke_alarm, soil_raw, soil_moisture, light_state FROM lamp_sensors "
-                "WHERE lamp_id=%s AND ts BETWEEN %s AND %s ORDER BY ts ASC LIMIT %s",
-                (lamp_id, start, end, limit),
+                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, storage_temp, heater_temp, "
+                "flow_rate, pressure, pump_state, heater_state, total_flow "
+                "FROM water_sensors WHERE ts BETWEEN %s AND %s "
+                "ORDER BY ts ASC LIMIT %s",
+                (start, end, limit),
             )
             return list(cur.fetchall())
     finally:
         conn.close()
 
 
-def query_latest_sensor(lamp_id: str) -> dict | None:
+def query_water_stats(start: str, end: str) -> dict:
+    """统计面板：平均/最高/最低温度、最高/最低压力、累计水流量。"""
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, temperature, humidity, luminance, "
-                "smoke, smoke_alarm, light_state FROM lamp_sensors WHERE lamp_id=%s ORDER BY id DESC LIMIT 1",
-                (lamp_id,),
+                "SELECT AVG(storage_temp) AS avg_storage, MAX(storage_temp) AS max_storage, "
+                "MIN(storage_temp) AS min_storage, AVG(heater_temp) AS avg_heater, "
+                "MAX(pressure) AS max_pressure, MIN(pressure) AS min_pressure, "
+                "(SELECT total_flow FROM water_sensors WHERE ts BETWEEN %s AND %s "
+                " ORDER BY id DESC LIMIT 1) AS end_total "
+                "FROM water_sensors WHERE ts BETWEEN %s AND %s",
+                (start, end, start, end),
             )
-            return cur.fetchone()
+            row = cur.fetchone()
+            return {
+                "avg_storage_temp": round(row["avg_storage"], 2) if row["avg_storage"] is not None else None,
+                "max_storage_temp": round(row["max_storage"], 2) if row["max_storage"] is not None else None,
+                "min_storage_temp": round(row["min_storage"], 2) if row["min_storage"] is not None else None,
+                "avg_heater_temp": round(row["avg_heater"], 2) if row["avg_heater"] is not None else None,
+                "max_pressure": round(row["max_pressure"], 2) if row["max_pressure"] is not None else None,
+                "min_pressure": round(row["min_pressure"], 2) if row["min_pressure"] is not None else None,
+                "total_flow": round(row["end_total"], 2) if row["end_total"] is not None else 0.0,
+            }
     finally:
         conn.close()
 
 
 # ---------- 告警 ----------
 def update_or_insert_alarm(
-    lamp_id: str,
-    ts: datetime,
-    type_: str,
-    value: float,
-    threshold: float,
-    direction: str,
-    message: str,
-    image: str | None = None,
+    ts: datetime, type_: str, value: float, threshold: float,
+    direction: str, message: str,
 ) -> None:
-    """写入活跃告警：同一 (灯杆, 类型) 已有 active 记录则更新，否则插入。
-
-    避免长期活跃的告警在进程重启后反复插入多条 active 记录导致统计虚高。
-    """
+    """同类型已有 active 记录则更新，否则插入(避免长期活跃重复多条)。"""
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s, "
-                "image=COALESCE(%s, image), "
-                "has_image=CASE WHEN %s IS NOT NULL THEN 1 ELSE has_image END "
-                "WHERE lamp_id=%s AND type=%s AND status='active'",
-                (ts, value, threshold, direction, message, image, image, lamp_id, type_),
+                "UPDATE alarms SET ts=%s, value=%s, threshold=%s, direction=%s, message=%s "
+                "WHERE device_id=%s AND type=%s AND status='active'",
+                (ts, value, threshold, direction, message, DEVICE_ID, type_),
             )
             if cur.rowcount == 0:
                 cur.execute(
-                    "INSERT INTO alarms (lamp_id, ts, type, value, threshold, direction, message, "
-                    "status, image, has_image) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)",
-                    (lamp_id, ts, type_, value, threshold, direction, message, image, 1 if image else 0),
+                    "INSERT INTO alarms (device_id, ts, type, value, threshold, direction, message, status) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')",
+                    (DEVICE_ID, ts, type_, value, threshold, direction, message),
                 )
     finally:
         conn.close()
 
 
-def recover_alarm(lamp_id: str, type_: str) -> None:
+def recover_alarm(type_: str) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE alarms SET status='recovered', recovered_at=%s "
-                "WHERE lamp_id=%s AND type=%s AND status='active'",
-                (datetime.now(), lamp_id, type_),
+                "WHERE device_id=%s AND type=%s AND status='active'",
+                (datetime.now(), DEVICE_ID, type_),
             )
     finally:
         conn.close()
 
 
-def recover_alarms_for_types(lamp_id: str, types: list[str]) -> None:
-    """把指定灯杆、指定类型数据库中的活跃告警批量置为已恢复（幂等）。
-
-    用于告警引擎每轮兜底：即使进程重启导致内存活跃集丢失，
-    也能确保数据库 status='active' 与内存真实活跃保持一致。
-    """
-    if not types:
-        return
+def query_alarms(start: str | None, end: str | None, type_: str | None,
+                 status: str | None, page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
+    """分页查询告警记录，返回 (items, total)。"""
     conn = get_pool().connection()
-    try:
-        with conn.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(types))
-            cur.execute(
-                f"UPDATE alarms SET status='recovered', recovered_at=%s "
-                f"WHERE lamp_id=%s AND type IN ({placeholders}) AND status='active'",
-                [datetime.now(), lamp_id, *types],
-            )
-    finally:
-        conn.close()
-
-
-def query_alarms(lamp_id: str | None, start: str | None, end: str | None,
-                 type_: str | None, status: str | None, keyword: str | None = None,
-                 page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
-    """分页查询告警记录，返回 (items, total)。keyword 模糊匹配类型或描述。"""
-    conn = get_pool().connection()
-    where = " WHERE 1=1"
-    params: list = []
-    if lamp_id:
-        where += " AND lamp_id = %s"
-        params.append(lamp_id)
+    where = " WHERE device_id = %s"
+    params: list = [DEVICE_ID]
     if start:
-        where += " AND ts >= %s"
-        params.append(start)
+        where += " AND ts >= %s"; params.append(start)
     if end:
-        where += " AND ts <= %s"
-        params.append(end)
+        where += " AND ts <= %s"; params.append(end)
     if type_:
-        where += " AND type = %s"
-        params.append(type_)
+        where += " AND type = %s"; params.append(type_)
     if status:
-        where += " AND status = %s"
-        params.append(status)
-    if keyword:
-        where += " AND (type LIKE %s OR message LIKE %s)"
-        params += [f"%{keyword}%", f"%{keyword}%"]
+        where += " AND status = %s"; params.append(status)
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) AS n FROM alarms{where}", params)
             total = cur.fetchone()["n"]
             offset = (page - 1) * page_size
-            sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
-                   "threshold, direction, message, status, "
-                   "has_image FROM alarms"
-                   + where + " ORDER BY ts DESC LIMIT %s OFFSET %s")
-            cur.execute(sql, params + [page_size, offset])
+            cur.execute(
+                "SELECT id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, threshold, "
+                "direction, message, status FROM alarms"
+                + where + " ORDER BY ts DESC LIMIT %s OFFSET %s",
+                params + [page_size, offset],
+            )
             items = list(cur.fetchall())
     finally:
         conn.close()
     return items, total
 
 
-def get_alarm(alarm_id: int) -> dict | None:
-    """返回单条告警记录（含 image 快照图）。"""
+def query_alarm_stats() -> list[dict]:
+    """按类型统计告警数量，供分布图使用。"""
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, type, value, "
-                "threshold, direction, message, status, recovered_at, image "
-                "FROM alarms WHERE id=%s",
-                (alarm_id,),
+                "SELECT type, COUNT(*) AS count FROM alarms "
+                "WHERE device_id=%s GROUP BY type ORDER BY count DESC",
+                (DEVICE_ID,),
             )
-            return cur.fetchone()
-    finally:
-        conn.close()
-
-
-def query_alarm_stats(lamp_id: str | None = None) -> list[dict]:
-    """按类型统计告警数量（全库或指定灯杆），供分布图使用。"""
-    conn = get_pool().connection()
-    sql = "SELECT type, COUNT(*) AS count FROM alarms"
-    params: list = []
-    if lamp_id:
-        sql += " WHERE lamp_id = %s"
-        params.append(lamp_id)
-    sql += " GROUP BY type ORDER BY count DESC"
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
             return list(cur.fetchall())
     finally:
         conn.close()
 
 
-# ---------- 人员监测记录 ----------
-def insert_detection(
-    lamp_id: str,
-    ts: datetime,
-    person_count: int,
-    max_confidence: float,
-    original_image: str | None,
-    processed_image: str | None,
-) -> int:
-    conn = get_pool().connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO person_detections (lamp_id, ts, person_count, max_confidence, original_image, processed_image) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (lamp_id, ts, person_count, max_confidence, original_image, processed_image),
-            )
-            return cur.lastrowid
-    finally:
-        conn.close()
-
-
-def query_detections(lamp_id: str | None, start: str | None, end: str | None,
-                     keyword: str | None = None, page: int = 1,
-                     page_size: int = 10) -> tuple[list[dict], int]:
-    """分页查询人员监测记录，返回 (items, total)。keyword 模糊匹配灯杆编号。"""
-    conn = get_pool().connection()
-    where = " WHERE 1=1"
-    params: list = []
-    if lamp_id:
-        where += " AND lamp_id = %s"
-        params.append(lamp_id)
-    if start:
-        where += " AND ts >= %s"
-        params.append(start)
-    if end:
-        where += " AND ts <= %s"
-        params.append(end)
-    if keyword:
-        where += " AND lamp_id LIKE %s"
-        params.append(f"%{keyword}%")
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) AS n FROM person_detections{where}", params)
-            total = cur.fetchone()["n"]
-            offset = (page - 1) * page_size
-            sql = ("SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, person_count, "
-                   "max_confidence FROM person_detections"
-                   + where + " ORDER BY ts DESC LIMIT %s OFFSET %s")
-            cur.execute(sql, params + [page_size, offset])
-            items = list(cur.fetchall())
-    finally:
-        conn.close()
-    return items, total
-
-
-def get_detection(detection_id: int) -> dict | None:
-    conn = get_pool().connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, person_count, "
-                "max_confidence, original_image, processed_image FROM person_detections WHERE id=%s",
-                (detection_id,),
-            )
-            return cur.fetchone()
-    finally:
-        conn.close()
-
-
-# ---------- 阈值配置 ----------
+# ---------- 阈值/动态配置 ----------
 def get_config(key: str, default: str | None = None) -> str | None:
     conn = get_pool().connection()
     try:
@@ -584,78 +351,46 @@ def get_all_config() -> dict:
         conn.close()
 
 
-# ---------- 设备控制日志 ----------
-def insert_control_log(lamp_id: str, action: str, result: str, detail: str | None = None) -> None:
+# ---------- 设备操作日志 ----------
+def insert_control_log(action: str, result: str, detail: str | None = None) -> None:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO control_log (lamp_id, ts, action, result, detail) VALUES (%s, %s, %s, %s, %s)",
-                (lamp_id, datetime.now(), action, result, detail),
+                "INSERT INTO control_log (device_id, ts, action, result, detail) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (DEVICE_ID, datetime.now(), action, result, detail),
             )
     finally:
         conn.close()
 
 
-def query_control_log(lamp_id: str | None = None, start: str | None = None,
-                      end: str | None = None, keyword: str | None = None,
+def query_control_log(start: str | None, end: str | None,
                       page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
-    """分页查询设备操作日志，返回 (items, total)。keyword 模糊匹配灯杆/指令/说明。"""
     conn = get_pool().connection()
-    where = " WHERE 1=1"
-    params: list = []
-    if lamp_id:
-        where += " AND lamp_id = %s"
-        params.append(lamp_id)
+    where = " WHERE device_id = %s"
+    params: list = [DEVICE_ID]
     if start:
-        where += " AND ts >= %s"
-        params.append(start)
+        where += " AND ts >= %s"; params.append(start)
     if end:
-        where += " AND ts <= %s"
-        params.append(end)
-    if keyword:
-        where += " AND (lamp_id LIKE %s OR action LIKE %s OR result LIKE %s OR detail LIKE %s)"
-        params += [f"%{keyword}%"] * 4
+        where += " AND ts <= %s"; params.append(end)
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) AS n FROM control_log{where}", params)
             total = cur.fetchone()["n"]
             offset = (page - 1) * page_size
-            sql = ("SELECT lamp_id, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail "
-                   "FROM control_log" + where + " ORDER BY id DESC LIMIT %s OFFSET %s")
-            cur.execute(sql, params + [page_size, offset])
+            cur.execute(
+                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail "
+                "FROM control_log" + where + " ORDER BY id DESC LIMIT %s OFFSET %s",
+                params + [page_size, offset],
+            )
             items = list(cur.fetchall())
     finally:
         conn.close()
     return items, total
 
 
-# ---------- 统计 ----------
-def query_stats(lamp_id: str, start: str, end: str) -> dict:
-    conn = get_pool().connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT AVG(temperature) AS avg_temp, MAX(temperature) AS max_temp, "
-                "MIN(temperature) AS min_temp, AVG(humidity) AS avg_humidity, "
-                "MAX(luminance) AS max_luminance, COUNT(*) AS sample_count "
-                "FROM lamp_sensors WHERE lamp_id=%s AND ts BETWEEN %s AND %s",
-                (lamp_id, start, end),
-            )
-            row = cur.fetchone()
-            return {
-                "avg_temp": round(row["avg_temp"], 2) if row["avg_temp"] is not None else None,
-                "max_temp": round(row["max_temp"], 2) if row["max_temp"] is not None else None,
-                "min_temp": round(row["min_temp"], 2) if row["min_temp"] is not None else None,
-                "avg_humidity": round(row["avg_humidity"], 2) if row["avg_humidity"] is not None else None,
-                "max_luminance": round(row["max_luminance"], 1) if row["max_luminance"] is not None else None,
-                "sample_count": row["sample_count"] or 0,
-            }
-    finally:
-        conn.close()
-
-
-# ---------- 账号（users 表） ----------
+# ---------- 账号 ----------
 def count_users() -> int:
     conn = get_pool().connection()
     try:
@@ -671,8 +406,7 @@ def get_user(username: str) -> dict | None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, username, password_hash, role, status, "
-                "DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at "
+                "SELECT id, username, password_hash, role, status "
                 "FROM users WHERE username=%s",
                 (username,),
             )
@@ -735,12 +469,7 @@ def query_users() -> list[dict]:
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
-            # 无参数 execute 不做 % 转义，DATE_FORMAT 直接用单 %（%% 会被 MySQL 原样输出）
-            cur.execute(
-                "SELECT id, username, role, status, "
-                "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at "
-                "FROM users ORDER BY id ASC",
-            )
+            cur.execute("SELECT id, username, role, status FROM users ORDER BY id ASC")
             return list(cur.fetchall())
     finally:
         conn.close()
