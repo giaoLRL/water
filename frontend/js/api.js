@@ -67,6 +67,15 @@ window.API = (() => {
     pump: (action) => req("POST", "/api/water/pump", { action }),
     heater: (action) => req("POST", "/api/water/heater", { action }),
     ingest: (data) => req("POST", "/api/water/ingest", data),
+    // 定量浇水（设备固件侧达到目标自动关泵）
+    pumpTargetGet: () => req("GET", "/api/water/pump/target"),
+    pumpTargetSet: (liters) => req("POST", "/api/water/pump/target", { liters }),
+    // 累计水量清零（破坏性操作）
+    volumeReset: () => req("POST", "/api/water/volume/reset"),
+    // 双水槽容积（用于把水位%换算成估算水量）
+    tankSet: (tank, capacity) => req("POST", "/api/water/tank", { tank, capacity }),
+    // 设备链路信息（IP/RSSI/运行时长/支持通道）
+    device: () => req("GET", "/api/water/device"),
     setTarget: (temp) => req("POST", "/api/water/target", { temp }),
     pidMode: (enabled) => req("POST", "/api/water/pid/mode", { enabled }),
     pidGet: () => req("GET", "/api/water/pid"),

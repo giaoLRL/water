@@ -41,6 +41,42 @@ def _connect_server() -> pymysql.Connection:
     )
 
 
+def _column_info(cur, table: str, column: str) -> dict | None:
+    """查询列定义(是否为 NULL)，列不存在时返回 None。"""
+    cur.execute(
+        "SELECT IS_NULLABLE AS nullable FROM information_schema.columns "
+        "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+        (config.DB_NAME, table, column),
+    )
+    return cur.fetchone()
+
+
+def _migrate_water_sensors(cur) -> None:
+    """water_sensors 表结构迁移（幂等，可重复执行，不丢历史数据）。
+
+    迁移原因：当前现场固件只提供流量与累计水量，无温度/压力/加热通道。
+    1) storage_temp / heater_temp / pressure / heater_state 由 NOT NULL 改为可空，
+       无数据的通道写 NULL，避免 0 值污染统计与曲线；
+    2) 新增 pump_target 列，记录当时的定量浇水目标，便于回溯。
+    """
+    # 列名 -> 完整列定义（类型必须与建表语句一致，勿强行统一为 DOUBLE）
+    nullable_columns = {
+        "storage_temp": "DOUBLE NULL",
+        "heater_temp": "DOUBLE NULL",
+        "pressure": "DOUBLE NULL",
+        "heater_state": "VARCHAR(8) NULL",
+        "flow_rate": "DOUBLE NULL",
+        "total_flow": "DOUBLE NULL",
+    }
+    for column, definition in nullable_columns.items():
+        info = _column_info(cur, "water_sensors", column)
+        if info is not None and info["nullable"] != "YES":
+            cur.execute(f"ALTER TABLE water_sensors MODIFY COLUMN `{column}` {definition}")
+
+    if _column_info(cur, "water_sensors", "pump_target") is None:
+        cur.execute("ALTER TABLE water_sensors ADD COLUMN pump_target DOUBLE NULL AFTER total_flow")
+
+
 def init_database() -> None:
     """创建数据库与业务表(幂等)。"""
     conn = _connect_server()
@@ -68,23 +104,28 @@ def init_database() -> None:
                     cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
             # 水循环传感数据表
+            # 可空列说明：现场固件只提供流量/累计水量通道，
+            # storage_temp/heater_temp/pressure/heater_state 无数据来源，故允许 NULL
+            # （NULL 表示“该通道无数据”，避免用 0 伪装成真实读数）。
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS water_sensors (
                     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
                     ts           DATETIME NOT NULL,
-                    storage_temp DOUBLE NOT NULL,
-                    heater_temp  DOUBLE NOT NULL,
-                    flow_rate    DOUBLE NOT NULL,
-                    pressure     DOUBLE NOT NULL,
+                    storage_temp DOUBLE NULL,
+                    heater_temp  DOUBLE NULL,
+                    flow_rate    DOUBLE NULL,
+                    pressure     DOUBLE NULL,
                     pump_state   VARCHAR(8) NOT NULL,
-                    heater_state VARCHAR(8) NOT NULL,
-                    total_flow   DOUBLE NOT NULL DEFAULT 0,
+                    heater_state VARCHAR(8) NULL,
+                    total_flow   DOUBLE NULL,
+                    pump_target  DOUBLE NULL,
                     PRIMARY KEY (id),
                     KEY idx_ts (ts)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            _migrate_water_sensors(cur)
             # 告警记录
             cur.execute(
                 """
@@ -104,7 +145,9 @@ def init_database() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            # 设备操作日志(水泵/加热器开关)
+            # 操作日志（设备控制 + 系统配置 + 账号管理）
+            # operator: 操作账号名；系统自动动作(恒温闭环/判定服务)为空
+            # source  : manual(人工) / auto(本地自动) / judge(判定服务)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS control_log (
@@ -114,11 +157,15 @@ def init_database() -> None:
                     action   VARCHAR(32) NOT NULL,
                     result   VARCHAR(16) NOT NULL,
                     detail   VARCHAR(255),
+                    `operator` VARCHAR(64) NULL,
+                    `source`   VARCHAR(16) NOT NULL DEFAULT 'manual',
                     PRIMARY KEY (id),
-                    KEY idx_ctrl_ts (ts)
+                    KEY idx_ctrl_ts (ts),
+                    KEY idx_ctrl_op (`operator`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            _migrate_control_log(cur)
             # 阈值/PID/判定服务动态配置
             cur.execute(
                 """
@@ -153,6 +200,20 @@ def init_database() -> None:
         conn.close()
 
 
+def _migrate_control_log(cur) -> None:
+    """control_log 表结构迁移（幂等，不丢历史数据）。
+
+    迁移原因：原日志只记录"做了什么"，没有"谁做的"，账号权限形同虚设。
+    1) 新增 `operator`(操作账号名) 与 `source`(manual/auto/judge)；
+    2) 历史行没有操作人，保持 NULL，前端显示"—"（不做数据猜测）。
+    """
+    if _column_info(cur, "control_log", "operator") is None:
+        cur.execute("ALTER TABLE control_log ADD COLUMN `operator` VARCHAR(64) NULL AFTER detail")
+    if _column_info(cur, "control_log", "source") is None:
+        cur.execute("ALTER TABLE control_log ADD COLUMN `source` VARCHAR(16) NOT NULL "
+                    "DEFAULT 'manual' AFTER `operator`")
+
+
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -172,18 +233,21 @@ def ping() -> bool:
 
 # ---------- 水循环传感数据 ----------
 def insert_water_sensor(
-    ts: datetime, storage_temp: float, heater_temp: float,
-    flow_rate: float, pressure: float,
-    pump_state: str, heater_state: str, total_flow: float,
+    ts: datetime, storage_temp: float | None, heater_temp: float | None,
+    flow_rate: float | None, pressure: float | None,
+    pump_state: str, heater_state: str | None, total_flow: float | None,
+    pump_target: float | None = None,
 ) -> None:
+    """写入一条采样。设备不支持的通道传 None（存 NULL，不伪造 0 值）。"""
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO water_sensors (ts, storage_temp, heater_temp, flow_rate, pressure, "
-                "pump_state, heater_state, total_flow) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "pump_state, heater_state, total_flow, pump_target) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (ts, storage_temp, heater_temp, flow_rate, pressure,
-                 pump_state, heater_state, total_flow),
+                 pump_state, heater_state, total_flow, pump_target),
             )
     finally:
         conn.close()
@@ -194,8 +258,9 @@ def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, storage_temp, heater_temp, "
-                "flow_rate, pressure, pump_state, heater_state, total_flow "
+                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, flow_rate, "
+                "total_flow, pump_target, pump_state, storage_temp, heater_temp, "
+                "pressure, heater_state "
                 "FROM water_sensors WHERE ts BETWEEN %s AND %s "
                 "ORDER BY ts ASC LIMIT %s",
                 (start, end, limit),
@@ -206,28 +271,57 @@ def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
 
 
 def query_water_stats(start: str, end: str) -> dict:
-    """统计面板：平均/最高/最低温度、最高/最低压力、累计水流量。"""
+    """统计面板：区间内流量均值/极值、累计水量增量、采样点数。
+
+    温度/压力通道当前固件无数据，对应键保留但返回 None（前端显示“--”）。
+    """
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT AVG(storage_temp) AS avg_storage, MAX(storage_temp) AS max_storage, "
-                "MIN(storage_temp) AS min_storage, AVG(heater_temp) AS avg_heater, "
-                "MAX(pressure) AS max_pressure, MIN(pressure) AS min_pressure, "
+                "SELECT AVG(flow_rate) AS avg_flow, MAX(flow_rate) AS max_flow, "
+                "MIN(flow_rate) AS min_flow, COUNT(*) AS samples, "
+                "SUM(flow_rate) AS sum_flow, "
                 "(SELECT total_flow FROM water_sensors WHERE ts BETWEEN %s AND %s "
-                " ORDER BY id DESC LIMIT 1) AS end_total "
+                " AND total_flow IS NOT NULL ORDER BY id ASC LIMIT 1) AS start_total, "
+                "(SELECT total_flow FROM water_sensors WHERE ts BETWEEN %s AND %s "
+                " AND total_flow IS NOT NULL ORDER BY id DESC LIMIT 1) AS end_total "
                 "FROM water_sensors WHERE ts BETWEEN %s AND %s",
-                (start, end, start, end),
+                (start, end, start, end, start, end),
             )
             row = cur.fetchone()
+
+            def _round(value, digits=2):
+                return round(value, digits) if value is not None else None
+
+            start_total = row["start_total"]
+            end_total = row["end_total"]
+            # 区间用水量：结束累计 - 开始累计；期间若执行过清零则可能为负，按 0 处理
+            used = None
+            if start_total is not None and end_total is not None:
+                used = round(max(0.0, float(end_total) - float(start_total)), 3)
+
             return {
-                "avg_storage_temp": round(row["avg_storage"], 2) if row["avg_storage"] is not None else None,
-                "max_storage_temp": round(row["max_storage"], 2) if row["max_storage"] is not None else None,
-                "min_storage_temp": round(row["min_storage"], 2) if row["min_storage"] is not None else None,
-                "avg_heater_temp": round(row["avg_heater"], 2) if row["avg_heater"] is not None else None,
-                "max_pressure": round(row["max_pressure"], 2) if row["max_pressure"] is not None else None,
-                "min_pressure": round(row["min_pressure"], 2) if row["min_pressure"] is not None else None,
-                "total_flow": round(row["end_total"], 2) if row["end_total"] is not None else 0.0,
+                # 流量通道（真实数据）
+                "avg_flow": _round(row["avg_flow"]),
+                "max_flow": _round(row["max_flow"]),
+                "min_flow": _round(row["min_flow"]),
+                "sum_flow": _round(row["sum_flow"]),
+                "samples": int(row["samples"] or 0),
+                # 累计水量
+                "start_total": _round(start_total, 3),
+                "end_total": _round(end_total, 3),
+                "volume_used": used,
+                "total_flow": _round(end_total, 3),   # 兼容旧字段名
+                # 以下通道当前固件不支持，恒为 None（保留键位以兼容旧前端）
+                "avg_storage_temp": None,
+                "max_storage_temp": None,
+                "min_storage_temp": None,
+                "avg_heater_temp": None,
+                "max_heater_temp": None,
+                "min_heater_temp": None,
+                "max_pressure": None,
+                "min_pressure": None,
             }
     finally:
         conn.close()
@@ -351,22 +445,35 @@ def get_all_config() -> dict:
         conn.close()
 
 
-# ---------- 设备操作日志 ----------
-def insert_control_log(action: str, result: str, detail: str | None = None) -> None:
+# ---------- 操作日志 ----------
+def insert_control_log(action: str, result: str, detail: str | None = None,
+                       operator: str | None = None, source: str = "manual") -> None:
+    """写入一条操作日志。
+
+    operator: 操作账号名；系统自动动作(恒温闭环/判定服务)传 None。
+    source  : manual(人工) / auto(本地自动) / judge(判定服务)；
+              仅表示动作来源，前端据此显示"操作人"列。
+    """
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO control_log (device_id, ts, action, result, detail) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (DEVICE_ID, datetime.now(), action, result, detail),
+                "INSERT INTO control_log (device_id, ts, action, result, detail, `operator`, `source`) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (DEVICE_ID, datetime.now(), action, result, detail, operator, source),
             )
     finally:
         conn.close()
 
 
 def query_control_log(start: str | None, end: str | None,
-                      page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
+                      page: int = 1, page_size: int = 10,
+                      category: str | None = None) -> tuple[list[dict], int]:
+    """分页查询操作日志，返回 (items, total)。
+
+    category 按 action 前缀区分：device(设备控制) / config(系统配置) /
+    account(账号管理)；设备类动作无前缀，配置类为 "config."、账号类为 "account."。
+    """
     conn = get_pool().connection()
     where = " WHERE device_id = %s"
     params: list = [DEVICE_ID]
@@ -374,13 +481,21 @@ def query_control_log(start: str | None, end: str | None,
         where += " AND ts >= %s"; params.append(start)
     if end:
         where += " AND ts <= %s"; params.append(end)
+    if category == "config":
+        where += " AND action LIKE %s"; params.append("config.%")
+    elif category == "account":
+        where += " AND action LIKE %s"; params.append("account.%")
+    elif category == "device":
+        where += " AND action NOT LIKE %s AND action NOT LIKE %s"
+        params += ["config.%", "account.%"]
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) AS n FROM control_log{where}", params)
             total = cur.fetchone()["n"]
             offset = (page - 1) * page_size
             cur.execute(
-                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail "
+                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, action, result, detail, "
+                "`operator`, `source` "
                 "FROM control_log" + where + " ORDER BY id DESC LIMIT %s OFFSET %s",
                 params + [page_size, offset],
             )

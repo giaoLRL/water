@@ -26,7 +26,19 @@ def err(code: int, msg: str, data=None) -> dict:
 
 
 class ActionRequest(BaseModel):
-    action: str = Field(pattern="^(on|off)$")
+    # toggle 由设备固件执行；前端默认使用确定的 on/off
+    action: str = Field(pattern="^(on|off|toggle)$")
+
+
+class PumpTargetRequest(BaseModel):
+    """定量浇水目标(L)：累计水量达到该值后由设备自动关泵。0 表示取消定量。"""
+    liters: float = Field(ge=0, le=10000)
+
+
+class TankRequest(BaseModel):
+    """水槽容积(L)：用于把液位百分比换算成界面上的估算水量。"""
+    tank: str = Field(default="storage", pattern="^(storage|heater)$")
+    capacity: float = Field(gt=0, le=1_000_000)
 
 
 class TargetRequest(BaseModel):
@@ -48,21 +60,15 @@ class PeriodRequest(BaseModel):
 
 
 class AlarmConfigRequest(BaseModel):
-    storage_temp_max: float | None = Field(default=None, ge=-50, le=110)
-    storage_temp_min: float | None = Field(default=None, ge=-50, le=110)
-    heater_temp_max: float | None = Field(default=None, ge=-50, le=110)
-    heater_temp_min: float | None = Field(default=None, ge=-50, le=110)
+    """告警阈值：仅当前设备支持的通道（流量）。"""
     flow_max: float | None = Field(default=None, ge=0, le=100)
     flow_min: float | None = Field(default=None, ge=0, le=100)
-    pressure_max: float | None = Field(default=None, ge=0, le=500)
-    pressure_min: float | None = Field(default=None, ge=0, le=500)
 
 
 class IngestRequest(BaseModel):
-    storage_temp: float | None = None
-    heater_temp: float | None = None
+    """采集端主动上报(可选链路)：仅设备实际提供的字段。"""
     flow_rate: float | None = None
-    pressure: float | None = None
+    total_liters: float | None = None
 
 
 def _validate_range(start: str | None, end: str | None) -> None:
@@ -77,23 +83,85 @@ def _validate_range(start: str | None, end: str | None) -> None:
         raise ValueError("start 不能晚于 end")
 
 
-def _snapshot() -> dict:
-    """实时快照：最新传感数据+设备状态+活跃告警。"""
+def _unsupported(feature: str, label: str) -> dict:
+    """设备能力缺失时的统一错误返回。"""
+    return err(40003, f"当前采集设备不支持{label}（固件未提供该通道，见 config.DEVICE_FEATURES）")
+
+
+def _tank_info(tank: str, data: dict) -> dict:
+    """单个水槽的水位信息。
+
+    液位来自该水槽的独立液位通道：
+      已接入(DEVICE_FEATURES["level_<tank>"]=True) → 真实读数，source="device"；
+      未接入                                        → 模拟值，  source="sim"。
+    "估算水量" = 液位% × 该水槽容积，仅作展示参考，不是计量值。
+    """
+    percent = data.get(f"level_{tank}")
+    if percent is None:
+        percent = 0.0
+    percent = max(0.0, min(100.0, float(percent)))
+    capacity = store.tank_capacity(tank)
+    height = (config.TANK_HEIGHT_CM_STORAGE if tank == "storage"
+              else config.TANK_HEIGHT_CM_HEATER)
+    return {
+        "key": tank,
+        "label": config.TANK_LABELS.get(tank, tank),
+        "percent": round(percent, 2),
+        "source": "device" if config.DEVICE_FEATURES.get(f"level_{tank}") else "sim",
+        "capacity": round(capacity, 3),
+        "volume": round(capacity * percent / 100.0, 3),   # 估算水量(L)，非计量值
+        "height_cm": round(height * percent / 100.0, 1),
+    }
+
+
+def _level_info() -> dict:
+    """双水槽水位信息（供前端 SVG 动画使用）。任一槽为模拟值时 any_sim 为 True。"""
     plant = services.plant
-    data = plant.read() if plant else {}
+    data = plant.status() if plant else {}
+    tanks = {tank: _tank_info(tank, data) for tank in config.TANKS}
+    return {
+        "tanks": tanks,
+        "any_sim": any(t["source"] == "sim" for t in tanks.values()),
+    }
+
+
+def _snapshot() -> dict:
+    """实时快照：设备最新读数 + 链路状态 + 设备能力 + 双水槽水位 + 活跃告警。
+
+    读的是设备模型缓存(由 1Hz 采集循环刷新)，不额外发起 HTTP 请求，
+    避免前端轮询放大对 ESP32 的压力。
+    """
+    plant = services.plant
+    data = plant.status() if plant else {}
     alarms = services.alarm.active_alarms() if services.alarm else []
     return {
+        # 真实通道
+        "flow_rate": data.get("flow_rate"),
+        "total_liters": data.get("total_liters"),
+        "total_flow": data.get("total_liters"),   # 兼容旧字段名：累计水量(L)
+        "pump_state": data.get("pump_state"),
+        "pump_target": data.get("pump_target"),
+        "target_baseline": store.target_baseline(),   # 设定定量目标时的累计水量(L)，用于进度换算
+        "pulses": data.get("pulses"),
+        "window_ms": data.get("window_ms"),
+        # 液位（双水槽，独立通道；传感器未接入时为模拟值）
+        "level_storage": data.get("level_storage"),
+        "level_heater": data.get("level_heater"),
+        "tank": _level_info(),
+        # 当前固件不支持的通道，恒为 None（前端据此显示“设备不支持”）
+        "temperature": data.get("temperature"),
         "storage_temp": data.get("storage_temp"),
         "heater_temp": data.get("heater_temp"),
-        "flow_rate": data.get("flow_rate"),
         "pressure": data.get("pressure"),
-        "total_flow": data.get("total_flow"),
-        "pump_state": data.get("pump_state"),
         "heater_state": data.get("heater_state"),
+        # 链路与设备信息
         "sensor_online": data.get("sensor_online"),
-        "target_temp": store.target_temp(),
-        "pid_enabled": bool(store.pid_enabled()),
-        "pid_duty": round(services.pid.last_duty, 1) if services.pid else 0.0,
+        "last_error": data.get("last_error") or "",
+        "device": data.get("device") or {},
+        "features": data.get("features") or dict(config.DEVICE_FEATURES),
+        "pid_supported": config.pid_supported(),
+        # 运行信息
+        "period": store.period(),
         "active_alarms": alarms,
         "alarm_count": len(alarms),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -122,45 +190,144 @@ def history(
 
 
 # ---------- 执行器控制 ----------
-def _control(device: str, body: ActionRequest, perm: str):
+def _control(device: str, action: str, label: str, user: dict):
+    """下发执行器控制指令，返回最新快照；失败返回 40003。操作账号写入日志。"""
     if services.plant is None:
         return err(40004, "设备未初始化")
-    t0 = datetime.now()
+    who = user.get("username") or None
     try:
         if device == "pump":
-            services.plant.pump_control(body.action)
+            services.plant.pump_control(action)
         else:
-            services.plant.heater_control(body.action)
-    except Exception as exc:  # noqa: BLE001
+            services.plant.heater_control(action)
+    except Exception as exc:  # noqa: BLE001  (含 DeviceError：网络失败/设备不支持)
+        database.insert_control_log(f"{device}_{action}", "failed", f"控制失败: {exc}",
+                                    operator=who, source="manual")
         return err(40003, f"控制指令执行失败: {exc}")
-    database.insert_control_log(
-        f"{device}_{body.action}", "success",
-        f"手动控制 { '水泵' if device == 'pump' else '加热模块' } {body.action}",
-    )
+    action_text = {"on": "开启", "off": "关闭", "toggle": "切换"}.get(action, action)
+    database.insert_control_log(f"{device}_{action}", "success", f"手动控制 {label} {action_text}",
+                                operator=who, source="manual")
     return ok(_snapshot())
 
 
 @router.post("/water/pump")
-def pump(body: ActionRequest, _: dict = Depends(auth.require_perm("ctrl_light"))):
-    return _control("pump", body, "ctrl_light")
+def pump(body: ActionRequest, user: dict = Depends(auth.require_perm("ctrl_light"))):
+    return _control("pump", body.action, "水泵", user)
 
 
 @router.post("/water/heater")
-def heater(body: ActionRequest, _: dict = Depends(auth.require_perm("ctrl_light"))):
-    return _control("heater", body, "ctrl_light")
+def heater(body: ActionRequest, user: dict = Depends(auth.require_perm("ctrl_light"))):
+    if not config.DEVICE_FEATURES.get("heater"):
+        return _unsupported("heater", "加热模块")
+    return _control("heater", body.action, "加热模块", user)
 
 
-# ---------- 采集端上报(任务二：底层→后端 HTTP 传输) ----------
+# ---------- 定量浇水（设备固件侧自动关泵） ----------
+@router.get("/water/pump/target")
+def pump_target_get(_: dict = Depends(auth.require_perm("view_monitor"))):
+    if not config.DEVICE_FEATURES.get("pump_target"):
+        return _unsupported("pump_target", "定量目标")
+    try:
+        target = services.plant.client.get_pump_target()
+    except Exception as exc:  # noqa: BLE001
+        return err(40003, f"读取定量目标失败: {exc}")
+    return ok({"target": target})
+
+
+@router.post("/water/pump/target")
+def pump_target_set(body: PumpTargetRequest, user: dict = Depends(auth.require_perm("ctrl_light"))):
+    if not config.DEVICE_FEATURES.get("pump_target"):
+        return _unsupported("pump_target", "定量目标")
+    who = user.get("username") or None
+    try:
+        target = services.plant.set_pump_target(body.liters)
+    except Exception as exc:  # noqa: BLE001
+        database.insert_control_log("pump_target", "failed", f"设定定量目标失败: {exc}",
+                                    operator=who, source="manual")
+        return err(40003, f"设定定量目标失败: {exc}")
+    # 记录本次定量的起始累计水量，供界面计算"本次已注入量"进度
+    if target > 0:
+        store.set_target_baseline(services.plant.status().get("total_liters") or 0.0)
+    else:
+        store.set_target_baseline(None)
+    detail = f"设定定量浇水目标 {target} L（达到后自动关泵）" if target > 0 else "取消定量浇水目标"
+    database.insert_control_log("pump_target", "success", detail, operator=who, source="manual")
+    snap = _snapshot()
+    snap["target"] = target
+    return ok(snap)
+
+
+# ---------- 双水槽容积（用于估算水量） ----------
+@router.post("/water/tank")
+def tank_set(body: TankRequest, user: dict = Depends(auth.require_perm("cfg_system"))):
+    """设置指定水槽的容积(L)。"""
+    store.set(f"tank_capacity_{body.tank}", body.capacity)
+    label = config.TANK_LABELS.get(body.tank, body.tank)
+    database.insert_control_log(
+        "config.tank", "success", f"设置{label}容积 = {body.capacity} L",
+        operator=user.get("username") or None, source="manual")
+    return ok({
+        "tank": body.tank,
+        "tank_capacity": store.tank_capacity(body.tank),
+        "capacities": {t: store.tank_capacity(t) for t in config.TANKS},
+        "tanks": _level_info()["tanks"],
+    })
+
+
+# ---------- 累计水量清零（破坏性操作，前端二次确认） ----------
+@router.post("/water/volume/reset")
+def volume_reset(user: dict = Depends(auth.require_perm("ctrl_light"))):
+    if not config.DEVICE_FEATURES.get("volume_reset"):
+        return _unsupported("volume_reset", "累计水量清零")
+    who = user.get("username") or None
+    try:
+        total = services.plant.reset_volume()
+    except Exception as exc:  # noqa: BLE001
+        database.insert_control_log("volume_reset", "failed", f"清零累计水量失败: {exc}",
+                                    operator=who, source="manual")
+        return err(40003, f"清零累计水量失败: {exc}")
+    database.insert_control_log("volume_reset", "success", "清零累计水量",
+                                operator=who, source="manual")
+    snap = _snapshot()
+    snap["totalLiters"] = total
+    return ok(snap)
+
+
+# ---------- 设备信息（任务一/二：链路状态） ----------
+@router.get("/water/device")
+def device_info(_: dict = Depends(auth.require_perm("view_device"))):
+    """设备链路信息：地址、在线状态、IP/RSSI/运行时长、支持通道。"""
+    plant = services.plant
+    if plant is None:
+        return err(40004, "设备未初始化")
+    info = plant.status()
+    device = dict(info.get("device") or {})
+    uptime_ms = device.get("uptime_ms")
+    device["uptime_s"] = round(uptime_ms / 1000.0, 1) if isinstance(uptime_ms, (int, float)) else None
+    device["last_error"] = info.get("last_error") or ""
+    return ok({"online": bool(info.get("sensor_online")), "device": device,
+               "features": info.get("features") or {}})
+
+
+# ---------- 采集端上报(任务二：底层→后端 HTTP 传输，可选链路) ----------
 @router.post("/water/ingest")
 def ingest(body: IngestRequest, _: dict = Depends(auth.require_perm("view_monitor"))):
-    """采集端(ESP32/上位机)每周期把真实传感数据 POST 到此接口。"""
+    """采集端(ESP32/上位机)每周期把数据 POST 到此接口。
+
+    后端默认主动轮询设备(见 water_device)，本接口用于设备主动推送的场景，
+    收到后 2 秒内的上报值会覆盖轮询值。
+    """
     services.ingest = {**body.model_dump(exclude_none=True), "ts": datetime.now().timestamp()}
     return ok({"msg": "已接收采集端数据"})
 
 
 # ---------- 恒温PID(任务六) ----------
+# 恒温闭环需设备同时提供温度采集与加热控制；当前固件不支持，以下接口统一返回不可用。
+# 固件升级后把 config.DEVICE_FEATURES 的 temperature/heater 置 True 即可自动启用。
 @router.post("/water/target")
 def set_target(body: TargetRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
+    if not config.pid_supported():
+        return _unsupported("temperature/heater", "恒温闭环控制")
     store.set("target_temp", body.temp)
     if services.pid:
         services.pid.reset()
@@ -169,6 +336,8 @@ def set_target(body: TargetRequest, _: dict = Depends(auth.require_perm("cfg_ala
 
 @router.post("/water/pid/mode")
 def pid_mode(body: PidModeRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
+    if not config.pid_supported():
+        return _unsupported("temperature/heater", "恒温闭环控制")
     store.set("pid_enabled", body.enabled)
     if services.pid:
         services.pid.reset()
@@ -178,6 +347,7 @@ def pid_mode(body: PidModeRequest, _: dict = Depends(auth.require_perm("cfg_alar
 @router.get("/water/pid")
 def pid_get(_: dict = Depends(auth.require_perm("view_history"))):
     return ok({
+        "supported": config.pid_supported(),
         "target_temp": store.target_temp(),
         "pid_enabled": bool(store.pid_enabled()),
         "kp": store.pid_kp(), "ki": store.pid_ki(), "kd": store.pid_kd(),
@@ -186,6 +356,8 @@ def pid_get(_: dict = Depends(auth.require_perm("view_history"))):
 
 @router.post("/water/pid")
 def pid_set(body: PidParamsRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
+    if not config.pid_supported():
+        return _unsupported("temperature/heater", "恒温闭环控制")
     updates = body.model_dump(exclude_none=True)
     for key, value in updates.items():
         store.set(f"pid_{key}", value)
@@ -199,8 +371,12 @@ def pid_set(body: PidParamsRequest, _: dict = Depends(auth.require_perm("cfg_ala
 
 # ---------- 采集周期 ----------
 @router.post("/water/period")
-def period_set(body: PeriodRequest, _: dict = Depends(auth.require_perm("cfg_system"))):
+def period_set(body: PeriodRequest, user: dict = Depends(auth.require_perm("cfg_system"))):
+    old = store.period()
     store.set("period", body.period)
+    database.insert_control_log("config.period", "success",
+                                f"采集周期 {old} → {store.period()} 秒",
+                                operator=user.get("username") or None, source="manual")
     return ok({"period": store.period()})
 
 
@@ -226,14 +402,20 @@ def alarm_config_get(_: dict = Depends(auth.require_perm("view_alarm"))):
 
 
 @router.post("/water/alarm/config")
-def alarm_config_set(body: AlarmConfigRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
+def alarm_config_set(body: AlarmConfigRequest, user: dict = Depends(auth.require_perm("cfg_alarm"))):
     updates = body.model_dump(exclude_none=True)
     if not updates:
         return err(40002, "未提供任何阈值")
+    before = services.alarm.thresholds if services.alarm else {}
     for key, value in updates.items():
         database.set_config(key, str(value))
     if services.alarm:
         services.alarm.reload()
+    changed = ", ".join(
+        f"{k}: {before.get(k, '--')} → {v}" for k, v in updates.items()
+    )
+    database.insert_control_log("config.alarm", "success", f"修改告警阈值 {changed}",
+                                operator=user.get("username") or None, source="manual")
     return ok({"thresholds": services.alarm.thresholds})
 
 
@@ -261,11 +443,12 @@ def alarm_stats(_: dict = Depends(auth.require_perm("view_alarm"))):
 def logs(
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
+    category: str | None = Query(default=None, pattern="^(device|config|account)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=200),
     _: dict = Depends(auth.require_perm("view_log")),
 ):
-    items, total = database.query_control_log(start, end, page, page_size)
+    items, total = database.query_control_log(start, end, page, page_size, category)
     return ok({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
@@ -284,12 +467,17 @@ def judge_enable(body: dict, _: dict = Depends(auth.require_perm("cfg_system")))
 # ---------- 系统状态 ----------
 @router.get("/water/system")
 def system_status(_: dict = Depends(auth.require_perm("view_device"))):
+    plant_info = services.plant.status() if services.plant else {}
     return ok({
         "uptime_s": round(services.uptime, 1),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "period": store.period(),
         "database_ok": database.ping(),
-        "sensor_url": config.SENSOR_URL or "模拟",
+        "device_url": config.DEVICE_URL,
+        "device_online": bool(plant_info.get("sensor_online")),
+        "tank_capacities": {t: store.tank_capacity(t) for t in config.TANKS},
+        "features": dict(config.DEVICE_FEATURES),
+        "pid_supported": config.pid_supported(),
         "active_alarm_count": len(services.alarm.active_alarms()) if services.alarm else 0,
     })
 
@@ -335,8 +523,14 @@ def auth_users(_: dict = Depends(auth.require_perm("account_manage"))):
     return ok({"users": [_user_public(r) for r in database.query_users()]})
 
 
+def _log_account(action: str, detail: str, user: dict, result: str = "success") -> None:
+    """账号管理类操作统一入日志（不记录任何密码明文）。"""
+    database.insert_control_log(action, result, detail,
+                                operator=user.get("username") or None, source="manual")
+
+
 @router.post("/auth/users")
-def auth_create_user(body: dict, _: dict = Depends(auth.require_perm("account_manage"))):
+def auth_create_user(body: dict, user: dict = Depends(auth.require_perm("account_manage"))):
     username = str(body.get("username", "")).strip()
     if not username:
         return err(40002, "用户名不能为空")
@@ -346,20 +540,29 @@ def auth_create_user(body: dict, _: dict = Depends(auth.require_perm("account_ma
     if role not in auth.role_matrix():
         return err(40002, f"角色不存在: {role}")
     user_id = database.insert_user(username, auth.hash_password(str(body.get("password", ""))), role)
+    _log_account("account.create", f"创建账号 {username}（角色 {auth.role_label(role)}）", user)
     return ok({"id": user_id, "msg": f"已创建用户 {username}"})
 
 
 @router.post("/auth/users/{user_id}/password")
-def auth_reset_password(user_id: int, body: dict, _: dict = Depends(auth.require_perm("account_manage"))):
+def auth_reset_password(user_id: int, body: dict, user: dict = Depends(auth.require_perm("account_manage"))):
+    target = next((r for r in database.query_users() if r["id"] == user_id), None)
     database.update_user_password(user_id, auth.hash_password(str(body.get("password", ""))))
+    name = target["username"] if target else f"#{user_id}"
+    _log_account("account.password", f"重置账号 {name} 的密码", user)
     return ok({"msg": "密码已重置"})
 
 
 @router.post("/auth/users/{user_id}/role")
-def auth_set_role(user_id: int, body: dict, _: dict = Depends(auth.require_perm("account_manage"))):
+def auth_set_role(user_id: int, body: dict, user: dict = Depends(auth.require_perm("account_manage"))):
     if body.get("role") not in auth.role_matrix():
         return err(40002, f"角色不存在: {body.get('role')}")
+    target = next((r for r in database.query_users() if r["id"] == user_id), None)
+    old_role = target["role"] if target else "--"
     database.update_user_role(user_id, body["role"])
+    name = target["username"] if target else f"#{user_id}"
+    _log_account("account.role",
+                 f"账号 {name} 角色 {auth.role_label(old_role)} → {auth.role_label(body['role'])}", user)
     return ok({"msg": "角色已更新"})
 
 
@@ -373,6 +576,8 @@ def auth_set_status(user_id: int, body: dict, user: dict = Depends(auth.require_
     if target["username"] == config.ADMIN_USERNAME:
         return err(40002, "不能禁用管理员账号")
     database.update_user_status(user_id, body["status"])
+    text = "启用" if body["status"] == "active" else "禁用"
+    _log_account("account.status", f"{text}账号 {target['username']}", user)
     return ok({"msg": "状态已更新"})
 
 
@@ -386,6 +591,7 @@ def auth_delete_user(user_id: int, user: dict = Depends(auth.require_perm("accou
     if target["username"] == config.ADMIN_USERNAME:
         return err(40002, "不能删除管理员账号")
     database.delete_user(user_id)
+    _log_account("account.delete", f"删除账号 {target['username']}（角色 {auth.role_label(target['role'])}）", user)
     return ok({"msg": "用户已删除"})
 
 
@@ -395,7 +601,7 @@ def auth_roles(_: dict = Depends(auth.require_perm("account_manage"))):
 
 
 @router.post("/auth/roles")
-def auth_save_roles(body: dict, _: dict = Depends(auth.require_perm("account_manage"))):
+def auth_save_roles(body: dict, user: dict = Depends(auth.require_perm("account_manage"))):
     matrix = {}
     for key, val in body.get("roles", {}).items():
         if not str(key).strip():
@@ -421,4 +627,5 @@ def auth_save_roles(body: dict, _: dict = Depends(auth.require_perm("account_man
     if matrix.get("admin") != auth.DEFAULT_ROLES["admin"]:
         matrix["admin"] = auth.DEFAULT_ROLES["admin"]
     auth.save_role_matrix(matrix)
+    _log_account("account.roles", f"保存角色权限矩阵（{len(matrix)} 个角色）", user)
     return ok({"msg": "角色矩阵已保存", "roles": auth.role_matrix()})

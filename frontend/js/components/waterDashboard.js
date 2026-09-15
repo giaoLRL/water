@@ -1,16 +1,24 @@
-/* 综合面板：实时监控(2路温度+流量+压力)、泵/加热控制、恒温PID、历史曲线、统计、告警、日志 */
+/* 综合面板：三栏驾驶舱（KPI / 双水槽循环回路 / 操作）+ 历史、统计、告警、日志。
+ *
+ * 数据来源为现场 ESP32 采集端（纯真实模式），前端只展示设备真实提供的通道：
+ *   支持   —— 瞬时流量 flow_rate、累计水量 total_liters、水泵 pump_state、定量目标 pump_target
+ *   不支持 —— 温度/压力/加热（由 realtime.features 声明，界面明确标注"设备不支持"）
+ *   待接入 —— 储水槽/加热槽液位（当前为后端模拟值，界面明确标注"模拟"）
+ */
+
 window.ViewWaterDash = {
   name: "WaterDashView",
+  components: { LoopViz: window.WaterLoopViz },
   props: { realtime: { type: Object, required: true } },
   data() {
     return {
       tab: "monitor",
       thresholds: {},
-      target: 42,
-      pidEnabled: 0,
       pumpBusy: false,
-      heaterBusy: false,
-      pidBusy: false,
+      targetInput: 0,
+      targetBusy: false,
+      resetBusy: false,
+      deviceInfo: {},
       // 历史
       histPoints: [],
       histRangeKey: "1h",
@@ -23,33 +31,102 @@ window.ViewWaterDash = {
       alarmTotal: 0, alarmPage: 1, alarmPageSize: 10,
       logs: [],
       logTotal: 0, logPage: 1, logPageSize: 10,
+      logCategory: "",
+      moreOpen: false,        // 「更多操作」折叠区
+      recentLogs: [],         // 驾驶舱右侧「最近操作」
+      tick: 0,                // 2s 定时器计数，用于低频刷新
       // 实时趋势缓冲
-      trend: { storage: [], heater: [], flow: [], pressure: [] },
+      trend: { flow: [], total: [] },
       timer: null,
     };
   },
   computed: {
+    online() { return !!this.realtime.sensor_online; },
+    features() { return this.realtime.features || {}; },
+    device() { return this.realtime.device || {}; },
+    pumpOn() { return this.realtime.pump_state === "on"; },
+    pumpUnknown() { return this.realtime.pump_state === "unknown"; },
+    // 设备不支持的通道（用于界面提示）
+    missingChannels() {
+      const f = this.features;
+      const names = [];
+      if (!f.temperature) names.push("水温");
+      if (!f.pressure) names.push("水压");
+      if (!f.heater) names.push("加热模块");
+      return names;
+    },
+    flowText() {
+      const v = this.realtime.flow_rate;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(2);
+    },
+    totalText() {
+      const v = this.realtime.total_liters;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(3);
+    },
+    targetText() {
+      const v = Number(this.realtime.pump_target || 0);
+      return v > 0 ? `${v.toFixed(2)} L` : "未设置";
+    },
+    uptimeText() {
+      const ms = this.device.uptime_ms != null ? this.device.uptime_ms : this.deviceInfo.uptime_ms;
+      if (ms == null) return "--";
+      const s = Math.floor(ms / 1000);
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      return h > 0 ? `${h} 小时 ${m} 分` : `${m} 分 ${s % 60} 秒`;
+    },
+    rssiText() {
+      const v = this.device.rssi != null ? this.device.rssi : this.deviceInfo.rssi;
+      return v == null ? "--" : `${v} dBm`;
+    },
+    ipText() {
+      return this.device.ip || this.deviceInfo.ip || this.deviceInfo.url || "--";
+    },
     alarmPages() { return Math.max(1, Math.ceil(this.alarmTotal / this.alarmPageSize)); },
     logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
+
+    // ---------- 双水槽水位 ----------
+    tankAnySim() { return !!(this.realtime.tank || {}).any_sim; },
+    flowActive() { return Number(this.realtime.flow_rate || 0) > 0.1; },
+    // 定量浇水进度：本次已注入量 / 目标水量
+    targetProgress() {
+      const target = Number(this.realtime.pump_target || 0);
+      if (!(target > 0)) return null;
+      const total = Number(this.realtime.total_liters || 0);
+      const base = Number(this.realtime.target_baseline ?? 0);
+      // 设备完成一次定量后会把累计值清零，此时回退为按当前累计值计算
+      const done = total >= base ? total - base : total;
+      return {
+        target,
+        done: Math.max(0, done),
+        percent: Math.max(0, Math.min(100, (done / target) * 100)),
+      };
+    },
   },
   watch: {
     realtime: {
-      handler(d) {
+      handler() {
         this.pushTrend();
         this.renderGauges();
         this.renderSparks();
+        this.syncTargetInput();
       },
       deep: true,
     },
   },
   mounted() {
-    this.target = this.realtime.target_temp ?? 42;
-    this.pidEnabled = this.realtime.pid_enabled ? 1 : 0;
+    this.syncTargetInput();
     this.loadAll();
+    this.refreshDevice();
+    // 2 秒兜底刷新：兼顾隐藏 tab 切回时的图表重绘
     this.timer = setInterval(() => {
+      this.tick += 1;
       this.pushTrend();
       this.refreshGauges();
       this.refreshSparks();
+      this.refreshDevice();
+      // 「最近操作」无需 2s 一刷，10s 一次即可
+      if (this.tick % 5 === 0) this.fetchRecentLogs();
     }, 2000);
   },
   beforeUnmount() {
@@ -66,13 +143,17 @@ window.ViewWaterDash = {
       const hours = { "1h": 1, "6h": 6, "24h": 24 }[key] || 1;
       return this.fmt(new Date(Date.now() - hours * 3600 * 1000));
     },
+    /* 目标输入框只在用户未聚焦时同步，避免覆盖正在输入的内容 */
+    syncTargetInput() {
+      const el = document.getElementById("pump-target-input");
+      if (el && document.activeElement === el) return;
+      const v = Number(this.realtime.pump_target || 0);
+      if (this.targetInput !== v) this.targetInput = v;
+    },
     pushTrend() {
-      const r = this.realtime;
-      const push = (arr, v) => { arr.push(v == null ? 0 : v); if (arr.length > 60) arr.shift(); };
-      push(this.trend.storage, r.storage_temp);
-      push(this.trend.heater, r.heater_temp);
-      push(this.trend.flow, r.flow_rate);
-      push(this.trend.pressure, r.pressure);
+      const push = (arr, v) => { arr.push(v === null || v === undefined ? 0 : Number(v)); if (arr.length > 60) arr.shift(); };
+      push(this.trend.flow, this.realtime.flow_rate);
+      push(this.trend.total, this.realtime.total_liters);
     },
     async loadAll() {
       try {
@@ -83,50 +164,52 @@ window.ViewWaterDash = {
       this.fetchStats("1h");
       this.fetchAlarms(1);
       this.fetchLogs(1);
+      this.fetchRecentLogs();
     },
-    // ---------- 控制 ----------
+    async refreshDevice() {
+      try {
+        const d = await API.device();
+        this.deviceInfo = d.device || {};
+        if (d.features && this.realtime && !this.realtime.features) this.realtime.features = d.features;
+      } catch (e) { /* silent */ }
+    },
+    // ---------- 水泵控制 ----------
     async onPump(e) {
-      const target = e.target.checked ? "on" : "off";
-      if (this.realtime.pump_state === target) { e.target.checked = this.realtime.pump_state === "on"; return; }
+      const action = e.target.checked ? "on" : "off";
+      if (!this.online) { e.target.checked = this.pumpOn; alert("设备离线，无法控制水泵"); return; }
       this.pumpBusy = true;
       try {
-        const d = await API.pump(target);
+        const d = await API.pump(action);
         Object.assign(this.realtime, d);
       } catch (err) {
-        e.target.checked = this.realtime.pump_state === "on";
+        e.target.checked = this.pumpOn;
         alert(err.message);
       } finally { this.pumpBusy = false; }
     },
-    async onHeater(e) {
-      const target = e.target.checked ? "on" : "off";
-      if (this.realtime.heater_state === target) { e.target.checked = this.realtime.heater_state === "on"; return; }
-      this.heaterBusy = true;
-      try {
-        const d = await API.heater(target);
-        Object.assign(this.realtime, d);
-      } catch (err) {
-        e.target.checked = this.realtime.heater_state === "on";
-        alert(err.message);
-      } finally { this.heaterBusy = false; }
-    },
+    // ---------- 定量浇水 ----------
     async saveTarget() {
-      const t = parseFloat(this.target);
-      if (isNaN(t)) { alert("请输入有效的目标温度"); return; }
+      const v = parseFloat(this.targetInput);
+      if (isNaN(v) || v < 0) { alert("请输入有效的目标水量(L)，填 0 表示取消定量"); return; }
+      this.targetBusy = true;
       try {
-        const d = await API.setTarget(t);
-        this.realtime.target_temp = d.target_temp;
-        alert("目标温度已设定");
+        const d = await API.pumpTargetSet(v);
+        Object.assign(this.realtime, d);
+        alert(v > 0 ? `已设定定量浇水 ${v} L，达到后设备自动关泵` : "已取消定量浇水");
       } catch (e) { alert(e.message); }
+      finally { this.targetBusy = false; }
     },
-    async togglePid(e) {
-      const target = e.target.checked ? 1 : 0;
-      this.pidBusy = true;
+    // ---------- 累计水量清零（破坏性） ----------
+    async resetVolume() {
+      if (!confirm("确定清零累计水量？\n\n该操作会清除设备上的累计值，不可恢复。")) return;
+      this.resetBusy = true;
       try {
-        await API.pidMode(target);
-        this.pidEnabled = target;
-        this.realtime.pid_enabled = !!target;
-      } catch (err) { e.target.checked = this.pidEnabled === 1; alert(err.message); }
-      finally { this.pidBusy = false; }
+        const d = await API.volumeReset();
+        Object.assign(this.realtime, d);
+        this.fetchHistory(this.histRangeKey);
+        this.fetchStats(this.histRangeKey);
+        alert("累计水量已清零");
+      } catch (e) { alert(e.message); }
+      finally { this.resetBusy = false; }
     },
     // ---------- 历史 ----------
     async fetchHistory(key, start, end) {
@@ -154,11 +237,9 @@ window.ViewWaterDash = {
       const times = pts.map((p) => p.ts);
       if (this.histType !== "all") {
         const def = {
-          temperature: ["储水槽温度", "storage_temp", "#2dd4bf", "℃"],
-          heater: ["加热槽温度", "heater_temp", "#f87171", "℃"],
-          flow: ["水流量", "flow_rate", "#38bdf8", "L/min"],
-          pressure: ["水压", "pressure", "#fbbf24", "kPa"],
-        }[this.histType] || ["储水槽温度", "storage_temp", "#2dd4bf", "℃"];
+          flow: ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0],
+          total: ["累计水量", "total_flow", "#2dd4bf", "L", 0],
+        }[this.histType] || ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0];
         window.Charts.init("water-hist-chart", {
           ...window.Charts.baseOption(times, def[3]),
           series: [window.Charts.lineSeries(def[0], pts.map((p) => p[def[1]]), def[2])],
@@ -171,18 +252,16 @@ window.ViewWaterDash = {
         grid: { left: 56, right: 60, top: 36, bottom: 60 },
         xAxis: { type: "category", data: times, boundaryGap: false, ...window.Charts.axisStyle },
         yAxis: [
-          { type: "value", name: "温度℃", ...window.Charts.axisStyle, nameTextStyle: { color: "#7d8b99" } },
-          { type: "value", name: "流量/压力", nameTextStyle: { color: "#7d8b99" }, axisLabel: { color: "#7d8b99" }, splitLine: { show: false }, axisLine: { lineStyle: { color: "#2a3442" } } },
+          { type: "value", name: "流量 L/min", ...window.Charts.axisStyle, nameTextStyle: { color: "#7d8b99" } },
+          { type: "value", name: "水量 L", nameTextStyle: { color: "#7d8b99" }, axisLabel: { color: "#7d8b99" }, splitLine: { show: false }, axisLine: { lineStyle: { color: "#2a3442" } } },
         ],
         dataZoom: [
           { type: "inside" },
           { type: "slider", height: 16, bottom: 8, borderColor: "#262f3b", backgroundColor: "#151b24", fillerColor: "rgba(45,212,191,0.14)", handleStyle: { color: "#2dd4bf" }, textStyle: { color: "#7d8b99" } },
         ],
         series: [
-          window.Charts.lineSeries("储水槽温度", pts.map((p) => p.storage_temp), "#2dd4bf", 0),
-          window.Charts.lineSeries("加热槽温度", pts.map((p) => p.heater_temp), "#f87171", 0),
-          window.Charts.lineSeries("水流量", pts.map((p) => p.flow_rate), "#38bdf8", 1),
-          window.Charts.lineSeries("水压", pts.map((p) => p.pressure), "#fbbf24", 1),
+          window.Charts.lineSeries("瞬时流量", pts.map((p) => p.flow_rate), "#38bdf8", 0),
+          window.Charts.lineSeries("累计水量", pts.map((p) => p.total_flow), "#2dd4bf", 1),
         ],
       });
     },
@@ -191,7 +270,18 @@ window.ViewWaterDash = {
       const s = this.rangeStart(key || this.histRangeKey);
       const e = this.rangeEnd();
       try { this.stats = await API.stats(s, e); } catch (err) { /* silent */ }
-      this.renderAlarmChart();
+      this.renderStatsChart();
+    },
+    renderStatsChart() {
+      const el = document.getElementById("water-stats-chart");
+      if (!el || !window.echarts) return;
+      const d = this.stats || {};
+      window.Charts.init("water-stats-chart", {
+        ...window.Charts.barOption(["平均流量", "最高流量", "最低流量"], "L/min"),
+        series: [window.Charts.barSeries("流量", [
+          d.avg_flow || 0, d.max_flow || 0, d.min_flow || 0,
+        ], "#38bdf8")],
+      });
     },
     // ---------- 告警 ----------
     async fetchAlarms(page) {
@@ -205,58 +295,62 @@ window.ViewWaterDash = {
     async fetchLogs(page) {
       if (page) this.logPage = page;
       try {
-        const d = await API.logs({ page: this.logPage, page_size: this.logPageSize });
+        const d = await API.logs({
+          page: this.logPage,
+          page_size: this.logPageSize,
+          category: this.logCategory,
+        });
         this.logs = d.items || [];
         this.logTotal = d.total || 0;
       } catch (e) { /* silent */ }
     },
-    renderAlarmChart() {
-      const el = document.getElementById("water-alarm-chart");
-      if (!el || !window.echarts) return;
-      let data;
-      try { data = this.stats; } catch (e) { data = {}; }
-      window.Charts.init("water-alarm-chart", {
-        ...window.Charts.baseOption(["平均温度", "最高温度", "最低温度"], "℃"),
-        series: [window.Charts.barSeries("数值", [
-          data.avg_heater_temp || 0, data.max_heater_temp || 0, data.min_heater_temp || 0,
-        ], "#2dd4bf")],
-      });
+    /* 取某个水槽的水位信息。模板里带参数调用，因此必须放 methods——
+       Vue 的 computed 不接受参数，写成 computed 会导致整个视图渲染失败。 */
+    tankOf(key) { return ((this.realtime.tank || {}).tanks || {})[key] || {}; },
+    async fetchRecentLogs() {
+      try {
+        const d = await API.logs({ page: 1, page_size: 4 });
+        this.recentLogs = d.items || [];
+      } catch (e) { /* silent */ }
+    },
+    /* 系统自动动作没有操作账号，用来源(source)区分 */
+    isSystemLog(l) { return l.source === "auto" || l.source === "judge"; },
+    operatorText(l) {
+      if (l.source === "auto") return "系统 · 恒温闭环";
+      if (l.source === "judge") return "系统 · 判定服务";
+      return l.operator || "—";
+    },
+    actionLabel(a) {
+      return {
+        "config.alarm": "修改告警阈值",
+        "config.period": "修改采集周期",
+        "config.tank": "修改水槽容积",
+        "account.create": "创建账号",
+        "account.password": "重置密码",
+        "account.role": "修改角色",
+        "account.status": "启用/禁用账号",
+        "account.delete": "删除账号",
+        "account.roles": "保存权限矩阵",
+      }[a] || a;
     },
     typeName(t) {
-      return { storage_temp: "储水槽温度", heater_temp: "加热槽温度", flow_rate: "水流量", pressure: "水压" }[t] || t;
+      return { flow_rate: "水流量", storage_temp: "储水槽温度", heater_temp: "加热槽温度", pressure: "水压" }[t] || t;
     },
     // ---------- 仪表盘与迷你曲线 ----------
     renderGauges() {
-      const r = this.realtime;
-      const defs = [
-        ["gauge-storage", r.storage_temp || 0, 0, 80, "℃", "#2dd4bf"],
-        ["gauge-heater", r.heater_temp || 0, 0, 80, "℃", "#f87171"],
-        ["gauge-flow", Math.min(r.flow_rate || 0, 20), 0, 20, "L/min", "#38bdf8"],
-        ["gauge-pressure", Math.min(r.pressure || 0, 160), 0, 160, "kPa", "#fbbf24"],
-      ];
-      defs.forEach(([id, v, min, max, unit, color]) => {
-        if (!document.getElementById(id)) return;
-        window.Charts.init(id, window.Charts.gaugeOption(v, min, max, unit, color), false);
-      });
+      const el = document.getElementById("gauge-flow");
+      if (!el) return;
+      const v = Number(this.realtime.flow_rate || 0);
+      window.Charts.init("gauge-flow", window.Charts.gaugeOption(Math.min(v, 20), 0, 20, "L/min", "#38bdf8"), false);
     },
     refreshGauges() {
-      const r = this.realtime;
-      const defs = [
-        ["gauge-storage", r.storage_temp || 0, 0, 80, "℃", "#2dd4bf"],
-        ["gauge-heater", r.heater_temp || 0, 0, 80, "℃", "#f87171"],
-        ["gauge-flow", Math.min(r.flow_rate || 0, 20), 0, 20, "L/min", "#38bdf8"],
-        ["gauge-pressure", Math.min(r.pressure || 0, 160), 0, 160, "kPa", "#fbbf24"],
-      ];
-      defs.forEach(([id, v, min, max, unit, color]) => {
-        window.Charts.set(id, window.Charts.gaugeOption(v, min, max, unit, color));
-      });
+      const v = Number(this.realtime.flow_rate || 0);
+      window.Charts.set("gauge-flow", window.Charts.gaugeOption(Math.min(v, 20), 0, 20, "L/min", "#38bdf8"));
     },
     renderSparks() {
       const defs = [
-        ["spark-storage", "storage", "#2dd4bf"],
-        ["spark-heater", "heater", "#f87171"],
         ["spark-flow", "flow", "#38bdf8"],
-        ["spark-pressure", "pressure", "#fbbf24"],
+        ["spark-total", "total", "#2dd4bf"],
       ];
       defs.forEach(([id, key, color]) => {
         const data = this.trend[key];
@@ -270,7 +364,7 @@ window.ViewWaterDash = {
       });
     },
     refreshSparks() {
-      const defs = [["spark-storage", "storage"], ["spark-heater", "heater"], ["spark-flow", "flow"], ["spark-pressure", "pressure"]];
+      const defs = [["spark-flow", "flow"], ["spark-total", "total"]];
       defs.forEach(([id, key]) => {
         const data = this.trend[key];
         if (Array.isArray(data) && data.length >= 2) window.Charts.set(id, { series: [{ data }] });
@@ -281,66 +375,123 @@ window.ViewWaterDash = {
   <div class="view-page">
     <div class="detail-head">
       <h2>水循环综合监控</h2>
-      <span class="desc">2 路温度 · 流量 · 压力 · 水泵 · 加热模块</span>
-      <span class="lamp-dot on" style="margin-left:auto;"></span>
-      <div class="detail-controls" v-if="perm('ctrl_light')">
-        <label class="toggle" :class="{ on: realtime.pump_state === 'on' }">
-          <input type="checkbox" :checked="realtime.pump_state === 'on'" :disabled="pumpBusy" @change="onPump">
+      <span class="desc">瞬时流量 · 累计水量 · 水泵控制 · 定量浇水</span>
+      <span class="lamp-dot" :class="online ? 'on' : 'off'"></span>
+      <span class="desc">{{ online ? '设备在线' : '设备离线' }}</span>
+      <div class="detail-controls" v-if="perm('ctrl_light') && features.pump">
+        <label class="toggle" :class="{ on: pumpOn }">
+          <input type="checkbox" :checked="pumpOn" :disabled="pumpBusy || !online" @change="onPump">
           <span class="toggle-track"><span class="toggle-thumb"></span></span>
         </label>
-        <span class="toggle-state">{{ realtime.pump_state === 'on' ? '水泵已开' : '水泵已关' }}</span>
-        <label class="toggle" :class="{ on: realtime.heater_state === 'on' }">
-          <input type="checkbox" :checked="realtime.heater_state === 'on'" :disabled="heaterBusy" @change="onHeater">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-        </label>
-        <span class="toggle-state">{{ realtime.heater_state === 'on' ? '加热已开' : '加热已关' }}</span>
+        <span class="toggle-state">{{ pumpUnknown ? '水泵状态未知' : (pumpOn ? '水泵已开' : '水泵已关') }}</span>
       </div>
+      <span v-else-if="!features.pump" class="toggle-state" style="color:var(--text-dim);">该设备不支持水泵控制</span>
       <span v-else class="toggle-state" style="color:var(--text-dim);">无控制权限</span>
+    </div>
+
+    <div v-if="!online" class="offline-bar">
+      <span class="ob-dot"></span>采集设备离线（{{ device.url || deviceInfo.url || '--' }}）{{ realtime.last_error ? '：' + realtime.last_error : '' }}
     </div>
 
     <div class="tabs">
       <span class="tab" :class="{ active: tab === 'monitor' }" @click="tab='monitor'">实时监控</span>
       <span class="tab" :class="{ active: tab === 'history' }" @click="tab='history'; $nextTick(()=>renderChart())">历史数据</span>
-      <span class="tab" :class="{ active: tab === 'stats' }" @click="tab='stats'; fetchStats('1h')">数据统计</span>
+      <span class="tab" :class="{ active: tab === 'stats' }" @click="tab='stats'; $nextTick(()=>renderStatsChart())">数据统计</span>
       <span class="tab" v-if="perm('view_alarm')" :class="{ active: tab === 'alarm' }" @click="tab='alarm'; fetchAlarms(1)">告警记录</span>
       <span class="tab" v-if="perm('view_log')" :class="{ active: tab === 'logs' }" @click="tab='logs'; fetchLogs(1)">操作日志</span>
     </div>
 
-    <!-- 实时监控 -->
-    <div v-show="tab === 'monitor'">
-      <div class="metrics-grid" style="margin-bottom:14px;">
-        <div class="metric gauge-box">
-          <div class="label">储水槽温度 <span class="desc">阈值 {{ thresholds.storage_temp_min ?? '--' }}~{{ thresholds.storage_temp_max ?? '--' }}℃</span></div>
-          <div class="gauge" id="gauge-storage"></div><div class="spark" id="spark-storage"></div>
+    <!-- 实时监控：三栏驾驶舱 -->
+    <div v-show="tab === 'monitor'" class="cockpit">
+      <!-- 左栏：关键指标 -->
+      <aside class="ck-kpi">
+        <div class="kpi-card">
+          <div class="kpi-label">瞬时流量</div>
+          <div class="kpi-value">{{ flowText }}<span class="kpi-unit">L/min</span></div>
+          <div class="kpi-spark" id="spark-flow"></div>
+          <div class="kpi-foot">阈值 {{ thresholds.flow_min ?? '--' }} ~ {{ thresholds.flow_max ?? '--' }}</div>
         </div>
-        <div class="metric gauge-box">
-          <div class="label">加热槽温度 <span class="desc">阈值 {{ thresholds.heater_temp_min ?? '--' }}~{{ thresholds.heater_temp_max ?? '--' }}℃</span></div>
-          <div class="gauge" id="gauge-heater"></div><div class="spark" id="spark-heater"></div>
-        </div>
-        <div class="metric gauge-box">
-          <div class="label">管路水流量 <span class="desc">阈值 {{ thresholds.flow_min ?? '--' }}~{{ thresholds.flow_max ?? '--' }} L/min</span></div>
-          <div class="gauge" id="gauge-flow"></div><div class="spark" id="spark-flow"></div>
-        </div>
-        <div class="metric gauge-box">
-          <div class="label">管路水压 <span class="desc">阈值 {{ thresholds.pressure_min ?? '--' }}~{{ thresholds.pressure_max ?? '--' }} kPa</span></div>
-          <div class="gauge" id="gauge-pressure"></div><div class="spark" id="spark-pressure"></div>
-        </div>
-      </div>
 
-      <div class="section" v-if="perm('cfg_alarm')">
-        <h3>本地恒温闭环控制 <span class="desc">PID · 目标温度 · 稳态±1℃（任务六）</span></h3>
-        <div class="alarm-rule">
-          <div class="rule-item"><span>目标温度</span><input type="number" v-model.number="target" min="0" max="90" style="width:90px;"> <span>℃</span></div>
-          <button class="btn-ghost" @click="saveTarget">设定目标</button>
-          <label class="rule-item"><span>启用恒温(PID)</span>
-            <input type="checkbox" :checked="pidEnabled === 1" :disabled="pidBusy" @change="togglePid">
-          </label>
-          <span class="desc">当前 PID 输出占空比：{{ realtime.pid_duty ?? '--' }}% ｜ 目标 {{ realtime.target_temp ?? '--' }}℃</span>
+        <div class="kpi-card">
+          <div class="kpi-label">累计水量</div>
+          <div class="kpi-value">{{ totalText }}<span class="kpi-unit">L</span></div>
+          <div class="kpi-spark" id="spark-total"></div>
+          <div class="kpi-foot">定量目标 {{ targetText }}</div>
         </div>
-      </div>
-      <div v-else class="section"><p class="desc">当前账号无恒温控制权限。</p></div>
 
-      <div class="note">数据每 {{ realtime.period ? '~' : '' }}2 秒自动刷新。水泵开→管路有水流量；加热开→加热槽升温（模拟）。</div>
+        <div class="kpi-card">
+          <div class="kpi-label">水泵</div>
+          <div class="kpi-state" :class="pumpOn ? 'ok' : (pumpUnknown ? 'bad' : 'off')">{{ pumpUnknown ? '未知' : (pumpOn ? '运行中' : '已停止') }}</div>
+          <div class="kpi-foot">窗口脉冲 {{ realtime.pulses ?? '--' }} · {{ realtime.window_ms ?? '--' }} ms</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">采集设备<span class="dot" :class="online ? 'green' : 'red'"></span></div>
+          <div class="kpi-kv"><span>地址</span><b>{{ ipText }}</b></div>
+          <div class="kpi-kv"><span>信号</span><b>{{ rssiText }}</b></div>
+          <div class="kpi-kv"><span>运行</span><b>{{ uptimeText }}</b></div>
+          <div class="kpi-foot kpi-warn" v-if="missingChannels.length"
+               :title="'当前固件未提供：' + missingChannels.join('、') + '。升级固件后在 backend/config.py 的 DEVICE_FEATURES 中开启对应通道。'">
+            未提供通道：{{ missingChannels.join('、') }}
+          </div>
+        </div>
+      </aside>
+
+      <!-- 中栏：双水槽循环回路（视觉主体） -->
+      <section class="ck-loop">
+        <LoopViz :storage="tankOf('storage')" :heater="tankOf('heater')"
+                 :flowing="flowActive" :pump-on="pumpOn" :flow-text="flowText"/>
+        <div class="loop-caption">
+          <span class="badge" :class="tankAnySim ? 'warn' : 'ok'">{{ tankAnySim ? '液位模拟' : '液位实测' }}</span>
+          <span class="desc">{{ tankAnySim
+            ? '液位传感器未接入，水位按水量守恒模拟：水泵运行储水槽→加热槽，停机缓慢回平'
+            : '两槽水位来自传感器实测值' }}</span>
+        </div>
+      </section>
+
+      <!-- 右栏：操作 -->
+      <aside class="ck-ops">
+        <div class="op-card" v-if="perm('ctrl_light') && features.pump_target">
+          <div class="op-title">定量浇水</div>
+          <div class="op-input">
+            <input id="pump-target-input" type="number" v-model.number="targetInput" min="0" step="0.1">
+            <span class="op-unit">L</span>
+            <button class="btn-primary" :disabled="targetBusy || !online" @click="saveTarget">设定</button>
+            <button class="btn-ghost" :disabled="targetBusy || !online" @click="targetInput = 0; saveTarget()">取消</button>
+          </div>
+          <div class="target-progress" v-if="targetProgress">
+            <div class="tp-head">
+              <span>已注入 {{ targetProgress.done.toFixed(3) }} / {{ targetProgress.target.toFixed(2) }} L</span>
+              <b>{{ targetProgress.percent.toFixed(1) }}%</b>
+            </div>
+            <div class="tp-bar"><span :style="{ width: targetProgress.percent + '%' }"></span></div>
+          </div>
+          <div class="op-foot">达到目标由设备固件自动关泵；完成后设备会清零累计水量并取消目标</div>
+        </div>
+
+        <div class="op-card" v-if="perm('view_log')">
+          <div class="op-title">最近操作</div>
+          <ul class="op-log">
+            <li v-for="(l, i) in recentLogs" :key="i">
+              <span class="op-time">{{ (l.ts || '').slice(11, 16) }}</span>
+              <span class="op-who" :class="{ sys: isSystemLog(l) }">{{ operatorText(l) }}</span>
+              <span class="op-what">{{ actionLabel(l.action) }}</span>
+            </li>
+            <li v-if="!recentLogs.length" class="op-empty">暂无记录</li>
+          </ul>
+        </div>
+
+        <div class="op-card op-more" v-if="perm('ctrl_light')">
+          <button class="op-more-btn" @click="moreOpen = !moreOpen">
+            更多操作<span class="op-caret" :class="{ open: moreOpen }">▾</span>
+          </button>
+          <div v-show="moreOpen" class="op-more-body">
+            <button class="btn-ghost danger" :disabled="resetBusy || !online || !features.volume_reset"
+                    @click="resetVolume">清零累计水量</button>
+            <div class="op-foot">清除设备上的累计值，不可恢复，执行前二次确认</div>
+          </div>
+        </div>
+      </aside>
     </div>
 
     <!-- 历史数据 -->
@@ -360,10 +511,8 @@ window.ViewWaterDash = {
         </div>
         <div class="tabs">
           <span class="tab" :class="{ active: histType==='all' }" @click="pickHistType('all')">全部</span>
-          <span class="tab" :class="{ active: histType==='temperature' }" @click="pickHistType('temperature')">储水槽温度</span>
-          <span class="tab" :class="{ active: histType==='heater' }" @click="pickHistType('heater')">加热槽温度</span>
-          <span class="tab" :class="{ active: histType==='flow' }" @click="pickHistType('flow')">水流量</span>
-          <span class="tab" :class="{ active: histType==='pressure' }" @click="pickHistType('pressure')">水压</span>
+          <span class="tab" :class="{ active: histType==='flow' }" @click="pickHistType('flow')">瞬时流量</span>
+          <span class="tab" :class="{ active: histType==='total' }" @click="pickHistType('total')">累计水量</span>
         </div>
         <div class="chart" id="water-hist-chart"></div>
       </div>
@@ -372,21 +521,22 @@ window.ViewWaterDash = {
     <!-- 数据统计 -->
     <div v-show="tab === 'stats'">
       <div class="section">
-        <h3>数据统计 <span class="desc">加热槽温度曲线汇总（任务六·数据统计分析）</span></h3>
-        <div class="chart" id="water-alarm-chart"></div>
+        <h3>数据统计 <span class="desc">区间流量指标汇总（任务六·数据统计分析）</span></h3>
+        <div class="chart small" id="water-stats-chart"></div>
       </div>
       <div class="grid-4" style="margin-bottom:14px;">
-        <div class="metric"><div class="label">平均储水槽温度</div><div class="value">{{ stats.avg_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
-        <div class="metric"><div class="label">平均加热槽温度</div><div class="value">{{ stats.avg_heater_temp ?? '--' }}<span class="unit">℃</span></div></div>
-        <div class="metric"><div class="label">最高/最低压力</div><div class="value">{{ stats.max_pressure ?? '--' }} / {{ stats.min_pressure ?? '--' }}<span class="unit">kPa</span></div></div>
-        <div class="metric"><div class="label">累计水流量</div><div class="value">{{ stats.total_flow ?? '--' }}<span class="unit">L</span></div></div>
+        <div class="metric"><div class="label">平均流量</div><div class="value">{{ stats.avg_flow ?? '--' }}<span class="unit">L/min</span></div></div>
+        <div class="metric"><div class="label">最高流量</div><div class="value">{{ stats.max_flow ?? '--' }}<span class="unit">L/min</span></div></div>
+        <div class="metric"><div class="label">最低流量</div><div class="value">{{ stats.min_flow ?? '--' }}<span class="unit">L/min</span></div></div>
+        <div class="metric"><div class="label">区间用水量</div><div class="value">{{ stats.volume_used ?? '--' }}<span class="unit">L</span></div></div>
       </div>
       <div class="grid-4">
-        <div class="metric"><div class="label">最高储水槽温度</div><div class="value">{{ stats.max_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
-        <div class="metric"><div class="label">最低储水槽温度</div><div class="value">{{ stats.min_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
-        <div class="metric"><div class="label">最高加热槽温度</div><div class="value">{{ stats.max_heater_temp ?? '--' }}<span class="unit">℃</span></div></div>
-        <div class="metric"><div class="label">采样点数</div><div class="value">{{ histPoints.length }}<span class="unit">条</span></div></div>
+        <div class="metric"><div class="label">区间起始累计</div><div class="value">{{ stats.start_total ?? '--' }}<span class="unit">L</span></div></div>
+        <div class="metric"><div class="label">区间结束累计</div><div class="value">{{ stats.end_total ?? '--' }}<span class="unit">L</span></div></div>
+        <div class="metric"><div class="label">当前累计水量</div><div class="value">{{ totalText }}<span class="unit">L</span></div></div>
+        <div class="metric"><div class="label">采样点数</div><div class="value">{{ stats.samples ?? 0 }}<span class="unit">条</span></div></div>
       </div>
+      <div class="note">区间用水量 = 区间结束累计水量 − 区间起始累计水量；期间若执行过清零，该值按 0 计。</div>
     </div>
 
     <!-- 告警记录 -->
@@ -421,18 +571,38 @@ window.ViewWaterDash = {
     <!-- 操作日志 -->
     <div v-show="tab === 'logs'">
       <div class="section">
-        <h3>设备操作日志 <span class="desc">共 {{ logTotal }} 条</span></h3>
+        <h3>操作日志
+          <span class="desc">共 {{ logTotal }} 条 · 记录设备控制、系统配置与账号管理</span>
+        </h3>
+        <div class="alarm-rule" style="margin-bottom:10px;">
+          <label class="rule-item"><span>分类</span>
+            <select v-model="logCategory" @change="fetchLogs(1)">
+              <option value="">全部</option>
+              <option value="device">设备控制</option>
+              <option value="config">系统配置</option>
+              <option value="account">账号管理</option>
+            </select>
+          </label>
+          <span class="desc" style="margin-left:auto;">
+            系统自动动作（恒温闭环 / 判定服务）无操作账号，标注为「系统」
+          </span>
+        </div>
         <div style="overflow-x:auto;">
           <table>
-            <thead><tr><th>时间</th><th>指令</th><th>结果</th><th>说明</th></tr></thead>
+            <thead><tr><th>时间</th><th>操作人</th><th>指令</th><th>结果</th><th>说明</th></tr></thead>
             <tbody>
               <tr v-for="(l,i) in logs" :key="i">
                 <td>{{ l.ts }}</td>
-                <td>{{ l.action }}</td>
+                <td>
+                  <span v-if="isSystemLog(l)" class="badge warn">{{ operatorText(l) }}</span>
+                  <span v-else-if="l.operator">{{ l.operator }}</span>
+                  <span v-else style="color:var(--text-dim);" title="历史日志未记录操作人">—</span>
+                </td>
+                <td>{{ actionLabel(l.action) }}</td>
                 <td><span class="badge" :class="l.result==='success' ? 'ok' : 'fail'">{{ l.result==='success' ? '成功':'失败' }}</span></td>
                 <td>{{ l.detail || '' }}</td>
               </tr>
-              <tr v-if="!logs.length"><td colspan="4" style="text-align:center;color:#6b7a90;">暂无操作日志</td></tr>
+              <tr v-if="!logs.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无操作日志</td></tr>
             </tbody>
           </table>
         </div>

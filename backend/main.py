@@ -36,39 +36,43 @@ DEBUG_ENABLE = 1
 
 
 def run_cycle() -> None:
-    """执行一个采集周期(采集→控制→入库→告警→判定)。"""
+    """执行一个采集周期(采集设备→可选PID→入库→告警→判定)。"""
     plant = services.plant
     data = plant.read()
 
-    # 采集端真实上报数据优先(任务二网络链路)；无则用模拟
+    # 采集端主动上报数据优先(可选链路，任务二)；无则用后端轮询到的值
     ing = services.ingest
     if ing and isinstance(ing, dict) and (time.time() - ing.get("ts", 0)) < 2.0:
-        for k in ("storage_temp", "heater_temp", "flow_rate", "pressure"):
-            if k in ing and ing[k] is not None:
+        for k in ("flow_rate", "total_liters"):
+            if ing.get(k) is not None:
                 data[k] = float(ing[k])
+        data["total_flow"] = data.get("total_liters")
 
-    # 恒温闭环控制(PID)：PID输出占空比→加热器开关(任务六)
-    if store.pid_enabled():
+    # 恒温闭环控制(PID)：需设备同时支持温度与加热通道，当前固件不支持故跳过（任务六）
+    if config.pid_supported() and store.pid_enabled():
         target = store.target_temp()
         duty = services.pid.update(target, data["heater_temp"], store.period())
         act = heater_action(duty)
         if act != plant.heater_state:
             plant.heater_control(act)
             name = "开启加热" if act == "on" else "关闭加热"
-            database.insert_control_log(f"heater_{act}", "success", f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)")
+            database.insert_control_log(f"heater_{act}", "success",
+                                        f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)",
+                                        operator=None, source="auto")
             if DEBUG_ENABLE:
                 _log.info("[CONTROL] 恒温闭环 → %s (heater_temp=%.2f target=%.1f duty=%.0f%%)",
                           name, data["heater_temp"], target, duty)
 
-    # 数据入库(任务三：持久化)
+    # 数据入库(任务三：持久化)；设备不支持的通道写 NULL
     database.insert_water_sensor(
-        datetime.now(), data["storage_temp"], data["heater_temp"],
-        data["flow_rate"], data["pressure"],
-        data["pump_state"], data["heater_state"],
-        data.get("total_flow", 0.0),
+        datetime.now(),
+        data.get("storage_temp"), data.get("heater_temp"),
+        data.get("flow_rate"), data.get("pressure"),
+        data.get("pump_state") or "unknown", data.get("heater_state"),
+        data.get("total_flow"), data.get("pump_target"),
     )
 
-    # 告警检查(任务六异常告警)
+    # 告警检查(任务六异常告警)：仅检查设备实际支持的通道
     services.alarm.check(data)
 
     # 判定服务：上报 + 轮询指令 + 执行反馈(任务五)
@@ -80,17 +84,30 @@ def run_cycle() -> None:
         device = str(cmd.get("device") or cmd.get("type") or "")
         action = str(cmd.get("action") or cmd.get("command") or "")
         if action in ("on", "off"):
-            if device == "pump":
-                plant.pump_control(action)
-            elif device == "heater":
-                plant.heater_control(action)
-            database.insert_control_log(f"{device}_{action}", "success", "判定服务指令执行")
+            try:
+                if device == "pump":
+                    plant.pump_control(action)
+                elif device == "heater":
+                    plant.heater_control(action)
+                database.insert_control_log(f"{device}_{action}", "success", "判定服务指令执行",
+                                            operator=None, source="judge")
+            except Exception as exc:  # noqa: BLE001
+                database.insert_control_log(f"{device}_{action}", "failed",
+                                            f"判定服务指令执行失败: {exc}",
+                                            operator=None, source="judge")
         judge.feedback("ok", {"pump_state": plant.pump_state, "heater_state": plant.heater_state})
 
     if DEBUG_ENABLE:
-        _log.info("[SENSOR] storage=%.2f heater=%.2f flow=%.2f pressure=%.2f pump=%s heater_m=%s",
-                  data["storage_temp"], data["heater_temp"], data["flow_rate"], data["pressure"],
-                  data["pump_state"], data["heater_state"])
+        _log.info("[SENSOR] flow=%s L/min total=%s L pump=%s target=%.2f online=%s%s",
+                  _fmt(data.get("flow_rate")), _fmt(data.get("total_liters"), 3),
+                  data.get("pump_state"), float(data.get("pump_target") or 0.0),
+                  data.get("sensor_online"),
+                  f" err={data.get('last_error')}" if data.get("last_error") else "")
+
+
+def _fmt(value, digits: int = 2) -> str:
+    """把可能为 None 的读数格式化为字符串，None 显示 '--'。"""
+    return "--" if value is None else f"{float(value):.{digits}f}"
 
 
 def collect_loop() -> None:
@@ -112,6 +129,10 @@ async def lifespan(app: FastAPI):
     services.alarm = AlarmEngine()
     services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
     services.judge = JudgeService()
+    enabled = [k for k, v in config.DEVICE_FEATURES.items() if v]
+    _log.info("采集设备: %s (超时%.1fs) 支持通道: %s", config.DEVICE_URL, config.DEVICE_TIMEOUT_S, ",".join(enabled))
+    if not config.pid_supported():
+        _log.info("恒温闭环(PID)已禁用：当前固件未提供温度/加热通道")
     threading.Thread(target=collect_loop, daemon=True).start()
     try:
         yield

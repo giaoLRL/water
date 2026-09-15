@@ -1,13 +1,14 @@
-/* 系统配置页：告警阈值 + 恒温PID参数 + 采集周期。账号/角色管理复用后端接口。 */
+/* 系统配置页：告警阈值 + 采集周期 + 设备信息。账号/角色管理复用后端接口。 */
 window.ViewSysConfig = {
   name: "SysConfigView",
   emits: ["back"],
   data() {
     return {
-      tab: "alarm",   // alarm / pid / account
+      tab: "alarm",   // alarm / account
       thresholds: {},
-      pid: { kp: 16, ki: 0.3, kd: 25 },
       period: 1.0,
+      tankCap: { storage: 1000, heater: 1000 },
+      system: {},
       // 账号
       users: [],
       roles: [],
@@ -36,8 +37,9 @@ window.ViewSysConfig = {
         const cfg = await API.alarmConfigGet();
         this.thresholds = cfg.thresholds || {};
       } catch (e) { /* silent */ }
-      try { this.pid = await API.pidGet(); } catch (e) { /* silent */ }
-      try { const s = await API.system(); this.period = s.period || 1.0; } catch (e) { /* silent */ }
+      try { this.system = await API.system(); this.period = this.system.period || 1.0; } catch (e) { /* silent */ }
+      const caps = this.system.tank_capacities;
+      if (caps) this.tankCap = { storage: caps.storage, heater: caps.heater };
       if (this.perm("account_manage")) {
         try { this.users = (await API.users()).users || []; } catch (e) { /* silent */ }
         try {
@@ -52,10 +54,9 @@ window.ViewSysConfig = {
         } catch (e) { /* silent */ }
       }
     },
-    async saveEnvUsed() {},
     async saveThresh() {
-      const keys = ["storage_temp_max", "storage_temp_min", "heater_temp_max", "heater_temp_min",
-                    "flow_max", "flow_min", "pressure_max", "pressure_min"];
+      // 仅保存当前采集设备支持的通道（流量）
+      const keys = ["flow_max", "flow_min"];
       const cfg = {};
       for (const k of keys) {
         const v = parseFloat(this.thresholds[k]);
@@ -68,17 +69,31 @@ window.ViewSysConfig = {
         alert("告警阈值已保存");
       } catch (e) { alert(e.message); }
     },
-    async savePid() {
-      try {
-        await API.pidSet({ kp: this.pid.kp, ki: this.pid.ki, kd: this.pid.kd });
-        alert("PID 参数已保存");
-      } catch (e) { alert(e.message); }
-    },
     async savePeriod() {
       try {
         const d = await API.setPeriod(this.period);
         this.period = d.period;
         alert("采集周期已保存（即时生效）");
+      } catch (e) { alert(e.message); }
+    },
+    async saveTank() {
+      // 先固化两个输入值：保存第一个水槽后回读 capacities 会覆盖尚未提交的另一槽输入
+      const caps = {
+        storage: parseFloat(this.tankCap.storage),
+        heater: parseFloat(this.tankCap.heater),
+      };
+      for (const [tank, label] of [["storage", "储水槽"], ["heater", "加热槽"]]) {
+        if (isNaN(caps[tank]) || caps[tank] <= 0) { alert(`请输入有效的${label}容积(L)`); return; }
+      }
+      try {
+        let last = null;
+        for (const tank of ["storage", "heater"]) {
+          last = await API.tankSet(tank, caps[tank]);
+        }
+        if (last && last.capacities) {
+          this.tankCap = { storage: last.capacities.storage, heater: last.capacities.heater };
+        }
+        alert("水槽容积已保存（实时水位界面即时生效）");
       } catch (e) { alert(e.message); }
     },
     async createUser() {
@@ -171,29 +186,27 @@ window.ViewSysConfig = {
     <div class="detail-head">
       <button class="btn-ghost" @click="$emit('back')">← 返回</button>
       <h2>系统配置</h2>
-      <span class="desc">告警阈值 · 恒温PID · 采集周期</span>
+      <span class="desc">告警阈值 · 采集周期 · 设备信息</span>
     </div>
 
     <div class="tabs">
-      <span class="tab" :class="{ active: tab==='alarm' }" @click="tab='alarm'">告警阈值 / PID / 周期</span>
+      <span class="tab" :class="{ active: tab==='alarm' }" @click="tab='alarm'">告警阈值 / 采集周期</span>
       <span class="tab" v-if="perm('account_manage')" :class="{ active: tab==='account' }" @click="tab='account'; load()">账号管理</span>
     </div>
 
     <div class="grid-2 config-grid" v-show="tab==='alarm'">
       <div class="section">
-        <h3>告警阈值 <span class="desc">温度/流量/压力上下限 · 超限即告警（任务六）</span></h3>
+        <h3>告警阈值 <span class="desc">流量上下限 · 超限即告警（任务六）</span></h3>
         <div class="alarm-rule" style="flex-direction:column;align-items:stretch;gap:10px;">
           <div class="grid-2">
-            <label class="rule-item"><span>储水槽温度上限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_max"></label>
-            <label class="rule-item"><span>储水槽温度下限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_min"></label>
-            <label class="rule-item"><span>加热槽温度上限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_max"></label>
-            <label class="rule-item"><span>加热槽温度下限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_min"></label>
             <label class="rule-item"><span>水流量上限 L/min</span><input type="number" v-model.number="thresholds.flow_max"></label>
             <label class="rule-item"><span>水流量下限 L/min</span><input type="number" v-model.number="thresholds.flow_min"></label>
-            <label class="rule-item"><span>水压上限 kPa</span><input type="number" v-model.number="thresholds.pressure_max"></label>
-            <label class="rule-item"><span>水压下限 kPa</span><input type="number" v-model.number="thresholds.pressure_min"></label>
           </div>
           <button class="btn-primary" @click="saveThresh">保存告警阈值</button>
+          <div class="note" style="margin-top:0;">
+            温度 / 压力阈值已随通道裁剪：当前采集固件未提供温度、压力与加热通道，
+            相关面板、告警与恒温闭环(PID)均不可用。
+          </div>
         </div>
       </div>
       <div class="section">
@@ -202,14 +215,27 @@ window.ViewSysConfig = {
           <label class="rule-item"><span>采集周期(秒)</span><input type="number" v-model.number="period" min="0.5" step="0.5" style="width:90px;"></label>
           <button class="btn-primary" @click="savePeriod">保存</button>
         </div>
-        <h3 style="margin-top:18px;">恒温PID参数 <span class="desc">任务六本地恒温</span></h3>
+        <h3 style="margin-top:18px;">双水槽容积 <span class="desc">实时水位动画</span></h3>
         <div class="alarm-rule">
-          <label class="rule-item"><span>Kp</span><input type="number" v-model.number="pid.kp" style="width:90px;"></label>
-          <label class="rule-item"><span>Ki</span><input type="number" v-model.number="pid.ki" style="width:90px;"></label>
-          <label class="rule-item"><span>Kd</span><input type="number" v-model.number="pid.kd" style="width:90px;"></label>
-          <button class="btn-primary" @click="savePid">保存PID</button>
+          <label class="rule-item"><span>储水槽(L)</span><input type="number" v-model.number="tankCap.storage" min="1" step="1" style="width:100px;"></label>
+          <label class="rule-item"><span>加热槽(L)</span><input type="number" v-model.number="tankCap.heater" min="1" step="1" style="width:100px;"></label>
+          <button class="btn-primary" @click="saveTank">保存</button>
+          <span class="desc">用于把水位%换算成估算水量</span>
         </div>
-        <div class="note">判定服务地址 / 采集端 / 继电器地址等硬参数集中在 backend/config.py 修改。</div>
+        <div class="note" style="margin-top:0;">
+          双水槽液位传感器尚未接入，界面水位目前为<b>模拟值</b>（按水量守恒：水泵运行时储水槽→加热槽，
+          停机后缓慢回平），已明确标注。传感器接入后，把 backend/config.py 的
+          <code>DEVICE_FEATURES["level_storage"]</code> / <code>["level_heater"]</code> 改为 <code>True</code>，
+          并填写 <code>LEVEL_PATH_STORAGE</code> / <code>LEVEL_PATH_HEATER</code> 与对应水槽高度，界面会自动切换为实测值。
+        </div>
+        <h3 style="margin-top:18px;">采集设备 <span class="desc">任务一/二：链路与通道</span></h3>
+        <div class="stat-grid2">
+          <div class="stat-box"><div class="label">设备地址</div><div class="value">{{ system.device_url || '--' }}</div></div>
+          <div class="stat-box"><div class="label">在线状态</div><div class="value">{{ system.device_online ? '在线' : '离线' }}</div></div>
+          <div class="stat-box"><div class="label">数据库</div><div class="value">{{ system.database_ok ? '正常' : '异常' }}</div></div>
+          <div class="stat-box"><div class="label">服务运行时长</div><div class="value">{{ system.uptime_s ?? '--' }} s</div></div>
+        </div>
+        <div class="note">设备地址 / 超时 / 通道开关等硬参数集中在 backend/config.py 修改（DEVICE_URL、DEVICE_FEATURES）。</div>
       </div>
     </div>
 

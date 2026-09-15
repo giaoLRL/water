@@ -140,7 +140,7 @@ const app = createApp({
         <div class="logo"><span v-html="ICONS.drop"></span></div>
         <div>
           <h1>智能水循环监测与温控系统</h1>
-          <div class="subtitle">水循环监测 · 恒温控制 · 报警 · 数据统计</div>
+          <div class="subtitle">水循环监测 · 流量计量 · 定量浇水 · 报警 · 数据统计</div>
         </div>
       </div>
       <div class="status-chips">

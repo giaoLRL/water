@@ -75,3 +75,27 @@ def pid_enabled() -> int:
 
 def judge_enabled() -> int:
     return get_int("judge_enabled", config.JUDGE_ENABLED_DEFAULT)
+
+
+# ---------- 可视化水位 ----------
+def tank_capacity(tank: str = "storage") -> float:
+    """指定水槽的容积(L)：把液位百分比换算成"估算水量"的分母。"""
+    default = (config.TANK_CAPACITY_STORAGE_DEFAULT if tank == "storage"
+               else config.TANK_CAPACITY_HEATER_DEFAULT)
+    return get_float(f"tank_capacity_{tank}", default)
+
+
+def target_baseline() -> float | None:
+    """设定定量目标那一刻的累计水量(L)，用于计算本次定量已注入量；未记录返回 None。"""
+    raw = get("target_baseline", None)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_target_baseline(value: float | None) -> None:
+    """记录/清除定量基准；传 None 表示清除(取消定量或设备已清零)。"""
+    set("target_baseline", "" if value is None else value)
