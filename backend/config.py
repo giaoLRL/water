@@ -10,6 +10,7 @@
 """
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _env(key: str, default: str) -> str:
@@ -74,6 +75,14 @@ DEVICE_FEATURES = {
     "heater": True,         # 加热继电器：/api/heater/on|off|toggle|state
     "light": True,          # 光照：/api/light（GY-302，单位 lx）
 }
+
+# 仪表盘自定义卡片代理白名单（仅主机名）：前端「自定义接口卡片」的 URL
+# 由后端 /api/water/dashboard/proxy 代发 GET，仅允许白名单内主机，防 SSRF。
+# 【现场修改】需要接入其他设备/服务时把主机名加进 WATER_DASHBOARD_PROXY_HOSTS（逗号分隔）。
+_proxy_extra = [h.strip() for h in _env("WATER_DASHBOARD_PROXY_HOSTS", "").split(",") if h.strip()]
+DASHBOARD_PROXY_HOSTS = sorted(
+    {"127.0.0.1", "localhost", urlparse(DEVICE_URL).hostname or "", *_proxy_extra} - {""}
+)
 
 # ---------- 双水槽液位通道 ----------
 # 固件只提供一路超声波液位 /api/level（接加热槽，返回百分比），储水槽无传感器。

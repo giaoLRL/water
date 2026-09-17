@@ -89,5 +89,10 @@ window.API = (() => {
     judgeStatus: () => req("GET", "/api/water/judge/status"),
     judgeEnable: (enabled) => req("POST", "/api/water/judge/enable", { enabled: enabled ? 1 : 0 }),
     system: () => req("GET", "/api/water/system"),
+    // 仪表盘布局（全局共享）与自定义卡片代理（白名单 GET 代发）
+    dashboardLayoutGet: () => req("GET", "/api/water/dashboard/layout"),
+    dashboardLayoutSave: (layout) => req("POST", "/api/water/dashboard/layout", { layout }),
+    dashboardLayoutReset: () => req("POST", "/api/water/dashboard/layout/reset"),
+    dashboardProxy: (url, log) => req("GET", "/api/water/dashboard/proxy?url=" + encodeURIComponent(url) + (log ? "&log=1" : "")),
   };
 })();

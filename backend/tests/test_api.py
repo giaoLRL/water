@@ -361,6 +361,40 @@ def main() -> None:
     check("采集周期变更已入日志", any(it["action"] == "config.period" for it in r["data"]["items"]),
           str([it["action"] for it in r["data"]["items"]]))
 
+    print("== 9.2 仪表盘布局与自定义卡片代理 ==")
+    r = request("GET", "/api/water/dashboard/layout")
+    check("布局读取接口可用", r["code"] == 0 and "layout" in r["data"], str(r))
+    saved_before = r["data"]["layout"]
+    demo_layout = {"version": 1, "widgets": [
+        {"id": "t1", "type": "value", "title": "测试卡", "unit": "", "decimals": 1,
+         "source": {"kind": "realtime", "path": "flow_rate"}, "grid": {"x": 0, "y": 0, "w": 6, "h": 2}},
+    ]}
+    r = request_raw("POST", "/api/water/dashboard/layout", {"layout": demo_layout}, token=viewer_token)
+    check("viewer 保存布局被拒 40301", r["code"] == 40301, str(r))
+    r = request("POST", "/api/water/dashboard/layout", {"layout": demo_layout})
+    check("admin 保存布局成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/dashboard/layout")
+    check("布局回读一致", r["code"] == 0 and r["data"]["layout"] == demo_layout, str(r))
+    r = request("GET", "/api/water/logs?category=config&page_size=5")
+    check("布局变更已入日志", any(it["action"] == "config.dashboard" for it in r["data"]["items"]),
+          str([it["action"] for it in r["data"]["items"]]))
+    # 自定义卡片代理：白名单外主机一律拒绝（防 SSRF）
+    r = request("GET", "/api/water/dashboard/proxy?url=" + "http%3A%2F%2Fexample.com%2Fapi")
+    check("代理拒绝白名单外主机 40002", r["code"] == 40002, str(r))
+    r = request("GET", "/api/water/dashboard/proxy?url=" + "ftp%3A%2F%2F127.0.0.1%2Fx")
+    check("代理拒绝非 http(s) 协议", r["code"] == 40002, str(r))
+    # 白名单内主机（本机后端自身）：请求一个真实接口验证代发链路
+    r = request("GET", "/api/water/dashboard/proxy?url="
+                + "http%3A%2F%2F127.0.0.1%3A8000%2Fapi%2Fwater%2Frealtime")
+    check("代理代发白名单主机成功", r["code"] == 0 and "json" in r["data"], str(r))
+    # 恢复测试前的布局（无则复位为空）
+    if saved_before:
+        request("POST", "/api/water/dashboard/layout", {"layout": saved_before})
+    else:
+        request("POST", "/api/water/dashboard/layout/reset")
+    r = request("GET", "/api/water/dashboard/layout")
+    check("布局已恢复", r["code"] == 0 and r["data"]["layout"] == saved_before, str(r))
+
     print("== 10. 账号清理 ==")
     me = request("GET", "/api/auth/users")
     tid = next((u["id"] for u in me["data"]["users"] if u["username"] == test_user), None)

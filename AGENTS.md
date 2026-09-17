@@ -76,14 +76,15 @@ frontend/
 │   ├── api.js                  # 接口封装（统一 code/msg/data 处理）
 │   ├── charts.js               # ECharts 辅助
 │   ├── auth.js                 # 登录态与权限
+│   ├── widgets.js              # 卡片目录/默认布局/取值解析（window.Widgets）
 │   ├── components/
 │   │   ├── login.js
-│   │   ├── waterLoop.js        # 双水槽循环回路 SVG 组件（罐体/管路/水泵/水流粒子）
-│   │   ├── waterDashboard.js   # 三栏驾驶舱 + 历史/统计/告警/日志
+│   │   ├── widgetShell.js      # 通用卡片渲染（value/spark/line/state/tank/control/builtin）
+│   │   ├── waterDashboard.js   # 全卡片网格驾驶舱 + 历史/统计/告警/日志
 │   │   ├── judgePanel.js       # 任务五：判定服务对接页
 │   │   └── sysConfig.js        # 告警阈值/采集周期/水槽容积/设备信息/账号角色
 │   ├── app.js                  # 根组件与轮询
-│   └── lib/                    # vue / echarts（本地文件）
+│   └── lib/                    # vue / echarts / gridstack（本地文件）
 backend/
 ├── main.py                     # FastAPI 入口 + 1Hz 采集循环
 ├── config.py                   # 【现场修改】设备地址、能力表、双水槽液位、阈值、判定服务
@@ -122,6 +123,7 @@ tests/
   历史行保持 `operator=NULL`（前端显示「—」，不猜测、不回填）。
   迁移在 `database._migrate_control_log()` 中幂等执行。**日志中不得出现密码明文。**
 - `config`：key-value。业务阈值用原名，运行期配置用 `sys.` 前缀（见 `store.py`）。
+  仪表盘布局存 `sys.dashboard_layout`（JSON，全局共享一套；不建新表）。
 - `users`：账号、密码哈希、角色、状态。
 
 时间戳统一 `yyyy-MM-dd HH:mm:ss`。
@@ -144,6 +146,27 @@ tests/
 | 40301 | 无权限 |
 
 核心接口见 `README.md` 的「核心接口」表。
+
+**可编辑仪表盘（实时监控页整体卡片化）**：实时监控页是一个 gridstack 卡片网格
+（`frontend/js/widgets.js` 目录 + `components/widgetShell.js` 渲染），展示与操作全部卡片化，
+可自由增删/拖拽/缩放（保存需 `cfg_system` 权限）。卡片 = JSON 配置
+（type/source/cmd/thresholds/grid），type ∈ value/spark/line/state/tank/control/builtin。
+**接口自由编辑（全卡直填 URL）**：value/spark/line/state/tank/control 六种卡的配置对话框
+均有「接口 URL」一栏——留空读本机实时快照（source.kind=realtime），填了走自定义 GET 接口
+（source.kind=custom，经 `/api/water/dashboard/proxy` 代发，**白名单防 SSRF**，见
+`config.DASHBOARD_PROXY_HOSTS` / 环境变量 `WATER_DASHBOARD_PROXY_HOSTS`；非 JSON 返回也接受）。
+**控制开关卡可改指令**：字段 `cmd:{on,off}` 为一对 GET 指令 URL，经代理下发（log=1 写入
+操作日志 device.custom 供审计）；留空则用内置水泵/加热通道（API.pump/heater）。toggle 始终
+需要 `ctrl_light` 权限与设备在线。**单水槽卡（tank）**为通用卡：数据源支持对象
+（`tank.tanks.*`，带无传感器/离线角标与水量）或纯数值百分比（自定义接口），目录 `multi:true`
+不判重、可加任意多个。builtin 特殊卡：quant（定量浇水）/ pid（恒温闭环）/ recent（最近操作）/
+reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShell（自行拉取数据、直调控制接口、
+同一权限点、后端入日志），不提供接口编辑。目录项可选门控字段：`feature`（DEVICE_FEATURES 键）、
+`perm`（Auth 权限点）、`flag`（realtime 顶层布尔）；无权限/离线时卡片渲染禁用态而非移除。
+默认布局 14 行（1366×768 首屏零滚动）：流量+累计 / 双温+水压+光照 / 两张单水槽卡(w4h9) +
+水泵/加热/定量卡；页头无快捷开关；**无循环回路系统**（原回路 SVG 组件已整体删除）。
+布局读写/重置：`/api/water/dashboard/layout[/reset]`，全局共享一套，未保存时按设备能力生成
+默认布局；loadLayout 按 builtin 去重防同类卡重复。
 
 **真实数据原则**：设备不支持或离线时，接口返回 `None` 与 `features` 能力表；
 水位类字段按用户要求**无数据一律为 0**，但必须同时带 `source="none"` 或离线标志。
@@ -170,9 +193,11 @@ tests/
 - [ ] 传感数据周期入库，`/api/water/history` 按时间范围可查，无数据通道为 NULL
 - [ ] 水泵控制真实改变设备状态并由实时接口回显；失败返回 40003
 - [ ] 定量浇水目标可读可写；清零接口有二次确认且权限受控
-- [ ] 实时监控为三栏驾驶舱（左KPI / 中循环回路 / 右操作），1366×768 以上首屏零滚动
-- [ ] 循环回路：两罐体并排、水泵节点位于两罐之间、管路与水流粒子动画正常、SVG id 唯一不串位
-- [ ] 「更多操作」中的清零按钮默认折叠，展开后才可见；未接传感器的槽位标注「无传感器」、离线时标注「离线」
+- [ ] 实时监控页为全卡片网格（gridstack），展示卡与操作卡（水泵/加热/定量/PID/最近操作/清零）均可增删/拖拽/缩放；页头无快捷开关
+- [ ] 编辑模式可拖拽/缩放/删除/添加内置卡/添加自定义接口卡（全类型可添加，预览取值），保存后刷新布局仍在；代理拒绝白名单外地址
+- [ ] 卡片接口可编辑：显示卡配置里 URL 留空读实时快照、填了走代理轮询；控制卡可配自定义开/关指令 URL（成对校验、代理下发、写入 device.custom 日志）
+- [ ] 通用单水槽卡默认两张（储水槽/加热槽）左右并排，无传感器槽位标注「无传感器」、离线标注「离线」，水位与后端一致；无循环回路系统
+- [ ] 清零累计卡不在默认布局（危险操作降权），从目录添加后需二次确认且权限受控；未接传感器的槽位标注「无传感器」、离线时标注「离线」
 - [ ] 全站无模拟数据：无数据的水位恒显示 0，设备离线时两槽水位归 0 并提示离线
 - [ ] 操作日志记录操作人（人工为账号名，自动动作为「系统 · 恒温闭环 / 判定服务」），支持分类筛选
 - [ ] 系统配置与账号管理类操作均已入日志，且不含密码明文

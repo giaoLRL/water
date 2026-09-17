@@ -3,7 +3,10 @@
 统一返回 {"code":0,"msg":"ok","data":...}；前端通过 /api/* 调用，
 接口文档启动后访问 /docs 自动生成。
 """
+import json
+import urllib.request
 from datetime import datetime
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -503,6 +506,83 @@ def system_status(_: dict = Depends(auth.require_perm("view_device"))):
         "pid_supported": config.pid_supported(),
         "active_alarm_count": len(services.alarm.active_alarms()) if services.alarm else 0,
     })
+
+
+# =============================================================
+# 仪表盘布局（全局共享一套，存 config 表 sys.dashboard_layout）
+# 前端卡片化仪表盘：布局/卡片配置整体为一份 JSON，由前端解释结构，
+# 后端只负责持久化、权限与审计；自定义卡片的数据请求走 proxy 白名单代发。
+# =============================================================
+class DashboardLayoutRequest(BaseModel):
+    """仪表盘布局配置：{widgets: [...]}，单卡片字段由前端 widgets.js 定义。"""
+    layout: dict
+
+
+@router.get("/water/dashboard/layout")
+def dashboard_layout_get(_: dict = Depends(auth.require_perm("view_monitor"))):
+    """读取全局仪表盘布局；从未保存过返回 layout=null（前端用内置默认布局）。"""
+    return ok({"layout": store.get_json("dashboard_layout", None)})
+
+
+@router.post("/water/dashboard/layout")
+def dashboard_layout_set(body: DashboardLayoutRequest,
+                         user: dict = Depends(auth.require_perm("cfg_system"))):
+    """保存全局仪表盘布局（覆盖式）。"""
+    raw = json.dumps(body.layout, ensure_ascii=False)
+    if len(raw) > 200_000:
+        return err(40002, "布局配置过大（超过 200KB）")
+    store.set_json("dashboard_layout", body.layout)
+    database.insert_control_log(
+        "config.dashboard", "success",
+        f"更新仪表盘布局（{len(body.layout.get('widgets', []))} 张卡片）",
+        operator=user.get("username") or None, source="manual")
+    return ok({"layout": body.layout})
+
+
+@router.post("/water/dashboard/layout/reset")
+def dashboard_layout_reset(user: dict = Depends(auth.require_perm("cfg_system"))):
+    """清除已保存布局，前端回退为内置默认布局。"""
+    store.set("dashboard_layout", "")
+    database.insert_control_log("config.dashboard", "success", "恢复默认仪表盘布局",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"layout": None})
+
+
+@router.get("/water/dashboard/proxy")
+def dashboard_proxy(url: str = Query(..., max_length=1000),
+                    log: int = Query(0),
+                    user: dict = Depends(auth.require_perm("view_monitor"))):
+    """自定义卡片数据源/控制指令代发（仅 GET）：仅允许白名单主机，防 SSRF 与跨域问题。
+
+    白名单见 config.DASHBOARD_PROXY_HOSTS（默认本机 + 现场采集设备）。
+    目标返回 JSON 时取 json 字段；非 JSON（如部分指令接口）返回 text 字段，均不算失败。
+    log=1 时视为一次控制指令下发，写入操作日志（device.custom）供审计。
+    """
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return err(40002, "非法 URL（仅支持 http/https）")
+    if u.hostname not in config.DASHBOARD_PROXY_HOSTS:
+        return err(40002, f"目标主机不在白名单: {u.hostname}")
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=config.DEVICE_TIMEOUT_S) as resp:
+            body = resp.read(131_072)
+        text = body.decode("utf-8", "replace")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = None
+        if log:
+            database.insert_control_log("device.custom", "success",
+                                        f"自定义指令: {url[:250]}",
+                                        operator=user.get("username") or None, source="manual")
+        return ok({"json": payload, "text": None if payload is not None else text[:2000]})
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            database.insert_control_log("device.custom", "fail",
+                                        f"自定义指令失败: {url[:200]} · {exc}"[:250],
+                                        operator=user.get("username") or None, source="manual")
+        return err(40003, f"请求失败: {exc}")
 
 
 # =============================================================

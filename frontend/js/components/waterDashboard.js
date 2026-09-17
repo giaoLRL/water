@@ -1,5 +1,10 @@
-/* 综合面板：三栏驾驶舱（KPI / 双水槽循环回路 / 操作）+ 历史、统计、告警、日志。
+/* 综合面板：全卡片网格（可编辑仪表盘）+ 历史、统计、告警、日志。
  *
+ * 实时监控页整体卡片化（gridstack 网格，12 列）：
+ *   卡片 = 配置 JSON（widgets.js 定义结构），布局存后端 config 表，全局共享；
+ *   展示卡（数值/曲线/状态/水槽/回路）与操作卡（水泵/加热/定量/PID/最近操作/清零）
+ *   全部进网格，「编辑卡片」可拖动/缩放/删除/配置，「+ 添加卡片」按设备能力与权限列出目录；
+ *   自定义接口卡经后端白名单代理代发，仅 GET。
  * 数据来源为现场 ESP32 采集端（纯真实模式），前端按 realtime.features 展示设备实际通道：
  *   支持 —— 瞬时流量、累计水量、水泵、定量目标、水温×2、水压、加热模块、光照、加热槽液位
  *   未接入 —— 储水槽液位（无传感器，水位恒显示 0 并标注「无传感器」）
@@ -8,21 +13,13 @@
 
 window.ViewWaterDash = {
   name: "WaterDashView",
-  components: { LoopViz: window.WaterLoopViz },
+  components: { WidgetShell: window.WidgetShell },
   props: { realtime: { type: Object, required: true } },
   data() {
     return {
       tab: "monitor",
       thresholds: {},
-      pumpBusy: false,
-      heaterBusy: false,
-      targetInput: 0,
-      targetBusy: false,
-      resetBusy: false,
       deviceInfo: {},
-      // 恒温闭环(PID)
-      pid: { target_temp: 42, pid_enabled: false, kp: 16, ki: 0.3, kd: 25 },
-      pidBusy: false,
       // 历史
       histPoints: [],
       histRangeKey: "1h",
@@ -36,11 +33,12 @@ window.ViewWaterDash = {
       logs: [],
       logTotal: 0, logPage: 1, logPageSize: 10,
       logCategory: "",
-      moreOpen: false,        // 「更多操作」折叠区
-      recentLogs: [],         // 驾驶舱右侧「最近操作」
       tick: 0,                // 2s 定时器计数，用于低频刷新
-      // 实时趋势缓冲
-      trend: { flow: [], total: [] },
+      // 可编辑卡片仪表盘
+      widgets: [],
+      editing: false,
+      layoutReady: false,
+      dlg: { show: false, mode: "add", tab: "builtin", target: null, form: {}, previewText: "", previewRaw: "", previewBusy: false },
       timer: null,
     };
   },
@@ -48,112 +46,49 @@ window.ViewWaterDash = {
     online() { return !!this.realtime.sensor_online; },
     features() { return this.realtime.features || {}; },
     device() { return this.realtime.device || {}; },
-    pumpOn() { return this.realtime.pump_state === "on"; },
-    pumpUnknown() { return this.realtime.pump_state === "unknown"; },
-    heaterOn() { return this.realtime.heater_state === "on"; },
-    heaterUnknown() { return this.realtime.heater_state !== "on" && this.realtime.heater_state !== "off"; },
-    pidSupported() { return !!this.realtime.pid_supported; },
-    // 设备不支持的通道（用于界面提示）
-    missingChannels() {
-      const f = this.features;
-      const names = [];
-      if (!f.temperature) names.push("水温");
-      if (!f.pressure) names.push("水压");
-      if (!f.heater) names.push("加热模块");
-      return names;
-    },
-    flowText() {
-      const v = this.realtime.flow_rate;
-      return v === null || v === undefined ? "--" : Number(v).toFixed(2);
-    },
     totalText() {
       const v = this.realtime.total_liters;
       return v === null || v === undefined ? "--" : Number(v).toFixed(3);
     },
-    storageTempText() {
-      const v = this.realtime.storage_temp;
-      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
-    },
-    heaterTempText() {
-      const v = this.realtime.heater_temp;
-      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
-    },
-    pressureText() {
-      const v = this.realtime.pressure;
-      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
-    },
-    lightText() {
-      const v = this.realtime.light;
-      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
-    },
-    targetText() {
-      const v = Number(this.realtime.pump_target || 0);
-      return v > 0 ? `${v.toFixed(2)} L` : "未设置";
-    },
-    uptimeText() {
-      const ms = this.device.uptime_ms != null ? this.device.uptime_ms : this.deviceInfo.uptime_ms;
-      if (ms == null) return "--";
-      const s = Math.floor(ms / 1000);
-      const h = Math.floor(s / 3600);
-      const m = Math.floor((s % 3600) / 60);
-      return h > 0 ? `${h} 小时 ${m} 分` : `${m} 分 ${s % 60} 秒`;
-    },
-    rssiText() {
-      const v = this.device.rssi != null ? this.device.rssi : this.deviceInfo.rssi;
-      return v == null ? "--" : `${v} dBm`;
-    },
-    ipText() {
-      return this.device.ip || this.deviceInfo.ip || this.deviceInfo.url || "--";
-    },
     alarmPages() { return Math.max(1, Math.ceil(this.alarmTotal / this.alarmPageSize)); },
     logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
-
-    // ---------- 双水槽水位 ----------
-    tankUnavailable() { return !!(this.realtime.tank || {}).any_unavailable; },
-    flowActive() { return Number(this.realtime.flow_rate || 0) > 0.1; },
-    // 定量浇水进度：本次已注入量 / 目标水量
-    targetProgress() {
-      const target = Number(this.realtime.pump_target || 0);
-      if (!(target > 0)) return null;
-      const total = Number(this.realtime.total_liters || 0);
-      const base = Number(this.realtime.target_baseline ?? 0);
-      // 设备完成一次定量后会把累计值清零，此时回退为按当前累计值计算
-      const done = total >= base ? total - base : total;
-      return {
-        target,
-        done: Math.max(0, done),
-        percent: Math.max(0, Math.min(100, (done / target) * 100)),
-      };
+    /* 内置卡片目录：按设备能力(feature)+权限(perm)+实时标志(flag)过滤，标记已添加；
+       multi 卡（通用单水槽）不判重，可重复添加 */
+    catalogList() {
+      const present = new Set(this.widgets.map((w) => w.catalogKey || w.builtin).filter(Boolean));
+      return window.Widgets.CATALOG
+        .filter((c) => (!c.feature || this.features[c.feature])
+                    && (!c.perm || this.perm(c.perm))
+                    && (!c.flag || !!this.realtime[c.flag]))
+        .map((c) => Object.assign({}, c, { added: !c.multi && present.has(c.key) }));
     },
   },
   watch: {
-    realtime: {
-      handler() {
-        this.pushTrend();
-        this.renderGauges();
-        this.renderSparks();
-        this.syncTargetInput();
+    /* 未保存过自定义布局时，默认布局随设备能力到达而重建 */
+    features: {
+      handler(n, o) {
+        if (this._layoutFromServer || !this.layoutReady) return;
+        if (JSON.stringify(n) === JSON.stringify(o)) return;
+        this.widgets = window.Widgets.defaultLayout(this.features);
+        this.rebuildGrid();
       },
       deep: true,
     },
   },
   mounted() {
-    this.syncTargetInput();
     this.loadAll();
     this.refreshDevice();
-    // 2 秒兜底刷新：兼顾隐藏 tab 切回时的图表重绘
+    this.loadLayout();
+    // 2 秒兜底刷新：兼顾隐藏 tab 切回时的低频数据
     this.timer = setInterval(() => {
       this.tick += 1;
-      this.pushTrend();
-      this.refreshGauges();
-      this.refreshSparks();
       this.refreshDevice();
-      // 「最近操作」无需 2s 一刷，10s 一次即可
-      if (this.tick % 5 === 0) this.fetchRecentLogs();
     }, 2000);
   },
   beforeUnmount() {
     if (this.timer) clearInterval(this.timer);
+    if (this._saveT) clearTimeout(this._saveT);
+    if (this._grid) { try { this._grid.destroy(false); } catch (e) { /* ignore */ } this._grid = null; }
   },
   methods: {
     perm(p) { return window.Auth ? window.Auth.has(p) : false; },
@@ -166,31 +101,16 @@ window.ViewWaterDash = {
       const hours = { "1h": 1, "6h": 6, "24h": 24 }[key] || 1;
       return this.fmt(new Date(Date.now() - hours * 3600 * 1000));
     },
-    /* 目标输入框只在用户未聚焦时同步，避免覆盖正在输入的内容 */
-    syncTargetInput() {
-      const el = document.getElementById("pump-target-input");
-      if (el && document.activeElement === el) return;
-      const v = Number(this.realtime.pump_target || 0);
-      if (this.targetInput !== v) this.targetInput = v;
-    },
-    pushTrend() {
-      const push = (arr, v) => { arr.push(v === null || v === undefined ? 0 : Number(v)); if (arr.length > 60) arr.shift(); };
-      push(this.trend.flow, this.realtime.flow_rate);
-      push(this.trend.total, this.realtime.total_liters);
-    },
+    /* 目标输入框已随定量卡迁入 widgetShell（自包含焦点保护） */
     async loadAll() {
       try {
         const cfg = await API.alarmConfigGet();
         this.thresholds = cfg.thresholds || {};
       } catch (e) { /* silent */ }
-      if (this.perm("cfg_alarm")) {
-        try { this.pid = Object.assign(this.pid, await API.pidGet()); } catch (e) { /* silent */ }
-      }
       this.fetchHistory("1h");
       this.fetchStats("1h");
       this.fetchAlarms(1);
       this.fetchLogs(1);
-      this.fetchRecentLogs();
     },
     async refreshDevice() {
       try {
@@ -198,89 +118,6 @@ window.ViewWaterDash = {
         this.deviceInfo = d.device || {};
         if (d.features && this.realtime && !this.realtime.features) this.realtime.features = d.features;
       } catch (e) { /* silent */ }
-    },
-    // ---------- 水泵控制 ----------
-    async onPump(e) {
-      const action = e.target.checked ? "on" : "off";
-      if (!this.online) { e.target.checked = this.pumpOn; alert("设备离线，无法控制水泵"); return; }
-      this.pumpBusy = true;
-      try {
-        const d = await API.pump(action);
-        Object.assign(this.realtime, d);
-      } catch (err) {
-        e.target.checked = this.pumpOn;
-        alert(err.message);
-      } finally { this.pumpBusy = false; }
-    },
-    // ---------- 加热模块控制 ----------
-    async onHeater(e) {
-      const action = e.target.checked ? "on" : "off";
-      if (!this.online) { e.target.checked = this.heaterOn; alert("设备离线，无法控制加热模块"); return; }
-      this.heaterBusy = true;
-      try {
-        const d = await API.heater(action);
-        Object.assign(this.realtime, d);
-      } catch (err) {
-        e.target.checked = this.heaterOn;
-        alert(err.message);
-      } finally { this.heaterBusy = false; }
-    },
-    // ---------- 恒温闭环(PID) ----------
-    async savePidTarget() {
-      const v = Number(this.pid.target_temp);
-      if (isNaN(v) || v < 0 || v > 90) { alert("请输入 0~90 之间的目标温度(℃)"); return; }
-      this.pidBusy = true;
-      try {
-        const d = await API.setTarget(v);
-        this.pid.target_temp = d.target_temp;
-        alert(`目标温度已设为 ${d.target_temp} ℃`);
-      } catch (e) { alert(e.message); }
-      finally { this.pidBusy = false; }
-    },
-    async togglePid(e) {
-      this.pidBusy = true;
-      try {
-        const d = await API.pidMode(e.target.checked ? 1 : 0);
-        this.pid.pid_enabled = d.pid_enabled;
-      } catch (err) {
-        e.target.checked = this.pid.pid_enabled;
-        alert(err.message);
-      } finally { this.pidBusy = false; }
-    },
-    async savePidParams() {
-      const p = { kp: Number(this.pid.kp), ki: Number(this.pid.ki), kd: Number(this.pid.kd) };
-      for (const [k, v] of Object.entries(p)) {
-        if (isNaN(v) || v < 0) { alert(`请填写有效的 PID 参数 ${k}`); return; }
-      }
-      this.pidBusy = true;
-      try { await API.pidSet(p); alert("PID 参数已保存"); }
-      catch (e) { alert(e.message); }
-      finally { this.pidBusy = false; }
-    },
-    // ---------- 定量浇水 ----------
-    async saveTarget() {
-      const v = parseFloat(this.targetInput);
-      if (isNaN(v) || v < 0) { alert("请输入有效的目标水量(L)，填 0 表示取消定量"); return; }
-      this.targetBusy = true;
-      try {
-        const d = await API.pumpTargetSet(v);
-        Object.assign(this.realtime, d);
-        alert(v > 0 ? `已设定定量浇水 ${v} L，达到后设备自动关泵` : "已取消定量浇水");
-      } catch (e) { alert(e.message); }
-      finally { this.targetBusy = false; }
-    },
-    // ---------- 累计水量清零（破坏性） ----------
-    async resetVolume() {
-      if (!confirm("确定清零累计水量？\n\n该操作会清除设备上的累计值，不可恢复。")) return;
-      this.resetBusy = true;
-      try {
-        const d = await API.volumeReset();
-        Object.assign(this.realtime, d);
-        this.fetchHistory(this.histRangeKey);
-        this.fetchStats(this.histRangeKey);
-        alert("累计水量已清零");
-      } catch (e) { alert(e.message); }
-      finally { this.resetBusy = false; }
     },
     // ---------- 历史 ----------
     async fetchHistory(key, start, end) {
@@ -379,96 +216,236 @@ window.ViewWaterDash = {
         this.logTotal = d.total || 0;
       } catch (e) { /* silent */ }
     },
-    /* 取某个水槽的水位信息。模板里带参数调用，因此必须放 methods——
-       Vue 的 computed 不接受参数，写成 computed 会导致整个视图渲染失败。 */
-    tankOf(key) { return ((this.realtime.tank || {}).tanks || {})[key] || {}; },
-    async fetchRecentLogs() {
-      try {
-        const d = await API.logs({ page: 1, page_size: 4 });
-        this.recentLogs = d.items || [];
-      } catch (e) { /* silent */ }
-    },
-    /* 系统自动动作没有操作账号，用来源(source)区分 */
-    isSystemLog(l) { return l.source === "auto" || l.source === "judge"; },
-    operatorText(l) {
-      if (l.source === "auto") return "系统 · 恒温闭环";
-      if (l.source === "judge") return "系统 · 判定服务";
-      return l.operator || "—";
-    },
-    actionLabel(a) {
-      return {
-        "config.alarm": "修改告警阈值",
-        "config.period": "修改采集周期",
-        "config.tank": "修改水槽容积",
-        "account.create": "创建账号",
-        "account.password": "重置密码",
-        "account.role": "修改角色",
-        "account.status": "启用/禁用账号",
-        "account.delete": "删除账号",
-        "account.roles": "保存权限矩阵",
-      }[a] || a;
-    },
+    /* 日志展示（与卡片共用 Widgets 纯函数；操作日志页表格仍在用） */
+    isSystemLog(l) { return window.Widgets.isSystemLog(l); },
+    operatorText(l) { return window.Widgets.operatorText(l); },
+    actionLabel(a) { return window.Widgets.actionLabel(a); },
     typeName(t) {
       return { flow_rate: "水流量", storage_temp: "储水槽温度", heater_temp: "加热槽温度", pressure: "水压", light: "光照" }[t] || t;
     },
-    // ---------- 仪表盘与迷你曲线 ----------
-    renderGauges() {
-      const el = document.getElementById("gauge-flow");
-      if (!el) return;
-      const v = Number(this.realtime.flow_rate || 0);
-      window.Charts.init("gauge-flow", window.Charts.gaugeOption(Math.min(v, 20), 0, 20, "L/min", "#38bdf8"), false);
+    // ---------- 可编辑卡片仪表盘 ----------
+    /* 读取布局：已保存过用服务端的（全局共享），否则按设备能力生成默认布局。
+       按 builtin 去重，防止历史/手编布局出现两张同类特殊卡（如双回路卡 SVG id 冲突）。 */
+    async loadLayout() {
+      let saved = null;
+      try { saved = (await API.dashboardLayoutGet()).layout; } catch (e) { /* silent */ }
+      this._layoutFromServer = !!(saved && Array.isArray(saved.widgets) && saved.widgets.length);
+      let widgets = this._layoutFromServer ? saved.widgets : window.Widgets.defaultLayout(this.features);
+      const seen = new Set();
+      widgets = widgets.filter((w) => {
+        const k = w.builtin ? "b:" + w.builtin : "id:" + w.id;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      this.widgets = widgets;
+      this.layoutReady = true;
+      this.rebuildGrid();
     },
-    refreshGauges() {
-      const v = Number(this.realtime.flow_rate || 0);
-      window.Charts.set("gauge-flow", window.Charts.gaugeOption(Math.min(v, 20), 0, 20, "L/min", "#38bdf8"));
+    initGrid() {
+      const el = document.getElementById("dash-grid");
+      if (!el || !window.GridStack) return;
+      const g = window.GridStack.init({
+        column: 12, cellHeight: 36, margin: 6, float: false,
+        handle: ".wg-grip", resizable: { handles: "se" },
+        disableDrag: !this.editing, disableResize: !this.editing,
+      }, el);
+      g.on("change", () => this.syncFromGrid());
+      this._grid = g;
     },
-    renderSparks() {
-      const defs = [
-        ["spark-flow", "flow", "#38bdf8"],
-        ["spark-total", "total", "#2dd4bf"],
-      ];
-      defs.forEach(([id, key, color]) => {
-        const data = this.trend[key];
-        if (!Array.isArray(data) || data.length < 2) return;
-        window.Charts.init(id, {
-          grid: { left: 2, right: 2, top: 5, bottom: 2 },
-          xAxis: { type: "category", show: false, data: data.map((_, i) => i) },
-          yAxis: { type: "value", show: false, min: "dataMin", max: "dataMax" },
-          series: [{ type: "line", data, showSymbol: false, smooth: true, lineStyle: { width: 1.5, color }, areaStyle: { color, opacity: 0.12 } }],
-        });
+    /* 结构变化（增/删/改配置）后重建网格；拖拽换位走 change 事件无需重建 */
+    rebuildGrid() {
+      this.$nextTick(() => {
+        if (this._grid) { try { this._grid.destroy(false); } catch (e) { /* ignore */ } this._grid = null; }
+        this.initGrid();
       });
     },
-    refreshSparks() {
-      const defs = [["spark-flow", "flow"], ["spark-total", "total"]];
-      defs.forEach(([id, key]) => {
-        const data = this.trend[key];
-        if (Array.isArray(data) && data.length >= 2) window.Charts.set(id, { series: [{ data }] });
+    syncFromGrid() {
+      if (!this._grid || !this.editing) return;
+      (this._grid.save(false) || []).forEach((it) => {
+        const w = this.widgets.find((x) => x.id === String(it.id));
+        if (w) w.grid = { x: it.x, y: it.y, w: it.w, h: it.h };
       });
+      this.scheduleSave();
+    },
+    /* 序列化卡片：只保留配置字段，剔除运行时字段 */
+    serialize(w) {
+      const o = { id: w.id, type: w.type, title: w.title, unit: w.unit, decimals: w.decimals,
+                  color: w.color, foot: w.foot, builtin: w.builtin, catalogKey: w.catalogKey,
+                  domId: w.domId, tank: w.tank, ctl: w.ctl, cmd: w.cmd,
+                  source: w.source, thresholds: w.thresholds, grid: w.grid };
+      Object.keys(o).forEach((k) => o[k] === undefined && delete o[k]);
+      return o;
+    },
+    scheduleSave() {
+      if (!this.perm("cfg_system")) return;
+      if (this._saveT) clearTimeout(this._saveT);
+      this._saveT = setTimeout(() => this.saveLayout(), 400);
+    },
+    async saveLayout() {
+      try {
+        const widgets = this.widgets.map((w) => this.serialize(w));
+        await API.dashboardLayoutSave({ version: 1, widgets });
+        this._layoutFromServer = true;
+      } catch (e) { /* 保存失败不打断编辑 */ }
+    },
+    toggleEdit() {
+      this.editing = !this.editing;
+      if (this._grid) {
+        this._grid.enableMove(this.editing);
+        this._grid.enableResize(this.editing);
+      }
+      if (!this.editing) this.saveLayout();
+    },
+    async resetLayout() {
+      if (!confirm("恢复为默认布局？已添加的自定义卡片与排版将被清除。")) return;
+      try { await API.dashboardLayoutReset(); } catch (e) { /* silent */ }
+      this._layoutFromServer = false;
+      this.widgets = window.Widgets.defaultLayout(this.features);
+      this.editing = false;
+      if (this._grid) { this._grid.enableMove(false); this._grid.enableResize(false); }
+      this.rebuildGrid();
+    },
+    bottomY() {
+      return this.widgets.reduce((m, w) => Math.max(m, ((w.grid || {}).y || 0) + ((w.grid || {}).h || 2)), 0);
+    },
+    /* 添加卡片（内置目录 / 自定义接口共用入口） */
+    addWidget(cfg) {
+      const w = JSON.parse(JSON.stringify(cfg));
+      delete w.feature;
+      delete w.added;
+      delete w.multi;
+      if (!w.id) w.id = window.Widgets.uid();
+      w.grid = Object.assign({ w: 6, h: 2 }, w.grid, { x: 0, y: this.bottomY() });
+      this.widgets.push(w);
+      this.dlg.show = false;
+      this.rebuildGrid();
+      this.scheduleSave();
+    },
+    addFromCatalog(c) {
+      const w = window.Widgets.fromCatalog(c);
+      this.addWidget(w);
+    },
+    removeWidget(w) {
+      if (!confirm(`删除卡片「${w.title}」？`)) return;
+      this.widgets = this.widgets.filter((x) => x.id !== w.id);
+      this.rebuildGrid();
+      this.scheduleSave();
+    },
+    typeLabel(t) { return (window.Widgets.TYPES || {})[t] || t; },
+    /* 这五种卡型的数据接口可自由编辑（URL 留空 = 本机实时快照） */
+    isSourceEditable(t) { return ["value", "spark", "line", "state", "tank", "control"].includes(t); },
+    openAdd() {
+      this.dlg = { show: true, mode: "add", tab: "builtin", target: null,
+                   form: this.blankCustomForm(), previewText: "", previewRaw: "", previewBusy: false };
+    },
+    blankCustomForm() {
+      return { title: "", url: "", period: 5, path: "", unit: "", decimals: 1,
+               type: "value", color: "#38bdf8", min: "", max: "", cmdOn: "", cmdOff: "" };
+    },
+    /* 自定义接口预览：走代理实取一次，验证 URL 与取值路径 */
+    async previewCustom() {
+      const f = this.dlg.form;
+      const url = (f.url || "").trim();
+      if (!url) {
+        // 无 URL：直接从实时快照预览
+        const v = window.Widgets.resolvePath(this.realtime, (f.path || "").trim());
+        this.dlg.previewText = v === undefined ? "（实时快照中该路径未取到值）" : JSON.stringify(v);
+        this.dlg.previewRaw = "（本机实时快照）";
+        return;
+      }
+      this.dlg.previewBusy = true;
+      try {
+        const d = await API.dashboardProxy(url);
+        const v = window.Widgets.resolvePath(d.json, f.path);
+        this.dlg.previewText = v === undefined ? "（该路径未取到值，请检查路径写法）" : JSON.stringify(v);
+        this.dlg.previewRaw = JSON.stringify(d.json ?? d.text).slice(0, 300);
+      } catch (e) {
+        this.dlg.previewText = "请求失败：" + (e.message || e);
+        this.dlg.previewRaw = "";
+      } finally { this.dlg.previewBusy = false; }
+    },
+    confirmCustom() {
+      const f = this.dlg.form;
+      if (!f.title.trim() || !(f.path || "").trim()) { alert("名称、取值路径必填（接口 URL 留空则读本机实时快照）"); return; }
+      const cmdOn = (f.cmdOn || "").trim(), cmdOff = (f.cmdOff || "").trim();
+      if (f.type === "control" && ((cmdOn ? 1 : 0) + (cmdOff ? 1 : 0)) === 1) {
+        alert("开/关指令 URL 需成对填写，或都留空使用内置通道"); return;
+      }
+      const hasTh = (f.min !== "" && f.min != null) || (f.max !== "" && f.max != null);
+      const url = (f.url || "").trim();
+      const path = f.path.trim();
+      const grids = { value: { w: 6, h: 2 }, spark: { w: 6, h: 3 }, line: { w: 6, h: 4 },
+                      state: { w: 4, h: 2 }, tank: { w: 3, h: 4 }, control: { w: 4, h: 2 } };
+      this.addWidget({
+        catalogKey: "custom:" + f.type + ":" + url + "#" + path,
+        type: f.type || "value",
+        title: f.title.trim(),
+        unit: f.unit || "", decimals: Number(f.decimals) || 0, color: f.color || "#38bdf8",
+        source: url ? { kind: "custom", url, path, period: Math.max(2, Number(f.period) || 5) }
+                    : { kind: "realtime", path },
+        cmd: f.type === "control" && cmdOn ? { on: cmdOn, off: cmdOff } : undefined,
+        thresholds: hasTh ? { min: f.min === "" ? null : Number(f.min), max: f.max === "" ? null : Number(f.max) } : null,
+        grid: grids[f.type] || { w: 6, h: 2 },
+      });
+    },
+    /* 卡片配置对话框：接口 URL 留空 = 本机实时快照，填了 = 自定义接口 */
+    openConfig(w) {
+      const t = w.thresholds || {};
+      const src = w.source || {};
+      this.dlg = { show: true, mode: "config", tab: "cfg", target: w.id, previewText: "", previewRaw: "", previewBusy: false,
+                   form: { title: w.title, unit: w.unit || "", decimals: w.decimals ?? 1,
+                           color: w.color || "#38bdf8", type: w.type, foot: w.foot || "",
+                           min: t.min ?? "", max: t.max ?? "",
+                           url: src.kind === "custom" ? src.url : "",
+                           path: src.path || "",
+                           period: src.period || 5,
+                           cmdOn: (w.cmd || {}).on || "", cmdOff: (w.cmd || {}).off || "" } };
+    },
+    saveConfig() {
+      const w = this.widgets.find((x) => x.id === this.dlg.target);
+      if (!w) { this.dlg.show = false; return; }
+      const f = this.dlg.form;
+      const cmdOn = (f.cmdOn || "").trim(), cmdOff = (f.cmdOff || "").trim();
+      if (w.type === "control" && ((cmdOn ? 1 : 0) + (cmdOff ? 1 : 0)) === 1) {
+        alert("开/关指令 URL 需成对填写，或都留空使用内置通道"); return;
+      }
+      w.title = (f.title || "").trim() || w.title;
+      if (this.isSourceEditable(w.type)) {
+        // 数据接口：URL 留空 → 实时快照字段；非空 → 自定义接口轮询
+        const url = (f.url || "").trim();
+        const path = (f.path || "").trim() || (w.source || {}).path || "";
+        if (w.type === "control") {
+          w.color = f.color;
+          if (cmdOn && cmdOff) w.cmd = { on: cmdOn, off: cmdOff }; else delete w.cmd;
+        } else {
+          w.type = f.type;
+          w.unit = f.unit;
+          w.decimals = Number(f.decimals) || 0;
+          w.color = f.color;
+        }
+        if (url) w.source = { kind: "custom", url, path, period: Math.max(2, Number(f.period) || 5) };
+        else w.source = { kind: "realtime", path };
+        w._v = (w._v || 0) + 1;   // 触发组件重建，以新参数重启轮询
+      }
+      w.foot = f.foot;
+      const keyed = w.thresholds && (w.thresholds.minKey || w.thresholds.maxKey);
+      if (!keyed && ["value", "spark", "line"].includes(w.type)) {
+        const has = (f.min !== "" && f.min != null) || (f.max !== "" && f.max != null);
+        w.thresholds = has ? { min: f.min === "" ? null : Number(f.min), max: f.max === "" ? null : Number(f.max) } : null;
+      }
+      this.dlg.show = false;
+      this.rebuildGrid();
+      this.scheduleSave();
     },
   },
   template: `
   <div class="view-page">
     <div class="detail-head">
       <h2>水循环综合监控</h2>
-      <span class="desc">瞬时流量 · 累计水量 · 水温 · 水压 · 水泵控制 · 定量浇水 · 恒温闭环</span>
+      <span class="desc">瞬时流量 · 累计水量 · 水温 · 水压 · 定量浇水 · 恒温闭环</span>
       <span class="lamp-dot" :class="online ? 'on' : 'off'"></span>
       <span class="desc">{{ online ? '设备在线' : '设备离线' }}</span>
-      <div class="detail-controls" v-if="perm('ctrl_light') && features.pump">
-        <label class="toggle" :class="{ on: pumpOn }">
-          <input type="checkbox" :checked="pumpOn" :disabled="pumpBusy || !online" @change="onPump">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-        </label>
-        <span class="toggle-state">{{ pumpUnknown ? '水泵状态未知' : (pumpOn ? '水泵已开' : '水泵已关') }}</span>
-      </div>
-      <span v-else-if="!features.pump" class="toggle-state" style="color:var(--text-dim);">该设备不支持水泵控制</span>
-      <span v-else class="toggle-state" style="color:var(--text-dim);">无控制权限</span>
-      <div class="detail-controls" v-if="perm('ctrl_light') && features.heater">
-        <label class="toggle" :class="{ on: heaterOn }">
-          <input type="checkbox" :checked="heaterOn" :disabled="heaterBusy || !online" @change="onHeater">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-        </label>
-        <span class="toggle-state">{{ heaterUnknown ? '加热状态未知' : (heaterOn ? '加热已开' : '加热已关') }}</span>
-      </div>
     </div>
 
     <div v-if="!online" class="offline-bar">
@@ -483,139 +460,26 @@ window.ViewWaterDash = {
       <span class="tab" v-if="perm('view_log')" :class="{ active: tab === 'logs' }" @click="tab='logs'; fetchLogs(1)">操作日志</span>
     </div>
 
-    <!-- 实时监控：三栏驾驶舱 -->
-    <div v-show="tab === 'monitor'" class="cockpit">
-      <!-- 左栏：关键指标 -->
-      <aside class="ck-kpi">
-        <div class="kpi-card">
-          <div class="kpi-label">瞬时流量</div>
-          <div class="kpi-value">{{ flowText }}<span class="kpi-unit">L/min</span></div>
-          <div class="kpi-spark" id="spark-flow"></div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">累计水量</div>
-          <div class="kpi-value">{{ totalText }}<span class="kpi-unit">L</span></div>
-          <div class="kpi-spark" id="spark-total"></div>
-        </div>
-
-        <!-- 新增通道小卡：双列紧凑区，控制左栏高度保证首屏零滚动 -->
-        <!-- 水泵状态不设 KPI 卡：顶部开关文字与回路图水泵节点已充分表达 -->
-        <div class="kpi-duo">
-          <div class="kpi-card" v-if="features.temperature">
-            <div class="kpi-label">储水槽水温</div>
-            <div class="kpi-value">{{ storageTempText }}<span class="kpi-unit">℃</span></div>
-            <div class="kpi-foot">阈值 {{ thresholds.storage_temp_min ?? '--' }} ~ {{ thresholds.storage_temp_max ?? '--' }} ℃</div>
-          </div>
-
-          <div class="kpi-card" v-if="features.temperature">
-            <div class="kpi-label">加热槽水温</div>
-            <div class="kpi-value">{{ heaterTempText }}<span class="kpi-unit">℃</span></div>
-            <div class="kpi-foot">阈值 {{ thresholds.heater_temp_min ?? '--' }} ~ {{ thresholds.heater_temp_max ?? '--' }} ℃</div>
-          </div>
-
-          <div class="kpi-card" v-if="features.pressure">
-            <div class="kpi-label">水压</div>
-            <div class="kpi-value">{{ pressureText }}<span class="kpi-unit">kPa</span></div>
-            <div class="kpi-foot">阈值 {{ thresholds.pressure_min ?? '--' }} ~ {{ thresholds.pressure_max ?? '--' }} kPa</div>
-          </div>
-
-          <div class="kpi-card kpi-wide" v-if="features.light">
-            <div class="kpi-label">光照</div>
-            <div class="kpi-value">{{ lightText }}<span class="kpi-unit">lx</span></div>
-            <div class="kpi-foot">阈值 {{ thresholds.light_min ?? '--' }} ~ {{ thresholds.light_max ?? '--' }} lx</div>
+    <!-- 实时监控：全卡片网格（回路图/操作卡均已卡片化，可自由增删拖拽） -->
+    <div v-show="tab === 'monitor'" class="grid-zone">
+      <div class="dash-editbar" v-if="perm('cfg_system')">
+        <button class="btn-ghost" @click="toggleEdit">{{ editing ? '完成' : '编辑卡片' }}</button>
+        <template v-if="editing">
+          <button class="btn-ghost" @click="openAdd">+ 添加卡片</button>
+          <button class="btn-ghost" @click="resetLayout">恢复默认</button>
+        </template>
+      </div>
+      <div class="grid-stack" id="dash-grid">
+        <div v-for="w in widgets" :key="w.id + '-' + (w._v || 0)" class="grid-stack-item"
+             :gs-id="w.id" :gs-x="w.grid.x" :gs-y="w.grid.y" :gs-w="w.grid.w" :gs-h="w.grid.h"
+             :gs-min-w="2" :gs-min-h="1">
+          <div class="grid-stack-item-content">
+            <WidgetShell :widget="w" :realtime="realtime" :thresholds="thresholds"
+                         :editing="editing" :online="online"
+                         @remove="removeWidget" @config="openConfig"/>
           </div>
         </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">采集设备<span class="dot" :class="online ? 'green' : 'red'"></span></div>
-          <div class="kpi-kv"><span>地址</span><b>{{ ipText }}</b></div>
-          <div class="kpi-kv"><span>信号</span><b>{{ rssiText }}</b></div>
-          <div class="kpi-kv"><span>运行</span><b>{{ uptimeText }}</b></div>
-          <div class="kpi-foot kpi-warn" v-if="missingChannels.length"
-               :title="'当前固件未提供：' + missingChannels.join('、') + '。升级固件后在 backend/config.py 的 DEVICE_FEATURES 中开启对应通道。'">
-            未提供通道：{{ missingChannels.join('、') }}
-          </div>
-        </div>
-      </aside>
-
-      <!-- 中栏：双水槽循环回路（视觉主体） -->
-      <section class="ck-loop">
-        <LoopViz :storage="tankOf('storage')" :heater="tankOf('heater')"
-                 :flowing="flowActive" :pump-on="pumpOn" :flow-text="flowText" :online="online"/>
-        <div class="loop-caption">
-          <span class="badge" :class="(online && !tankUnavailable) ? 'ok' : 'warn'">{{
-            !online ? '设备离线' : (tankUnavailable ? '液位不完整' : '液位实测') }}</span>
-          <span class="desc">{{ tankUnavailable
-            ? '储水槽未接液位传感器，水位显示 0；加热槽为超声波实测。无数据一律显示 0，不做模拟'
-            : '两槽水位来自传感器实测值' }}</span>
-        </div>
-      </section>
-
-      <!-- 右栏：操作 -->
-      <aside class="ck-ops">
-        <div class="op-card" v-if="pidSupported && perm('cfg_alarm')">
-          <div class="op-title">恒温闭环 (PID)
-            <label class="toggle" :class="{ on: pid.pid_enabled }" style="float:right;">
-              <input type="checkbox" :checked="pid.pid_enabled" :disabled="pidBusy || !online" @change="togglePid">
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
-          </div>
-          <div class="op-input">
-            <input type="number" v-model.number="pid.target_temp" min="0" max="90" step="0.5" style="width:80px;">
-            <span class="op-unit">℃ 目标</span>
-            <button class="btn-primary" :disabled="pidBusy || !online" @click="savePidTarget">设定</button>
-          </div>
-          <div class="op-input" style="margin-top:8px;gap:6px;">
-            <input type="number" v-model.number="pid.kp" min="0" step="0.1" style="width:56px;" title="比例系数 Kp">
-            <input type="number" v-model.number="pid.ki" min="0" step="0.1" style="width:56px;" title="积分系数 Ki">
-            <input type="number" v-model.number="pid.kd" min="0" step="0.1" style="width:56px;" title="微分系数 Kd">
-            <button class="btn-ghost" :disabled="pidBusy || !online" @click="savePidParams">存参数</button>
-          </div>
-          <div class="op-foot">{{ pid.pid_enabled ? '闭环运行中：按加热槽水温自动开关加热' : '闭环已关闭；开启后按加热槽水温自动开关加热(目标±1℃)' }}</div>
-        </div>
-
-        <div class="op-card" v-if="perm('ctrl_light') && features.pump_target">
-          <div class="op-title">定量浇水</div>
-          <div class="op-input">
-            <input id="pump-target-input" type="number" v-model.number="targetInput" min="0" step="0.1">
-            <span class="op-unit">L</span>
-            <button class="btn-primary" :disabled="targetBusy || !online" @click="saveTarget">设定</button>
-            <button class="btn-ghost" :disabled="targetBusy || !online" @click="targetInput = 0; saveTarget()">取消</button>
-          </div>
-          <div class="target-progress" v-if="targetProgress">
-            <div class="tp-head">
-              <span>已注入 {{ targetProgress.done.toFixed(3) }} / {{ targetProgress.target.toFixed(2) }} L</span>
-              <b>{{ targetProgress.percent.toFixed(1) }}%</b>
-            </div>
-            <div class="tp-bar"><span :style="{ width: targetProgress.percent + '%' }"></span></div>
-          </div>
-          <div class="op-foot">达到目标由设备固件自动关泵；完成后设备会清零累计水量并取消目标</div>
-        </div>
-
-        <div class="op-card" v-if="perm('view_log')">
-          <div class="op-title">最近操作</div>
-          <ul class="op-log">
-            <li v-for="(l, i) in recentLogs" :key="i">
-              <span class="op-time">{{ (l.ts || '').slice(11, 16) }}</span>
-              <span class="op-who" :class="{ sys: isSystemLog(l) }">{{ operatorText(l) }}</span>
-              <span class="op-what">{{ actionLabel(l.action) }}</span>
-            </li>
-            <li v-if="!recentLogs.length" class="op-empty">暂无记录</li>
-          </ul>
-        </div>
-
-        <div class="op-card op-more" v-if="perm('ctrl_light')">
-          <button class="op-more-btn" @click="moreOpen = !moreOpen">
-            更多操作<span class="op-caret" :class="{ open: moreOpen }">▾</span>
-          </button>
-          <div v-show="moreOpen" class="op-more-body">
-            <button class="btn-ghost danger" :disabled="resetBusy || !online || !features.volume_reset"
-                    @click="resetVolume">清零累计水量</button>
-            <div class="op-foot">清除设备上的累计值，不可恢复，执行前二次确认</div>
-          </div>
-        </div>
-      </aside>
+      </div>
     </div>
 
     <!-- 历史数据 -->
@@ -745,6 +609,136 @@ window.ViewWaterDash = {
               <tr v-if="!logs.length"><td colspan="5" style="text-align:center;color:#6b7a90;">暂无操作日志</td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 添加卡片 / 卡片配置 对话框 -->
+    <div class="modal-overlay" v-if="dlg.show" @click.self="dlg.show=false">
+      <div class="modal wg-modal">
+        <div class="modal-head">
+          <h3>{{ dlg.mode === 'add' ? '添加卡片' : '卡片配置' }}</h3>
+          <button class="close" @click="dlg.show=false">×</button>
+        </div>
+
+        <div class="tabs" v-if="dlg.mode==='add'">
+          <span class="tab" :class="{active:dlg.tab==='builtin'}" @click="dlg.tab='builtin'">内置卡片</span>
+          <span class="tab" :class="{active:dlg.tab==='custom'}" @click="dlg.tab='custom'">自定义接口</span>
+        </div>
+
+        <!-- 内置卡片目录 -->
+        <div v-if="dlg.mode==='add' && dlg.tab==='builtin'" class="wg-catalog">
+          <div v-for="c in catalogList" :key="c.key" class="wg-cat-item">
+            <div class="wg-cat-name">
+              <b>{{ c.title }}</b>
+              <span class="wg-cat-type">{{ typeLabel(c.type) }}<template v-if="c.unit"> · {{ c.unit }}</template></span>
+            </div>
+            <button class="btn-ghost" :disabled="c.added" @click="addFromCatalog(c)">{{ c.added ? '已添加' : '添加' }}</button>
+          </div>
+          <div v-if="!catalogList.length" class="wg-empty">当前设备能力下无可添加的内置卡片</div>
+        </div>
+
+        <!-- 自定义接口卡片：全部卡型可添加 -->
+        <div v-if="dlg.mode==='add' && dlg.tab==='custom'" class="wg-form">
+          <div class="wg-row"><span>卡片名称</span><input v-model="dlg.form.title" placeholder="如：环境温度"></div>
+          <div class="wg-row"><span>接口 URL</span><input v-model="dlg.form.url" placeholder="留空读本机实时快照；或填完整 GET 接口"></div>
+          <div class="wg-row"><span>取值路径</span><input v-model="dlg.form.path" placeholder="如 value / data.temperature / tank.tanks.heater"></div>
+          <div class="wg-row">
+            <span>显示类型</span>
+            <select v-model="dlg.form.type">
+              <option value="value">数值卡</option>
+              <option value="spark">数值+迷你曲线</option>
+              <option value="line">趋势曲线</option>
+              <option value="state">状态卡</option>
+              <option value="tank">单水槽</option>
+              <option value="control">控制开关</option>
+            </select>
+            <span style="width:auto;">轮询</span>
+            <input type="number" v-model.number="dlg.form.period" min="2" max="300" style="max-width:64px;">
+            <span style="width:auto;">秒</span>
+          </div>
+          <div class="wg-row" v-if="['value','spark','line','tank'].includes(dlg.form.type)">
+            <span>单位</span><input v-model="dlg.form.unit" style="max-width:90px;">
+            <span style="width:auto;">小数位</span>
+            <input type="number" v-model.number="dlg.form.decimals" min="0" max="4" style="max-width:64px;">
+            <span style="width:auto;">颜色</span>
+            <input type="color" v-model="dlg.form.color" class="wg-color">
+          </div>
+          <div class="wg-row" v-if="dlg.form.type === 'control'">
+            <span>开指令</span><input v-model="dlg.form.cmdOn" placeholder="开 = GET URL，留空用内置水泵通道">
+          </div>
+          <div class="wg-row" v-if="dlg.form.type === 'control'">
+            <span>关指令</span><input v-model="dlg.form.cmdOff" placeholder="关 = GET URL，留空用内置水泵通道">
+          </div>
+          <div class="wg-row" v-if="['value','spark','line'].includes(dlg.form.type)">
+            <span>告警阈值</span>
+            <input type="number" v-model="dlg.form.min" placeholder="下限(可空)">
+            <span style="width:auto;">~</span>
+            <input type="number" v-model="dlg.form.max" placeholder="上限(可空)">
+          </div>
+          <div class="wg-row">
+            <button class="btn-ghost" :disabled="dlg.previewBusy" @click="previewCustom">{{ dlg.previewBusy ? '请求中…' : '预览取值' }}</button>
+            <span class="wg-preview" v-if="dlg.previewText">{{ dlg.previewText }}</span>
+          </div>
+          <div class="wg-raw" v-if="dlg.previewRaw" :title="dlg.previewRaw">原始返回：{{ dlg.previewRaw }}…</div>
+          <div class="wg-note">接口 URL 留空读本机实时快照；填了则经后端代理 GET 代发（仅白名单主机，轮询 ≥2 秒）。控制开关卡的指令 URL 同样走代理并写入操作日志。</div>
+          <div class="wg-actions">
+            <button class="btn-primary" @click="confirmCustom">添加卡片</button>
+          </div>
+        </div>
+
+        <!-- 已有卡片配置：接口 URL 留空读本机实时快照，填了走自定义接口 -->
+        <div v-if="dlg.mode==='config'" class="wg-form">
+          <div class="wg-row"><span>卡片名称</span><input v-model="dlg.form.title"></div>
+          <template v-if="isSourceEditable(dlg.form.type)">
+            <div class="wg-row">
+              <span>显示类型</span>
+              <select v-model="dlg.form.type">
+                <option value="value">数值卡</option>
+                <option value="spark">数值+迷你曲线</option>
+                <option value="line">趋势曲线</option>
+                <option value="state" v-if="dlg.form.type==='state'">状态卡</option>
+                <option value="tank" v-if="dlg.form.type==='tank'">单水槽</option>
+                <option value="control" v-if="dlg.form.type==='control'">控制开关</option>
+              </select>
+              <span style="width:auto;">颜色</span>
+              <input type="color" v-model="dlg.form.color" class="wg-color">
+            </div>
+            <div class="wg-row" v-if="dlg.form.type !== 'control'">
+              <span>单位</span><input v-model="dlg.form.unit" style="max-width:90px;">
+              <span style="width:auto;">小数位</span>
+              <input type="number" v-model.number="dlg.form.decimals" min="0" max="4" style="max-width:64px;">
+            </div>
+            <div class="wg-row">
+              <span>接口 URL</span>
+              <input v-model="dlg.form.url" placeholder="留空读本机实时快照；或填完整 GET 接口地址">
+            </div>
+            <div class="wg-row">
+              <span>取值路径</span><input v-model="dlg.form.path" placeholder="如 flow_rate 或 data.value">
+              <span style="width:auto;">轮询</span>
+              <input type="number" v-model.number="dlg.form.period" min="2" max="300" style="max-width:60px;">
+              <span style="width:auto;">秒</span>
+            </div>
+            <template v-if="dlg.form.type === 'control'">
+              <div class="wg-row"><span>开指令</span><input v-model="dlg.form.cmdOn" placeholder="开 = GET URL，留空用内置通道"></div>
+              <div class="wg-row"><span>关指令</span><input v-model="dlg.form.cmdOff" placeholder="关 = GET URL，留空用内置通道"></div>
+              <div class="wg-note">指令经后端代理 GET 下发（仅白名单主机）并写入操作日志；两条都留空则使用内置水泵/加热通道。</div>
+            </template>
+          </template>
+          <div class="wg-row" v-if="['value','spark','line'].includes(dlg.form.type) && !((widgets.find(x=>x.id===dlg.target)||{}).thresholds||{}).minKey">
+            <span>告警阈值</span>
+            <input type="number" v-model="dlg.form.min" placeholder="下限(可空)">
+            <span style="width:auto;">~</span>
+            <input type="number" v-model="dlg.form.max" placeholder="上限(可空)">
+          </div>
+          <div class="wg-row" v-else-if="['value','spark','line'].includes(dlg.form.type)">
+            <span>告警阈值</span>
+            <span class="wg-note" style="flex:1;">由「系统配置 → 告警阈值」统一维护，此处仅展示</span>
+          </div>
+          <div class="wg-row"><span>底部说明</span><input v-model="dlg.form.foot" placeholder="自定义底部说明文字(可空)"></div>
+          <div class="wg-actions">
+            <button class="btn-primary" @click="saveConfig">保存</button>
+          </div>
         </div>
       </div>
     </div>
