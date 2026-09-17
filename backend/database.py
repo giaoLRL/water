@@ -54,10 +54,11 @@ def _column_info(cur, table: str, column: str) -> dict | None:
 def _migrate_water_sensors(cur) -> None:
     """water_sensors 表结构迁移（幂等，可重复执行，不丢历史数据）。
 
-    迁移原因：当前现场固件只提供流量与累计水量，无温度/压力/加热通道。
-    1) storage_temp / heater_temp / pressure / heater_state 由 NOT NULL 改为可空，
-       无数据的通道写 NULL，避免 0 值污染统计与曲线；
-    2) 新增 pump_target 列，记录当时的定量浇水目标，便于回溯。
+    迁移原因：设备离线或读数无效期间温度/压力/加热/光照通道无数据。
+    1) storage_temp / heater_temp / pressure / heater_state / flow_rate / total_flow
+       保持可空，无数据的通道写 NULL，避免 0 值污染统计与曲线；
+    2) 新增 pump_target 列，记录当时的定量浇水目标，便于回溯；
+    3) 新增 light 列（光照 lx，/api/light 通道）。
     """
     # 列名 -> 完整列定义（类型必须与建表语句一致，勿强行统一为 DOUBLE）
     nullable_columns = {
@@ -75,6 +76,9 @@ def _migrate_water_sensors(cur) -> None:
 
     if _column_info(cur, "water_sensors", "pump_target") is None:
         cur.execute("ALTER TABLE water_sensors ADD COLUMN pump_target DOUBLE NULL AFTER total_flow")
+
+    if _column_info(cur, "water_sensors", "light") is None:
+        cur.execute("ALTER TABLE water_sensors ADD COLUMN light DOUBLE NULL AFTER pressure")
 
 
 def init_database() -> None:
@@ -104,9 +108,8 @@ def init_database() -> None:
                     cur.execute(f"DROP TABLE IF EXISTS `{table}`")
 
             # 水循环传感数据表
-            # 可空列说明：现场固件只提供流量/累计水量通道，
-            # storage_temp/heater_temp/pressure/heater_state 无数据来源，故允许 NULL
-            # （NULL 表示“该通道无数据”，避免用 0 伪装成真实读数）。
+            # 可空列说明：设备离线或单通道读数无效（503/负值）时对应通道写 NULL，
+            # 不用 0 伪装成真实读数，避免污染曲线与统计。
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS water_sensors (
@@ -116,6 +119,7 @@ def init_database() -> None:
                     heater_temp  DOUBLE NULL,
                     flow_rate    DOUBLE NULL,
                     pressure     DOUBLE NULL,
+                    light        DOUBLE NULL,
                     pump_state   VARCHAR(8) NOT NULL,
                     heater_state VARCHAR(8) NULL,
                     total_flow   DOUBLE NULL,
@@ -236,7 +240,7 @@ def insert_water_sensor(
     ts: datetime, storage_temp: float | None, heater_temp: float | None,
     flow_rate: float | None, pressure: float | None,
     pump_state: str, heater_state: str | None, total_flow: float | None,
-    pump_target: float | None = None,
+    pump_target: float | None = None, light: float | None = None,
 ) -> None:
     """写入一条采样。设备不支持的通道传 None（存 NULL，不伪造 0 值）。"""
     conn = get_pool().connection()
@@ -244,10 +248,10 @@ def insert_water_sensor(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO water_sensors (ts, storage_temp, heater_temp, flow_rate, pressure, "
-                "pump_state, heater_state, total_flow, pump_target) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "pump_state, heater_state, total_flow, pump_target, light) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (ts, storage_temp, heater_temp, flow_rate, pressure,
-                 pump_state, heater_state, total_flow, pump_target),
+                 pump_state, heater_state, total_flow, pump_target, light),
             )
     finally:
         conn.close()
@@ -260,7 +264,7 @@ def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
             cur.execute(
                 "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, flow_rate, "
                 "total_flow, pump_target, pump_state, storage_temp, heater_temp, "
-                "pressure, heater_state "
+                "pressure, heater_state, light "
                 "FROM water_sensors WHERE ts BETWEEN %s AND %s "
                 "ORDER BY ts ASC LIMIT %s",
                 (start, end, limit),
@@ -271,9 +275,9 @@ def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
 
 
 def query_water_stats(start: str, end: str) -> dict:
-    """统计面板：区间内流量均值/极值、累计水量增量、采样点数。
+    """统计面板：区间内流量均值/极值、累计水量增量、温度/压力指标、采样点数。
 
-    温度/压力通道当前固件无数据，对应键保留但返回 None（前端显示“--”）。
+    设备离线期间无数据的通道聚合结果为 None（前端显示"--"）。
     """
     conn = get_pool().connection()
     try:
@@ -282,6 +286,10 @@ def query_water_stats(start: str, end: str) -> dict:
                 "SELECT AVG(flow_rate) AS avg_flow, MAX(flow_rate) AS max_flow, "
                 "MIN(flow_rate) AS min_flow, COUNT(*) AS samples, "
                 "SUM(flow_rate) AS sum_flow, "
+                "AVG(storage_temp) AS avg_st, MAX(storage_temp) AS max_st, MIN(storage_temp) AS min_st, "
+                "AVG(heater_temp) AS avg_ht, MAX(heater_temp) AS max_ht, MIN(heater_temp) AS min_ht, "
+                "MAX(pressure) AS max_p, MIN(pressure) AS min_p, "
+                "AVG(light) AS avg_l, MAX(light) AS max_l, MIN(light) AS min_l, "
                 "(SELECT total_flow FROM water_sensors WHERE ts BETWEEN %s AND %s "
                 " AND total_flow IS NOT NULL ORDER BY id ASC LIMIT 1) AS start_total, "
                 "(SELECT total_flow FROM water_sensors WHERE ts BETWEEN %s AND %s "
@@ -313,15 +321,19 @@ def query_water_stats(start: str, end: str) -> dict:
                 "end_total": _round(end_total, 3),
                 "volume_used": used,
                 "total_flow": _round(end_total, 3),   # 兼容旧字段名
-                # 以下通道当前固件不支持，恒为 None（保留键位以兼容旧前端）
-                "avg_storage_temp": None,
-                "max_storage_temp": None,
-                "min_storage_temp": None,
-                "avg_heater_temp": None,
-                "max_heater_temp": None,
-                "min_heater_temp": None,
-                "max_pressure": None,
-                "min_pressure": None,
+                # 温度/压力通道（有数据则统计，无数据为 None）
+                "avg_storage_temp": _round(row["avg_st"]),
+                "max_storage_temp": _round(row["max_st"]),
+                "min_storage_temp": _round(row["min_st"]),
+                "avg_heater_temp": _round(row["avg_ht"]),
+                "max_heater_temp": _round(row["max_ht"]),
+                "min_heater_temp": _round(row["min_ht"]),
+                "max_pressure": _round(row["max_p"], 1),
+                "min_pressure": _round(row["min_p"], 1),
+                # 光照通道（有数据则统计，无数据为 None）
+                "avg_light": _round(row["avg_l"], 1),
+                "max_light": _round(row["max_l"], 1),
+                "min_light": _round(row["min_l"], 1),
             }
     finally:
         conn.close()
@@ -454,6 +466,9 @@ def insert_control_log(action: str, result: str, detail: str | None = None,
     source  : manual(人工) / auto(本地自动) / judge(判定服务)；
               仅表示动作来源，前端据此显示"操作人"列。
     """
+    # detail 列 VARCHAR(255)：统一截断兜底，避免任何调用点超长导致 1406 报错
+    if detail and len(detail) > 250:
+        detail = detail[:250] + "…"
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:

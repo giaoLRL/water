@@ -109,8 +109,11 @@ window.Charts = (() => {
     const el = document.getElementById(id);
     if (!el || !window.echarts) return null;
     let chart = registry[id];
-    if (chart && !chart.getDom().isConnected) {
-      chart.dispose();
+    // 实例可能已被 dispose（getDom() 为 null）或 DOM 已随组件销毁断开：
+    // 两种情况都要清理 registry，否则残留已销毁实例会让后续调用再次崩溃
+    if (chart && (!chart.getDom() || !chart.getDom().isConnected)) {
+      try { chart.dispose(); } catch (e) { /* ignore */ }
+      delete registry[id];
       chart = null;
     }
     // 容器隐藏（display:none）时 clientWidth 为 0，此时初始化会得到错误的画布宽度。

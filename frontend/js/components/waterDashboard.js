@@ -1,9 +1,9 @@
 /* 综合面板：三栏驾驶舱（KPI / 双水槽循环回路 / 操作）+ 历史、统计、告警、日志。
  *
- * 数据来源为现场 ESP32 采集端（纯真实模式），前端只展示设备真实提供的通道：
- *   支持   —— 瞬时流量 flow_rate、累计水量 total_liters、水泵 pump_state、定量目标 pump_target
- *   不支持 —— 温度/压力/加热（由 realtime.features 声明，界面明确标注"设备不支持"）
- *   待接入 —— 储水槽/加热槽液位（当前为后端模拟值，界面明确标注"模拟"）
+ * 数据来源为现场 ESP32 采集端（纯真实模式），前端按 realtime.features 展示设备实际通道：
+ *   支持 —— 瞬时流量、累计水量、水泵、定量目标、水温×2、水压、加热模块、光照、加热槽液位
+ *   未接入 —— 储水槽液位（无传感器，水位恒显示 0 并标注「无传感器」）
+ * 无数据一律显示 0 或 --，不做任何模拟。
  */
 
 window.ViewWaterDash = {
@@ -15,10 +15,14 @@ window.ViewWaterDash = {
       tab: "monitor",
       thresholds: {},
       pumpBusy: false,
+      heaterBusy: false,
       targetInput: 0,
       targetBusy: false,
       resetBusy: false,
       deviceInfo: {},
+      // 恒温闭环(PID)
+      pid: { target_temp: 42, pid_enabled: false, kp: 16, ki: 0.3, kd: 25 },
+      pidBusy: false,
       // 历史
       histPoints: [],
       histRangeKey: "1h",
@@ -46,6 +50,9 @@ window.ViewWaterDash = {
     device() { return this.realtime.device || {}; },
     pumpOn() { return this.realtime.pump_state === "on"; },
     pumpUnknown() { return this.realtime.pump_state === "unknown"; },
+    heaterOn() { return this.realtime.heater_state === "on"; },
+    heaterUnknown() { return this.realtime.heater_state !== "on" && this.realtime.heater_state !== "off"; },
+    pidSupported() { return !!this.realtime.pid_supported; },
     // 设备不支持的通道（用于界面提示）
     missingChannels() {
       const f = this.features;
@@ -62,6 +69,22 @@ window.ViewWaterDash = {
     totalText() {
       const v = this.realtime.total_liters;
       return v === null || v === undefined ? "--" : Number(v).toFixed(3);
+    },
+    storageTempText() {
+      const v = this.realtime.storage_temp;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
+    },
+    heaterTempText() {
+      const v = this.realtime.heater_temp;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
+    },
+    pressureText() {
+      const v = this.realtime.pressure;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
+    },
+    lightText() {
+      const v = this.realtime.light;
+      return v === null || v === undefined ? "--" : Number(v).toFixed(1);
     },
     targetText() {
       const v = Number(this.realtime.pump_target || 0);
@@ -86,7 +109,7 @@ window.ViewWaterDash = {
     logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
 
     // ---------- 双水槽水位 ----------
-    tankAnySim() { return !!(this.realtime.tank || {}).any_sim; },
+    tankUnavailable() { return !!(this.realtime.tank || {}).any_unavailable; },
     flowActive() { return Number(this.realtime.flow_rate || 0) > 0.1; },
     // 定量浇水进度：本次已注入量 / 目标水量
     targetProgress() {
@@ -160,6 +183,9 @@ window.ViewWaterDash = {
         const cfg = await API.alarmConfigGet();
         this.thresholds = cfg.thresholds || {};
       } catch (e) { /* silent */ }
+      if (this.perm("cfg_alarm")) {
+        try { this.pid = Object.assign(this.pid, await API.pidGet()); } catch (e) { /* silent */ }
+      }
       this.fetchHistory("1h");
       this.fetchStats("1h");
       this.fetchAlarms(1);
@@ -185,6 +211,51 @@ window.ViewWaterDash = {
         e.target.checked = this.pumpOn;
         alert(err.message);
       } finally { this.pumpBusy = false; }
+    },
+    // ---------- 加热模块控制 ----------
+    async onHeater(e) {
+      const action = e.target.checked ? "on" : "off";
+      if (!this.online) { e.target.checked = this.heaterOn; alert("设备离线，无法控制加热模块"); return; }
+      this.heaterBusy = true;
+      try {
+        const d = await API.heater(action);
+        Object.assign(this.realtime, d);
+      } catch (err) {
+        e.target.checked = this.heaterOn;
+        alert(err.message);
+      } finally { this.heaterBusy = false; }
+    },
+    // ---------- 恒温闭环(PID) ----------
+    async savePidTarget() {
+      const v = Number(this.pid.target_temp);
+      if (isNaN(v) || v < 0 || v > 90) { alert("请输入 0~90 之间的目标温度(℃)"); return; }
+      this.pidBusy = true;
+      try {
+        const d = await API.setTarget(v);
+        this.pid.target_temp = d.target_temp;
+        alert(`目标温度已设为 ${d.target_temp} ℃`);
+      } catch (e) { alert(e.message); }
+      finally { this.pidBusy = false; }
+    },
+    async togglePid(e) {
+      this.pidBusy = true;
+      try {
+        const d = await API.pidMode(e.target.checked ? 1 : 0);
+        this.pid.pid_enabled = d.pid_enabled;
+      } catch (err) {
+        e.target.checked = this.pid.pid_enabled;
+        alert(err.message);
+      } finally { this.pidBusy = false; }
+    },
+    async savePidParams() {
+      const p = { kp: Number(this.pid.kp), ki: Number(this.pid.ki), kd: Number(this.pid.kd) };
+      for (const [k, v] of Object.entries(p)) {
+        if (isNaN(v) || v < 0) { alert(`请填写有效的 PID 参数 ${k}`); return; }
+      }
+      this.pidBusy = true;
+      try { await API.pidSet(p); alert("PID 参数已保存"); }
+      catch (e) { alert(e.message); }
+      finally { this.pidBusy = false; }
     },
     // ---------- 定量浇水 ----------
     async saveTarget() {
@@ -239,6 +310,10 @@ window.ViewWaterDash = {
         const def = {
           flow: ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0],
           total: ["累计水量", "total_flow", "#2dd4bf", "L", 0],
+          stemp: ["储水槽温度", "storage_temp", "#fb923c", "℃", 1],
+          htemp: ["加热槽温度", "heater_temp", "#f87171", "℃", 1],
+          pressure: ["水压", "pressure", "#a78bfa", "kPa", 1],
+          light: ["光照", "light", "#facc15", "lx", 1],
         }[this.histType] || ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0];
         window.Charts.init("water-hist-chart", {
           ...window.Charts.baseOption(times, def[3]),
@@ -334,7 +409,7 @@ window.ViewWaterDash = {
       }[a] || a;
     },
     typeName(t) {
-      return { flow_rate: "水流量", storage_temp: "储水槽温度", heater_temp: "加热槽温度", pressure: "水压" }[t] || t;
+      return { flow_rate: "水流量", storage_temp: "储水槽温度", heater_temp: "加热槽温度", pressure: "水压", light: "光照" }[t] || t;
     },
     // ---------- 仪表盘与迷你曲线 ----------
     renderGauges() {
@@ -375,7 +450,7 @@ window.ViewWaterDash = {
   <div class="view-page">
     <div class="detail-head">
       <h2>水循环综合监控</h2>
-      <span class="desc">瞬时流量 · 累计水量 · 水泵控制 · 定量浇水</span>
+      <span class="desc">瞬时流量 · 累计水量 · 水温 · 水压 · 水泵控制 · 定量浇水 · 恒温闭环</span>
       <span class="lamp-dot" :class="online ? 'on' : 'off'"></span>
       <span class="desc">{{ online ? '设备在线' : '设备离线' }}</span>
       <div class="detail-controls" v-if="perm('ctrl_light') && features.pump">
@@ -387,6 +462,13 @@ window.ViewWaterDash = {
       </div>
       <span v-else-if="!features.pump" class="toggle-state" style="color:var(--text-dim);">该设备不支持水泵控制</span>
       <span v-else class="toggle-state" style="color:var(--text-dim);">无控制权限</span>
+      <div class="detail-controls" v-if="perm('ctrl_light') && features.heater">
+        <label class="toggle" :class="{ on: heaterOn }">
+          <input type="checkbox" :checked="heaterOn" :disabled="heaterBusy || !online" @change="onHeater">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        </label>
+        <span class="toggle-state">{{ heaterUnknown ? '加热状态未知' : (heaterOn ? '加热已开' : '加热已关') }}</span>
+      </div>
     </div>
 
     <div v-if="!online" class="offline-bar">
@@ -409,20 +491,40 @@ window.ViewWaterDash = {
           <div class="kpi-label">瞬时流量</div>
           <div class="kpi-value">{{ flowText }}<span class="kpi-unit">L/min</span></div>
           <div class="kpi-spark" id="spark-flow"></div>
-          <div class="kpi-foot">阈值 {{ thresholds.flow_min ?? '--' }} ~ {{ thresholds.flow_max ?? '--' }}</div>
         </div>
 
         <div class="kpi-card">
           <div class="kpi-label">累计水量</div>
           <div class="kpi-value">{{ totalText }}<span class="kpi-unit">L</span></div>
           <div class="kpi-spark" id="spark-total"></div>
-          <div class="kpi-foot">定量目标 {{ targetText }}</div>
         </div>
 
-        <div class="kpi-card">
-          <div class="kpi-label">水泵</div>
-          <div class="kpi-state" :class="pumpOn ? 'ok' : (pumpUnknown ? 'bad' : 'off')">{{ pumpUnknown ? '未知' : (pumpOn ? '运行中' : '已停止') }}</div>
-          <div class="kpi-foot">窗口脉冲 {{ realtime.pulses ?? '--' }} · {{ realtime.window_ms ?? '--' }} ms</div>
+        <!-- 新增通道小卡：双列紧凑区，控制左栏高度保证首屏零滚动 -->
+        <!-- 水泵状态不设 KPI 卡：顶部开关文字与回路图水泵节点已充分表达 -->
+        <div class="kpi-duo">
+          <div class="kpi-card" v-if="features.temperature">
+            <div class="kpi-label">储水槽水温</div>
+            <div class="kpi-value">{{ storageTempText }}<span class="kpi-unit">℃</span></div>
+            <div class="kpi-foot">阈值 {{ thresholds.storage_temp_min ?? '--' }} ~ {{ thresholds.storage_temp_max ?? '--' }} ℃</div>
+          </div>
+
+          <div class="kpi-card" v-if="features.temperature">
+            <div class="kpi-label">加热槽水温</div>
+            <div class="kpi-value">{{ heaterTempText }}<span class="kpi-unit">℃</span></div>
+            <div class="kpi-foot">阈值 {{ thresholds.heater_temp_min ?? '--' }} ~ {{ thresholds.heater_temp_max ?? '--' }} ℃</div>
+          </div>
+
+          <div class="kpi-card" v-if="features.pressure">
+            <div class="kpi-label">水压</div>
+            <div class="kpi-value">{{ pressureText }}<span class="kpi-unit">kPa</span></div>
+            <div class="kpi-foot">阈值 {{ thresholds.pressure_min ?? '--' }} ~ {{ thresholds.pressure_max ?? '--' }} kPa</div>
+          </div>
+
+          <div class="kpi-card kpi-wide" v-if="features.light">
+            <div class="kpi-label">光照</div>
+            <div class="kpi-value">{{ lightText }}<span class="kpi-unit">lx</span></div>
+            <div class="kpi-foot">阈值 {{ thresholds.light_min ?? '--' }} ~ {{ thresholds.light_max ?? '--' }} lx</div>
+          </div>
         </div>
 
         <div class="kpi-card">
@@ -440,17 +542,39 @@ window.ViewWaterDash = {
       <!-- 中栏：双水槽循环回路（视觉主体） -->
       <section class="ck-loop">
         <LoopViz :storage="tankOf('storage')" :heater="tankOf('heater')"
-                 :flowing="flowActive" :pump-on="pumpOn" :flow-text="flowText"/>
+                 :flowing="flowActive" :pump-on="pumpOn" :flow-text="flowText" :online="online"/>
         <div class="loop-caption">
-          <span class="badge" :class="tankAnySim ? 'warn' : 'ok'">{{ tankAnySim ? '液位模拟' : '液位实测' }}</span>
-          <span class="desc">{{ tankAnySim
-            ? '液位传感器未接入，水位按水量守恒模拟：水泵运行储水槽→加热槽，停机缓慢回平'
+          <span class="badge" :class="(online && !tankUnavailable) ? 'ok' : 'warn'">{{
+            !online ? '设备离线' : (tankUnavailable ? '液位不完整' : '液位实测') }}</span>
+          <span class="desc">{{ tankUnavailable
+            ? '储水槽未接液位传感器，水位显示 0；加热槽为超声波实测。无数据一律显示 0，不做模拟'
             : '两槽水位来自传感器实测值' }}</span>
         </div>
       </section>
 
       <!-- 右栏：操作 -->
       <aside class="ck-ops">
+        <div class="op-card" v-if="pidSupported && perm('cfg_alarm')">
+          <div class="op-title">恒温闭环 (PID)
+            <label class="toggle" :class="{ on: pid.pid_enabled }" style="float:right;">
+              <input type="checkbox" :checked="pid.pid_enabled" :disabled="pidBusy || !online" @change="togglePid">
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+          <div class="op-input">
+            <input type="number" v-model.number="pid.target_temp" min="0" max="90" step="0.5" style="width:80px;">
+            <span class="op-unit">℃ 目标</span>
+            <button class="btn-primary" :disabled="pidBusy || !online" @click="savePidTarget">设定</button>
+          </div>
+          <div class="op-input" style="margin-top:8px;gap:6px;">
+            <input type="number" v-model.number="pid.kp" min="0" step="0.1" style="width:56px;" title="比例系数 Kp">
+            <input type="number" v-model.number="pid.ki" min="0" step="0.1" style="width:56px;" title="积分系数 Ki">
+            <input type="number" v-model.number="pid.kd" min="0" step="0.1" style="width:56px;" title="微分系数 Kd">
+            <button class="btn-ghost" :disabled="pidBusy || !online" @click="savePidParams">存参数</button>
+          </div>
+          <div class="op-foot">{{ pid.pid_enabled ? '闭环运行中：按加热槽水温自动开关加热' : '闭环已关闭；开启后按加热槽水温自动开关加热(目标±1℃)' }}</div>
+        </div>
+
         <div class="op-card" v-if="perm('ctrl_light') && features.pump_target">
           <div class="op-title">定量浇水</div>
           <div class="op-input">
@@ -513,6 +637,10 @@ window.ViewWaterDash = {
           <span class="tab" :class="{ active: histType==='all' }" @click="pickHistType('all')">全部</span>
           <span class="tab" :class="{ active: histType==='flow' }" @click="pickHistType('flow')">瞬时流量</span>
           <span class="tab" :class="{ active: histType==='total' }" @click="pickHistType('total')">累计水量</span>
+          <span class="tab" v-if="features.temperature" :class="{ active: histType==='stemp' }" @click="pickHistType('stemp')">储水槽温度</span>
+          <span class="tab" v-if="features.temperature" :class="{ active: histType==='htemp' }" @click="pickHistType('htemp')">加热槽温度</span>
+          <span class="tab" v-if="features.pressure" :class="{ active: histType==='pressure' }" @click="pickHistType('pressure')">水压</span>
+          <span class="tab" v-if="features.light" :class="{ active: histType==='light' }" @click="pickHistType('light')">光照</span>
         </div>
         <div class="chart" id="water-hist-chart"></div>
       </div>
@@ -529,6 +657,18 @@ window.ViewWaterDash = {
         <div class="metric"><div class="label">最高流量</div><div class="value">{{ stats.max_flow ?? '--' }}<span class="unit">L/min</span></div></div>
         <div class="metric"><div class="label">最低流量</div><div class="value">{{ stats.min_flow ?? '--' }}<span class="unit">L/min</span></div></div>
         <div class="metric"><div class="label">区间用水量</div><div class="value">{{ stats.volume_used ?? '--' }}<span class="unit">L</span></div></div>
+      </div>
+      <div class="grid-4" v-if="features.temperature || features.pressure" style="margin-bottom:14px;">
+        <div class="metric" v-if="features.temperature"><div class="label">储水槽均温</div><div class="value">{{ stats.avg_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
+        <div class="metric" v-if="features.temperature"><div class="label">储水槽峰值</div><div class="value">{{ stats.max_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
+        <div class="metric" v-if="features.temperature"><div class="label">加热槽均温</div><div class="value">{{ stats.avg_heater_temp ?? '--' }}<span class="unit">℃</span></div></div>
+        <div class="metric" v-if="features.temperature"><div class="label">加热槽峰值</div><div class="value">{{ stats.max_heater_temp ?? '--' }}<span class="unit">℃</span></div></div>
+      </div>
+      <div class="grid-4" v-if="features.pressure" style="margin-bottom:14px;">
+        <div class="metric"><div class="label">水压最高</div><div class="value">{{ stats.max_pressure ?? '--' }}<span class="unit">kPa</span></div></div>
+        <div class="metric"><div class="label">水压最低</div><div class="value">{{ stats.min_pressure ?? '--' }}<span class="unit">kPa</span></div></div>
+        <div class="metric" v-if="features.light"><div class="label">光照最高</div><div class="value">{{ stats.max_light ?? '--' }}<span class="unit">lx</span></div></div>
+        <div class="metric" v-if="features.light"><div class="label">光照最低</div><div class="value">{{ stats.min_light ?? '--' }}<span class="unit">lx</span></div></div>
       </div>
       <div class="grid-4">
         <div class="metric"><div class="label">区间起始累计</div><div class="value">{{ stats.start_total ?? '--' }}<span class="unit">L</span></div></div>

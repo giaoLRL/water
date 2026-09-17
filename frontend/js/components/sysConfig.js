@@ -6,6 +6,7 @@ window.ViewSysConfig = {
     return {
       tab: "alarm",   // alarm / account
       thresholds: {},
+      features: {},            // 设备通道能力（/api/system 返回），用于裁剪阈值表单
       period: 1.0,
       tankCap: { storage: 1000, heater: 1000 },
       system: {},
@@ -38,6 +39,7 @@ window.ViewSysConfig = {
         this.thresholds = cfg.thresholds || {};
       } catch (e) { /* silent */ }
       try { this.system = await API.system(); this.period = this.system.period || 1.0; } catch (e) { /* silent */ }
+      if (this.system.features) this.features = this.system.features;
       const caps = this.system.tank_capacities;
       if (caps) this.tankCap = { storage: caps.storage, heater: caps.heater };
       if (this.perm("account_manage")) {
@@ -55,8 +57,11 @@ window.ViewSysConfig = {
       }
     },
     async saveThresh() {
-      // 仅保存当前采集设备支持的通道（流量）
+      // 仅保存当前采集设备支持的通道；温度阈值单位℃，压力 kPa，光照 lx
       const keys = ["flow_max", "flow_min"];
+      if (this.features.temperature) keys.push("storage_temp_max", "storage_temp_min", "heater_temp_max", "heater_temp_min");
+      if (this.features.pressure) keys.push("pressure_max", "pressure_min");
+      if (this.features.light) keys.push("light_max", "light_min");
       const cfg = {};
       for (const k of keys) {
         const v = parseFloat(this.thresholds[k]);
@@ -196,16 +201,32 @@ window.ViewSysConfig = {
 
     <div class="grid-2 config-grid" v-show="tab==='alarm'">
       <div class="section">
-        <h3>告警阈值 <span class="desc">流量上下限 · 超限即告警（任务六）</span></h3>
+        <h3>告警阈值 <span class="desc">流量 / 温度 / 压力上下限 · 超限即告警（任务六）</span></h3>
         <div class="alarm-rule" style="flex-direction:column;align-items:stretch;gap:10px;">
           <div class="grid-2">
             <label class="rule-item"><span>水流量上限 L/min</span><input type="number" v-model.number="thresholds.flow_max"></label>
             <label class="rule-item"><span>水流量下限 L/min</span><input type="number" v-model.number="thresholds.flow_min"></label>
           </div>
+          <div class="grid-2" v-if="features.temperature">
+            <label class="rule-item"><span>储水槽温度上限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_max"></label>
+            <label class="rule-item"><span>储水槽温度下限 ℃</span><input type="number" v-model.number="thresholds.storage_temp_min"></label>
+          </div>
+          <div class="grid-2" v-if="features.temperature">
+            <label class="rule-item"><span>加热槽温度上限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_max"></label>
+            <label class="rule-item"><span>加热槽温度下限 ℃</span><input type="number" v-model.number="thresholds.heater_temp_min"></label>
+          </div>
+          <div class="grid-2" v-if="features.pressure">
+            <label class="rule-item"><span>水压上限 kPa</span><input type="number" v-model.number="thresholds.pressure_max"></label>
+            <label class="rule-item"><span>水压下限 kPa</span><input type="number" v-model.number="thresholds.pressure_min"></label>
+          </div>
+          <div class="grid-2" v-if="features.light">
+            <label class="rule-item"><span>光照上限 lx</span><input type="number" v-model.number="thresholds.light_max"></label>
+            <label class="rule-item"><span>光照下限 lx</span><input type="number" v-model.number="thresholds.light_min"></label>
+          </div>
           <button class="btn-primary" @click="saveThresh">保存告警阈值</button>
           <div class="note" style="margin-top:0;">
-            温度 / 压力阈值已随通道裁剪：当前采集固件未提供温度、压力与加热通道，
-            相关面板、告警与恒温闭环(PID)均不可用。
+            仅展示当前固件支持的通道；压力单位为 kPa（设备固件上报 MPa，后端已按 ×1000 统一换算），
+            光照单位为 lx（GY-302）。温度通道启用后，恒温闭环(PID)可在实时面板开启。
           </div>
         </div>
       </div>
@@ -223,10 +244,10 @@ window.ViewSysConfig = {
           <span class="desc">用于把水位%换算成估算水量</span>
         </div>
         <div class="note" style="margin-top:0;">
-          双水槽液位传感器尚未接入，界面水位目前为<b>模拟值</b>（按水量守恒：水泵运行时储水槽→加热槽，
-          停机后缓慢回平），已明确标注。传感器接入后，把 backend/config.py 的
-          <code>DEVICE_FEATURES["level_storage"]</code> / <code>["level_heater"]</code> 改为 <code>True</code>，
-          并填写 <code>LEVEL_PATH_STORAGE</code> / <code>LEVEL_PATH_HEATER</code> 与对应水槽高度，界面会自动切换为实测值。
+          液位说明：加热槽已接<b>超声波传感器（实测）</b>；储水槽暂无传感器，水位<b>恒显示 0</b>
+          并标注「无传感器」（已清除全部模拟数据，无数据一律保持 0）。
+          传感器接入后，把 backend/config.py 的 <code>DEVICE_FEATURES["level_storage"]</code> 改为
+          <code>True</code> 并填写 <code>LEVEL_PATH_STORAGE</code>，储水槽会自动切换为实测值。
         </div>
         <h3 style="margin-top:18px;">采集设备 <span class="desc">任务一/二：链路与通道</span></h3>
         <div class="stat-grid2">

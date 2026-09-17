@@ -60,15 +60,27 @@ class PeriodRequest(BaseModel):
 
 
 class AlarmConfigRequest(BaseModel):
-    """告警阈值：仅当前设备支持的通道（流量）。"""
+    """告警阈值：仅当前设备支持的通道（流量/温度/压力/光照）。压力单位 kPa，光照单位 lx。"""
     flow_max: float | None = Field(default=None, ge=0, le=100)
     flow_min: float | None = Field(default=None, ge=0, le=100)
+    storage_temp_max: float | None = Field(default=None, ge=0, le=100)
+    storage_temp_min: float | None = Field(default=None, ge=-20, le=100)
+    heater_temp_max: float | None = Field(default=None, ge=0, le=100)
+    heater_temp_min: float | None = Field(default=None, ge=-20, le=100)
+    pressure_max: float | None = Field(default=None, ge=0, le=2000)
+    pressure_min: float | None = Field(default=None, ge=0, le=2000)
+    light_max: float | None = Field(default=None, ge=0, le=200000)
+    light_min: float | None = Field(default=None, ge=0, le=200000)
 
 
 class IngestRequest(BaseModel):
     """采集端主动上报(可选链路)：仅设备实际提供的字段。"""
     flow_rate: float | None = None
     total_liters: float | None = None
+    storage_temp: float | None = None
+    heater_temp: float | None = None
+    pressure: float | None = None
+    light: float | None = None
 
 
 def _validate_range(start: str | None, end: str | None) -> None:
@@ -93,10 +105,12 @@ def _tank_info(tank: str, data: dict) -> dict:
 
     液位来自该水槽的独立液位通道：
       已接入(DEVICE_FEATURES["level_<tank>"]=True) → 真实读数，source="device"；
-      未接入                                        → 模拟值，  source="sim"。
+      未接入                                        → 恒为 0，      source="none"（界面标注「无传感器」）。
+    无数据一律按 0 展示，不使用任何模拟值（用户要求：清除模拟数据，没有数据就保持 0）。
     "估算水量" = 液位% × 该水槽容积，仅作展示参考，不是计量值。
     """
-    percent = data.get(f"level_{tank}")
+    available = bool(config.DEVICE_FEATURES.get(f"level_{tank}"))
+    percent = data.get(f"level_{tank}") if available else None
     if percent is None:
         percent = 0.0
     percent = max(0.0, min(100.0, float(percent)))
@@ -107,7 +121,7 @@ def _tank_info(tank: str, data: dict) -> dict:
         "key": tank,
         "label": config.TANK_LABELS.get(tank, tank),
         "percent": round(percent, 2),
-        "source": "device" if config.DEVICE_FEATURES.get(f"level_{tank}") else "sim",
+        "source": "device" if available else "none",
         "capacity": round(capacity, 3),
         "volume": round(capacity * percent / 100.0, 3),   # 估算水量(L)，非计量值
         "height_cm": round(height * percent / 100.0, 1),
@@ -115,13 +129,17 @@ def _tank_info(tank: str, data: dict) -> dict:
 
 
 def _level_info() -> dict:
-    """双水槽水位信息（供前端 SVG 动画使用）。任一槽为模拟值时 any_sim 为 True。"""
+    """双水槽水位信息（供前端 SVG 动画使用）。
+
+    any_unavailable：存在未接入传感器的槽位（该槽水位恒为 0，界面标注「无传感器」）。
+    设备是否在线由 snapshot 的 sensor_online 单独给出，前端据此显示「离线」。
+    """
     plant = services.plant
     data = plant.status() if plant else {}
     tanks = {tank: _tank_info(tank, data) for tank in config.TANKS}
     return {
         "tanks": tanks,
-        "any_sim": any(t["source"] == "sim" for t in tanks.values()),
+        "any_unavailable": any(t["source"] != "device" for t in tanks.values()),
     }
 
 
@@ -144,16 +162,17 @@ def _snapshot() -> dict:
         "target_baseline": store.target_baseline(),   # 设定定量目标时的累计水量(L)，用于进度换算
         "pulses": data.get("pulses"),
         "window_ms": data.get("window_ms"),
-        # 液位（双水槽，独立通道；传感器未接入时为模拟值）
+        # 液位（双水槽；仅加热槽为超声波实测，储水槽未接入传感器 → 水位恒为 0）
         "level_storage": data.get("level_storage"),
         "level_heater": data.get("level_heater"),
         "tank": _level_info(),
-        # 当前固件不支持的通道，恒为 None（前端据此显示“设备不支持”）
+        # 温度/压力/加热/光照通道（离线或读数无效时为 None）
         "temperature": data.get("temperature"),
         "storage_temp": data.get("storage_temp"),
         "heater_temp": data.get("heater_temp"),
         "pressure": data.get("pressure"),
         "heater_state": data.get("heater_state"),
+        "light": data.get("light"),
         # 链路与设备信息
         "sensor_online": data.get("sensor_online"),
         "last_error": data.get("last_error") or "",
@@ -322,8 +341,8 @@ def ingest(body: IngestRequest, _: dict = Depends(auth.require_perm("view_monito
 
 
 # ---------- 恒温PID(任务六) ----------
-# 恒温闭环需设备同时提供温度采集与加热控制；当前固件不支持，以下接口统一返回不可用。
-# 固件升级后把 config.DEVICE_FEATURES 的 temperature/heater 置 True 即可自动启用。
+# 恒温闭环需设备同时提供温度采集与加热控制；两项能力均在 config.DEVICE_FEATURES 声明，
+# 任一缺失时以下接口统一返回不可用（40003）。
 @router.post("/water/target")
 def set_target(body: TargetRequest, _: dict = Depends(auth.require_perm("cfg_alarm"))):
     if not config.pid_supported():
@@ -414,7 +433,11 @@ def alarm_config_set(body: AlarmConfigRequest, user: dict = Depends(auth.require
     changed = ", ".join(
         f"{k}: {before.get(k, '--')} → {v}" for k, v in updates.items()
     )
-    database.insert_control_log("config.alarm", "success", f"修改告警阈值 {changed}",
+    # detail 列为 VARCHAR(255)：阈值字段多时整包可能超长，截断保护
+    detail = f"修改告警阈值 {changed}"
+    if len(detail) > 250:
+        detail = detail[:250] + "…"
+    database.insert_control_log("config.alarm", "success", detail,
                                 operator=user.get("username") or None, source="manual")
     return ok({"thresholds": services.alarm.thresholds})
 

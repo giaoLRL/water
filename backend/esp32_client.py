@@ -1,8 +1,8 @@
 """ESP32 采集/控制端 HTTP 客户端（仅用标准库 urllib，无第三方依赖，可离线）。
 
-现场设备（默认 http://192.168.31.100）固件为《YF-S401 水流量检测》，实际提供的接口：
+现场设备（默认 http://192.168.31.100）固件 web_server.cpp 实际提供的接口（全部 GET）：
     GET /                          网页控制页(HTML)
-    GET /api/data                  全部状态 JSON(瞬时流量/累计水量/水泵/定量目标/窗口脉冲)
+    GET /api/data                  全部状态 JSON(流量/累计水量/水温×2/压力/水泵/定量目标/加热/窗口脉冲)
     GET /api/flow                  瞬时流量 {"value":x,"unit":"L/min"}
     GET /api/volume                累计水量 {"value":x,"unit":"L"}
     GET /api/pump/on               开水泵
@@ -12,13 +12,22 @@
     GET /api/pump/target           查询定量目标 {"target":0}
     GET /api/pump/target?value=2.5 设定定量目标(水量达到自动关泵)
     GET /api/reset                 清零累计水量
+    GET /api/temperature           水温探头1(→储水槽)；读数无效时 503，固件无该通道时 404
+    GET /api/temperature2          水温探头2(→加热槽)；语义同上
+    GET /api/pressure              压力 {"value":"MPa","ok":true,"raw","pinVoltage","voltage"}；异常 503 仍带 raw/电压
+    GET /api/level                 超声波水位 {"value":85,"unit":"%"}（单路，接加热槽）；无效时 503
+    GET /api/level/height?value=85 设定预定高度(mm，NVS 掉电不丢)；不带参数查询当前值
+    GET /api/light                 光照 {"value":76.7,"unit":"lx"}；未识别到 GY-302 时 503
+    GET /api/heater/on|off|toggle  加热继电器开关/切换
+    GET /api/heater/state          查询加热 {"heater":true/false}
     GET /api/health                运行时长/IP/RSSI/状态
-    GET /api/temperature           水温；读数无效时 503，固件无该通道时 404
 
 设计要点：
 - 所有请求均为 GET（与现场固件一致），网络/HTTP/解析异常统一抛出 DeviceError；
 - 由上层（water_device）决定离线降级策略，本模块不做任何模拟数据；
-- 温度等可选通道返回 None 表示“不可用/读数无效”，不抛异常，避免影响主数据链路。
+- 温度/压力等通道返回 None 表示"不可用/读数无效"，不抛异常，避免影响主数据链路；
+- 压力固件单位为 MPa，换算 kPa 由上层负责（×1000）；
+- 液位百分比直接可用，mm/cm 单位换算由上层负责。
 """
 import json
 import urllib.error
@@ -98,15 +107,33 @@ class Esp32Client:
         return payload or {}
 
     def temperature(self) -> float | None:
-        """读取 /api/temperature。
+        """读取 /api/temperature（探头1→储水槽水温）。
 
         503=读数无效（传感器异常），404=固件无该通道；两种情况均返回 None，
-        由前端显示“读数无效 / 设备不支持”，不影响其他数据采集。
+        由前端显示"读数无效 / 设备不支持"，不影响其他数据采集。
         """
         status, payload = self._get("/api/temperature", tolerate=(404, 503))
         if status != 200 or not payload:
             return None
         return self._as_float(payload.get("value"))
+
+    def temperature2(self) -> float | None:
+        """读取 /api/temperature2（探头2→加热槽水温），语义同 temperature()。"""
+        status, payload = self._get("/api/temperature2", tolerate=(404, 503))
+        if status != 200 or not payload:
+            return None
+        return self._as_float(payload.get("value"))
+
+    def pressure(self) -> dict | None:
+        """读取 /api/pressure 原始返回（value 单位 MPa，换算 kPa 由上层负责）。
+
+        正常: {"value":0.123,"unit":"MPa","ok":true,"raw":1234,"pinVoltage":0.987,"voltage":1.480}
+        传感器异常时固件返回 503 且仍带 raw/电压（方便排查接线与标定），此时返回 None。
+        """
+        status, payload = self._get("/api/pressure", tolerate=(404, 503))
+        if status != 200 or not payload:
+            return None
+        return payload
 
     def health(self) -> dict:
         """读取 /api/health（运行时长/IP/RSSI 等）。"""
@@ -114,11 +141,11 @@ class Esp32Client:
         return payload or {}
 
     def level(self, path: str) -> dict | None:
-        """读取液位（传感器尚未接入，接口路径由调用方传入 config.LEVEL_PATH，待固件确定）。
+        """读取液位（固件单路超声波 /api/level，路径由调用方传入 config.LEVEL_PATH_*）。
 
-        兼容 {"value":x,"unit":"%"} 与 {"value":x,"unit":"cm"} 两种返回，
-        单位换算由上层负责（cm 需用 config.TANK_HEIGHT_CM 换算为百分比）。
-        返回 {"value":float|None, "unit":str|None}；通道不存在或读数无效时返回 None。
+        兼容 {"value":x,"unit":"%"} 与 {"value":x,"unit":"cm"/"mm"} 三种返回，
+        百分比直接可用；cm/mm 需用 config.TANK_HEIGHT_CM 换算为百分比（上层负责）。
+        返回 {"value":float|None, "unit":str|None}；通道不存在或读数无效(503)时返回 None。
         """
         status, payload = self._get(path, tolerate=(404, 503))
         if status != 200 or not payload:
@@ -126,6 +153,13 @@ class Esp32Client:
         unit = payload.get("unit")
         return {"value": self._as_float(payload.get("value")),
                 "unit": (str(unit).strip().lower() or None) if unit else None}
+
+    def light(self) -> float | None:
+        """读取 /api/light 光照(lx)。未识别到 GY-302 时固件返回 503 → 返回 None。"""
+        status, payload = self._get("/api/light", tolerate=(404, 503))
+        if status != 200 or not payload:
+            return None
+        return self._as_float(payload.get("value"))
 
     # ---------- 水泵控制 ----------
     def pump_state(self) -> bool | None:
@@ -150,6 +184,22 @@ class Esp32Client:
         if payload.get("status") not in (None, "ok"):
             raise DeviceError(f"设备执行失败（{path}）：{payload}")
         return payload
+
+    # ---------- 加热控制 ----------
+    def heater_state(self) -> bool | None:
+        """查询加热继电器真实状态；设备未返回布尔值时返回 None。"""
+        _, payload = self._get("/api/heater/state")
+        value = (payload or {}).get("heater")
+        return value if isinstance(value, bool) else None
+
+    def heater_on(self) -> dict:
+        return self._action("/api/heater/on", "heater")
+
+    def heater_off(self) -> dict:
+        return self._action("/api/heater/off", "heater")
+
+    def heater_toggle(self) -> dict:
+        return self._action("/api/heater/toggle", "heater")
 
     # ---------- 定量目标 ----------
     def get_pump_target(self) -> float:

@@ -132,11 +132,12 @@ def main() -> None:
         check("水泵状态为 on/off/unknown", d["pump_state"] in ("on", "off", "unknown"), str(d["pump_state"]))
     else:
         warn("现场设备离线，跳过读数有效性校验", d.get("last_error", ""))
-    check("温度通道标注为不支持且无数据",
-          d["features"].get("temperature") is False and d["temperature"] is None, str(d.get("features")))
-    check("压力通道标注为不支持且无数据",
-          d["features"].get("pressure") is False and d["pressure"] is None, str(d.get("features")))
-    check("加热通道标注为不支持", d["features"].get("heater") is False, str(d.get("features")))
+    check("温度通道标注为支持", d["features"].get("temperature") is True, str(d.get("features")))
+    check("压力通道标注为支持", d["features"].get("pressure") is True, str(d.get("features")))
+    check("加热通道标注为支持", d["features"].get("heater") is True, str(d.get("features")))
+    for f in ("storage_temp", "heater_temp", "pressure", "heater_state", "light"):
+        check(f"realtime 字段 {f}", f in d, str(sorted(d.keys())))
+    check("光照通道标注为支持", d["features"].get("light") is True, str(d.get("features")))
 
     print("== 2. 执行器控制 ==")
     r = request("POST", "/api/water/pump", {"action": "off"})
@@ -154,8 +155,11 @@ def main() -> None:
         warn("已跳过开泵链路验证（设 WATER_TEST_ACTUATE=1 可启用）")
     r = request("POST", "/api/water/pump", {"action": "invalid"})
     check("非法指令返回 40002", r["code"] == 40002, str(r))
-    r = request("POST", "/api/water/heater", {"action": "on"})
-    check("加热控制被拒 40003(设备不支持)", r["code"] == 40003, str(r))
+    r = request("POST", "/api/water/heater", {"action": "off"})
+    check_device("关闭加热成功(安全幂等)", r, r["code"] == 0
+                 and r["data"].get("heater_state") in ("off", "on", "unknown"))
+    r = request("POST", "/api/water/heater", {"action": "invalid"})
+    check("加热非法指令返回 40002", r["code"] == 40002, str(r))
 
     print("== 3. 定量浇水与累计水量 ==")
     r = request("GET", "/api/water/pump/target")
@@ -176,7 +180,7 @@ def main() -> None:
     print("== 4.1 双水槽水位 ==")
     rt = request("GET", "/api/water/realtime")["data"]
     tank = rt["tank"]
-    check("水位含 tanks 与 any_sim", "tanks" in tank and "any_sim" in tank, str(tank))
+    check("水位含 tanks 与 any_unavailable", "tanks" in tank and "any_unavailable" in tank, str(tank))
     tanks = tank["tanks"]
     check("含储水槽与加热槽两路", set(tanks.keys()) == {"storage", "heater"}, str(list(tanks.keys())))
     for key, label in (("storage", "储水槽"), ("heater", "加热槽")):
@@ -184,15 +188,26 @@ def main() -> None:
         check(f"{label}含 来源/百分比/容积/估算水量",
               all(k in t for k in ("source", "percent", "capacity", "volume", "height_cm")), str(t))
         check(f"{label}百分比在 0~100", 0 <= t["percent"] <= 100, str(t["percent"]))
-        check(f"{label}来源标注合法(device/sim)", t["source"] in ("device", "sim"), str(t["source"]))
+        check(f"{label}来源标注合法(device/none)", t["source"] in ("device", "none"), str(t["source"]))
         check(f"{label}标签正确", t["label"] == label, str(t["label"]))
     check("realtime 含两槽液位字段",
           "level_storage" in rt and "level_heater" in rt, str(sorted(rt.keys())))
-    if tank["any_sim"]:
-        check("液位通道标为未接入",
-              rt["features"]["level_storage"] is False and rt["features"]["level_heater"] is False,
-              str(rt["features"]))
-        warn("两槽液位当前为模拟值（传感器未接入），界面已标注")
+    check("加热槽液位标为已接入(超声波)、储水槽标为未接入",
+          rt["features"]["level_heater"] is True and rt["features"]["level_storage"] is False,
+          str(rt["features"]))
+    check("储水槽无传感器：source=none 且水位恒为 0",
+          tanks["storage"]["source"] == "none" and tanks["storage"]["percent"] == 0.0
+          and tanks["storage"]["volume"] == 0.0,
+          str({k: v["source"] for k, v in tanks.items()}))
+    check("加热槽为实测通道：source=device", tanks["heater"]["source"] == "device",
+          str({k: v["source"] for k, v in tanks.items()}))
+    check("any_unavailable 反映存在未接入槽位(储水槽)", tank["any_unavailable"] is True,
+          str(tank["any_unavailable"]))
+    # 无模拟数据：设备离线时两槽水位均归 0，不出现任何非零"演示值"
+    if not rt["sensor_online"]:
+        check("设备离线：两槽水位均为 0（不做模拟）",
+              tanks["storage"]["percent"] == 0.0 and tanks["heater"]["percent"] == 0.0,
+              str({k: v["percent"] for k, v in tanks.items()}))
     # 容积可改，并原值恢复（两槽分别设置）
     origin_caps = {k: tanks[k]["capacity"] for k in ("storage", "heater")}
     r = request("POST", "/api/water/tank", {"tank": "storage", "capacity": origin_caps["storage"] + 100})
@@ -218,13 +233,28 @@ def main() -> None:
     # 注意：不在此设定非零定量目标 —— 现场固件会因此启动浇水并在完成后清零累计水量
     warn("未验证定量进度（设定非零目标会触发设备真实浇水并清零累计值）")
 
-    print("== 5. 恒温PID（当前固件不支持，应统一拒绝） ==")
+    print("== 5. 恒温PID（温度/加热通道已启用） ==")
     r = request("GET", "/api/water/pid")
-    check("PID 查询返回 supported=False", r["code"] == 0 and r["data"]["supported"] is False, str(r))
+    check("PID 查询返回 supported=True", r["code"] == 0 and r["data"]["supported"] is True, str(r))
+    origin_pid = r["data"]
+    # 只做参数读写与目标温度设定并原值恢复；不开启闭环（enabled 保持 0，避免真实控制加热）
+    r = request("POST", "/api/water/pid", {"kp": 2.0, "ki": 0.5, "kd": 1.0})
+    check("写入PID参数成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/pid")
+    check("PID参数回读一致",
+          (r["data"]["kp"], r["data"]["ki"], r["data"]["kd"]) == (2.0, 0.5, 1.0), str(r))
+    r = request("POST", "/api/water/pid",
+                {"kp": origin_pid["kp"], "ki": origin_pid["ki"], "kd": origin_pid["kd"]})
+    check("恢复PID参数", r["code"] == 0, str(r))
     r = request("POST", "/api/water/target", {"temp": 40.0})
-    check("设定目标温度被拒 40003", r["code"] == 40003, str(r))
-    r = request("POST", "/api/water/pid/mode", {"enabled": 1})
-    check("开启恒温PID被拒 40003", r["code"] == 40003, str(r))
+    check("设定目标温度成功", r["code"] == 0 and r["data"]["target_temp"] == 40.0, str(r))
+    r = request("POST", "/api/water/target", {"temp": origin_pid["target_temp"]})
+    check("恢复目标温度", r["code"] == 0, str(r))
+    r = request("POST", "/api/water/target", {"temp": 999})
+    check("非法目标温度返回 40002", r["code"] == 40002, str(r))
+    r = request("POST", "/api/water/pid/mode", {"enabled": 0})
+    check("恒温PID保持关闭(安全幂等)", r["code"] == 0 and r["data"]["pid_enabled"] is False, str(r))
+    warn("未开启恒温闭环（会真实控制加热模块）；如需验证请在界面手动开启并观察")
 
     print("== 6. 历史数据 ==")
     start, end = now_fmt(-10), now_fmt(1)
@@ -240,6 +270,12 @@ def main() -> None:
     r = request("GET", f"/api/water/stats?start={urllib.parse.quote(start)}&end={urllib.parse.quote(end)}")
     check("统计返回流量指标/累计水量/采样点数", r["code"] == 0
           and all(k in r["data"] for k in ("avg_flow", "max_flow", "min_flow", "samples", "total_flow")), str(r))
+    check("统计返回温度/压力聚合指标", r["code"] == 0 and all(k in r["data"] for k in (
+        "avg_storage_temp", "max_storage_temp", "min_storage_temp",
+        "avg_heater_temp", "max_heater_temp", "min_heater_temp",
+        "max_pressure", "min_pressure")), str(r["data"].keys()))
+    check("统计返回光照聚合指标", r["code"] == 0 and all(
+        k in r["data"] for k in ("avg_light", "max_light", "min_light")), str(r["data"].keys()))
 
     print("== 8. 告警 ==")
     r = request("GET", "/api/water/alarm/config")
@@ -253,6 +289,24 @@ def main() -> None:
     check("保存流量阈值成功", r["code"] == 0 and r["data"]["thresholds"]["flow_max"] == probe_max, str(r))
     r = request("POST", "/api/water/alarm/config", {"flow_max": origin_max, "flow_min": origin_min})
     check("恢复原阈值成功", r["code"] == 0 and r["data"]["thresholds"]["flow_max"] == origin_max, str(r))
+    # 温度/压力/光照阈值（压力 kPa、光照 lx）：写入探测值验证后原值恢复
+    origin_st_max = float(origin.get("storage_temp_max", 45.0))
+    origin_p_max = float(origin.get("pressure_max", 400.0))
+    origin_l_max = float(origin.get("light_max", 2000.0))
+    r = request("POST", "/api/water/alarm/config",
+                {"storage_temp_max": origin_st_max + 1.0, "pressure_max": origin_p_max + 1.0,
+                 "light_max": origin_l_max + 100.0})
+    check("保存温度/压力/光照阈值成功", r["code"] == 0
+          and r["data"]["thresholds"]["storage_temp_max"] == origin_st_max + 1.0
+          and r["data"]["thresholds"]["pressure_max"] == origin_p_max + 1.0
+          and r["data"]["thresholds"]["light_max"] == origin_l_max + 100.0, str(r))
+    r = request("POST", "/api/water/alarm/config",
+                {"storage_temp_max": origin_st_max, "pressure_max": origin_p_max,
+                 "light_max": origin_l_max})
+    check("恢复温度/压力/光照阈值成功", r["code"] == 0
+          and r["data"]["thresholds"]["storage_temp_max"] == origin_st_max
+          and r["data"]["thresholds"]["pressure_max"] == origin_p_max
+          and r["data"]["thresholds"]["light_max"] == origin_l_max, str(r))
     r = request("POST", "/api/water/alarm/config", {})
     check("空阈值返回 40002", r["code"] == 40002, str(r))
     r = request("GET", "/api/water/alarms")

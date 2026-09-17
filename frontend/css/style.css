@@ -946,7 +946,7 @@ td { font-variant-numeric: tabular-nums; }
 }
 
 /* --- 左栏：关键指标 --- */
-.ck-kpi { display: flex; flex-direction: column; gap: 12px; }
+.ck-kpi { display: flex; flex-direction: column; gap: 8px; }
 .kpi-card { padding: 12px 14px 11px; display: flex; flex-direction: column; }
 .kpi-label {
   display: flex; align-items: center; gap: 6px;
@@ -954,11 +954,11 @@ td { font-variant-numeric: tabular-nums; }
 }
 .kpi-label .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .kpi-value {
-  font-family: var(--mono); font-size: 29px; font-weight: 700;
+  font-family: var(--mono); font-size: 27px; font-weight: 700;
   line-height: 1.1; color: var(--text); margin-top: 5px;
 }
 .kpi-unit { font-size: 11px; font-weight: 400; color: var(--text-dim); margin-left: 5px; }
-.kpi-spark { height: 32px; margin-top: 3px; }
+.kpi-spark { height: 26px; margin-top: 3px; }
 .kpi-foot { font-size: 10px; color: var(--text-dim); margin-top: 6px; line-height: 1.4; }
 .kpi-warn { color: var(--warn); cursor: help; }
 .kpi-state { font-family: var(--mono); font-size: 19px; font-weight: 700; margin-top: 6px; }
@@ -968,6 +968,14 @@ td { font-variant-numeric: tabular-nums; }
 .kpi-kv { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; margin-top: 5px; }
 .kpi-kv span { color: var(--text-dim); }
 .kpi-kv b { color: var(--text-sub); font-family: var(--mono); font-weight: 500; }
+/* 新增通道小卡双列区（温度×2/水压/光照）：紧凑排版控制左栏高度，保证 1366×768 首屏零滚动 */
+.kpi-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.kpi-duo .kpi-card { padding: 10px 12px 9px; }
+.kpi-duo .kpi-value { font-size: 20px; margin-top: 4px; }
+.kpi-duo .kpi-state { font-size: 16px; margin-top: 4px; }
+.kpi-duo .kpi-foot { margin-top: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 光照等奇数张时最后一张跨双列，避免留空格 */
+.kpi-duo .kpi-wide { grid-column: span 2; }
 
 /* --- 中栏：循环回路 --- */
 .ck-loop { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
@@ -976,8 +984,8 @@ td { font-variant-numeric: tabular-nums; }
   display: flex; align-items: center; justify-content: center;
 }
 /* 水箱高度随视口自适应：小屏收窄避免出现滚动条，大屏放大让主体更有存在感。
-   256px ≈ 顶栏+标题栏+标签栏+页边距 的固定开销。 */
-.loop-svg { width: 100%; height: 100%; max-height: min(700px, calc(100vh - 270px)); display: block; }
+   300px ≈ 顶栏+标题栏(含双开关)+标签栏+页边距+说明行的固定开销。 */
+.loop-svg { width: 100%; height: 100%; max-height: min(700px, calc(100vh - 300px)); display: block; }
 .loop-caption { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 2px; }
 .loop-caption .desc { font-size: 10px; color: var(--text-dim); }
 
@@ -1013,7 +1021,8 @@ td { font-variant-numeric: tabular-nums; }
   paint-order: stroke; stroke: rgba(6, 14, 24, 0.5); stroke-width: 5px; stroke-linejoin: round;
   pointer-events: none;
 }
-.tank-sim-tag { fill: var(--warn); font-size: 12px; font-weight: 600; letter-spacing: 3px; pointer-events: none; }
+/* 水位角标：提示该水位不是有效实测值（无传感器 / 设备离线），无数据一律显示 0 */
+.tank-tag { fill: var(--warn); font-size: 12px; font-weight: 600; letter-spacing: 3px; pointer-events: none; }
 
 /* 循环管路：出水(储水槽→加热槽) 与 回流(加热槽→储水槽) */
 .loop-pipe-line { stroke: var(--border); stroke-width: 9; stroke-linecap: round; transition: stroke 0.4s; }
@@ -1122,6 +1131,7 @@ td { font-variant-numeric: tabular-nums; }
   .cockpit { grid-template-columns: 1fr; }
   .ck-kpi { flex-direction: row; flex-wrap: wrap; }
   .ck-kpi .kpi-card { flex: 1 1 170px; }
+  .ck-kpi .kpi-duo { flex: 1 1 100%; }
   .ck-loop { min-height: 400px; }
 }
 @media (max-width: 700px) {

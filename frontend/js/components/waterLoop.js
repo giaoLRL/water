@@ -6,6 +6,8 @@
  *
  * 注意：SVG 内的 id（渐变、裁剪）必须唯一，同页多实例时否则会互相串位，
  * 因此统一带 uid 后缀。
+ *
+ * 水位不做任何模拟：无数据一律显示 0，并用角标标明原因（「无传感器」/「离线」）。
  */
 let waterLoopUid = 0;
 
@@ -17,6 +19,7 @@ window.WaterLoopViz = {
     flowing: { type: Boolean, default: false },   // 是否有水流（决定管路动画）
     pumpOn: { type: Boolean, default: false },
     flowText: { type: String, default: "--" },
+    online: { type: Boolean, default: false },    // 设备是否在线（离线时水位恒为 0 并标注）
   },
   data() {
     return {
@@ -60,7 +63,13 @@ window.WaterLoopViz = {
       const p = Number(this.info(key).percent);
       return isNaN(p) ? 0 : Math.max(0, Math.min(100, p));
     },
-    isSim(key) { return this.info(key).source !== "device"; },
+    /* 水位角标：说明该水位为何不是有效实测值（无模拟数据，无数据一律显示 0）
+       未接入传感器 → 「无传感器」；已接入但设备离线 → 「离线」；正常实测 → 不显示 */
+    unavailable(key) { return this.info(key).source !== "device"; },
+    tagOf(key) {
+      if (this.unavailable(key)) return "无传感器";
+      return this.online ? "" : "离线";
+    },
     waterHeight(key) { return this.geo.h * this.pct(key) / 100; },
     waterTop(key) { return this.geo.bottom - this.waterHeight(key); },
     markY(p) { return this.geo.bottom - this.geo.h * p / 100; },
@@ -137,7 +146,7 @@ window.WaterLoopViz = {
       <!-- 水位百分比与副标题 -->
       <g v-for="t in tanks" :key="'txt' + t.key">
         <text class="tank-pct" :x="t.x + geo.w / 2" y="242" text-anchor="middle">{{ pct(t.key).toFixed(0) }}%</text>
-        <text v-if="isSim(t.key)" class="tank-sim-tag" :x="t.x + geo.w / 2" y="270" text-anchor="middle">模拟</text>
+        <text v-if="tagOf(t.key)" class="tank-tag" :x="t.x + geo.w / 2" y="270" text-anchor="middle">{{ tagOf(t.key) }}</text>
         <text class="loop-tank-sub" :x="t.x + geo.w / 2" y="440" text-anchor="middle">{{ info(t.key).volume ?? '--' }} L · 水深 {{ info(t.key).height_cm ?? '--' }} cm</text>
       </g>
 

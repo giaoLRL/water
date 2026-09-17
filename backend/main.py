@@ -43,25 +43,31 @@ def run_cycle() -> None:
     # 采集端主动上报数据优先(可选链路，任务二)；无则用后端轮询到的值
     ing = services.ingest
     if ing and isinstance(ing, dict) and (time.time() - ing.get("ts", 0)) < 2.0:
-        for k in ("flow_rate", "total_liters"):
+        for k in ("flow_rate", "total_liters", "storage_temp", "heater_temp", "pressure", "light"):
             if ing.get(k) is not None:
                 data[k] = float(ing[k])
         data["total_flow"] = data.get("total_liters")
 
-    # 恒温闭环控制(PID)：需设备同时支持温度与加热通道，当前固件不支持故跳过（任务六）
+    # 恒温闭环控制(PID)：需设备同时支持温度与加热通道（任务六）
     if config.pid_supported() and store.pid_enabled():
-        target = store.target_temp()
-        duty = services.pid.update(target, data["heater_temp"], store.period())
-        act = heater_action(duty)
-        if act != plant.heater_state:
-            plant.heater_control(act)
-            name = "开启加热" if act == "on" else "关闭加热"
-            database.insert_control_log(f"heater_{act}", "success",
-                                        f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)",
-                                        operator=None, source="auto")
+        heater_temp = data.get("heater_temp")
+        if heater_temp is None:
+            # 加热槽温度无有效读数(设备离线/传感器异常)时跳过本轮闭环，避免 PID 收到空值
             if DEBUG_ENABLE:
-                _log.info("[CONTROL] 恒温闭环 → %s (heater_temp=%.2f target=%.1f duty=%.0f%%)",
-                          name, data["heater_temp"], target, duty)
+                _log.warning("[CONTROL] 恒温闭环跳过：加热槽温度无有效读数")
+        else:
+            target = store.target_temp()
+            duty = services.pid.update(target, heater_temp, store.period())
+            act = heater_action(duty)
+            if act != plant.heater_state:
+                plant.heater_control(act)
+                name = "开启加热" if act == "on" else "关闭加热"
+                database.insert_control_log(f"heater_{act}", "success",
+                                            f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)",
+                                            operator=None, source="auto")
+                if DEBUG_ENABLE:
+                    _log.info("[CONTROL] 恒温闭环 → %s (heater_temp=%.2f target=%.1f duty=%.0f%%)",
+                              name, heater_temp, target, duty)
 
     # 数据入库(任务三：持久化)；设备不支持的通道写 NULL
     database.insert_water_sensor(
@@ -70,6 +76,7 @@ def run_cycle() -> None:
         data.get("flow_rate"), data.get("pressure"),
         data.get("pump_state") or "unknown", data.get("heater_state"),
         data.get("total_flow"), data.get("pump_target"),
+        data.get("light"),
     )
 
     # 告警检查(任务六异常告警)：仅检查设备实际支持的通道
@@ -98,10 +105,14 @@ def run_cycle() -> None:
         judge.feedback("ok", {"pump_state": plant.pump_state, "heater_state": plant.heater_state})
 
     if DEBUG_ENABLE:
-        _log.info("[SENSOR] flow=%s L/min total=%s L pump=%s target=%.2f online=%s%s",
+        _log.info("[SENSOR] flow=%s L/min total=%s L pump=%s target=%.2f online=%s "
+                  "t1=%s℃ t2=%s℃ p=%s kPa heater=%s lv=%s%% lx=%s%s",
                   _fmt(data.get("flow_rate")), _fmt(data.get("total_liters"), 3),
                   data.get("pump_state"), float(data.get("pump_target") or 0.0),
                   data.get("sensor_online"),
+                  _fmt(data.get("storage_temp")), _fmt(data.get("heater_temp")),
+                  _fmt(data.get("pressure"), 1), data.get("heater_state"),
+                  _fmt(data.get("level_heater"), 1), _fmt(data.get("light"), 1),
                   f" err={data.get('last_error')}" if data.get("last_error") else "")
 
 

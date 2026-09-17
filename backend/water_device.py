@@ -1,16 +1,23 @@
 """水循环设备模型（纯真实模式）：通过 HTTP 读写现场 ESP32 采集端。
 
 分层（业务层与底层解耦）：
-    业务层(api / main / alarm) 只调用 read / pump_control / set_pump_target / reset_volume；
+    业务层(api / main / alarm) 只调用 read / pump_control / heater_control / set_pump_target / reset_volume；
     HTTP 细节封装在 esp32_client.Esp32Client。
 
-现场固件《YF-S401 水流量检测》实际提供的通道：
-    瞬时流量 flow_rate(L/min)、累计水量 total_liters(L)、水泵 pump、定量目标 pump_target(L)、
+现场固件 web_server.cpp 实际提供的通道：
+    瞬时流量 flow_rate(L/min)、累计水量 total_liters(L)、水温×2(探头1→储水槽、探头2→加热槽)、
+    压力(固件 MPa，统一换算 kPa)、水泵 pump、加热继电器 heater、定量目标 pump_target(L)、
     上一窗口脉冲数 pulses / 窗口时长 window_ms、设备健康(IP/RSSI/运行时长)。
+    以上通道固件在 /api/data 一次全部带回，无需逐个请求。
+    另有：超声波液位 /api/level(单路，接加热槽，返回百分比)、光照 /api/light(lx)，
+    这两个通道每周期单独请求。
 
-温度、压力、加热通道由 config.DEVICE_FEATURES 声明；当前固件不支持，对应字段恒为 None，
-前端据此显示“设备不支持”，系统不会生成任何模拟值。
-设备离线时字段置 None 并置 sensor_online=False，由前端提示“设备离线”。
+温度/压力/加热/光照通道由 config.DEVICE_FEATURES 声明开关；关闭时对应字段恒为 None，
+前端据此显示"设备不支持"。读数无效（tempOk/pressureOk 为 False 或 503）时为 None，
+系统不生成任何模拟值。设备离线时字段置 None 并置 sensor_online=False，由前端提示"设备离线"。
+
+液位通道（双水槽）：仅加热槽接超声波传感器，未接入的槽位水位恒为 0；
+设备离线后两槽水位统一归 0，同样不做任何模拟。
 """
 import threading
 import time
@@ -25,7 +32,7 @@ def _clamp(percent: float) -> float:
 
 
 class WaterPlant:
-    """单套水循环设备：1 路流量 + 累计水量 + 水泵控制（按 DEVICE_FEATURES 可扩展）。"""
+    """单套水循环设备：流量/水量/水温×2/压力/水泵/加热（按 DEVICE_FEATURES 可裁剪）。"""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -37,14 +44,16 @@ class WaterPlant:
         self.pump_target: float = 0.0
         self.pulses: int | None = None        # 上一窗口脉冲数
         self.window_ms: float | None = None   # 上一窗口时长(ms)，固件用 lastUpdateMs 返回
-        # 设备未提供的通道，恒为 None（不模拟）
-        self.temperature: float | None = None
-        self.pressure: float | None = None
-        self.heater_state: str | None = None
-        # 液位通道（双水槽）：传感器尚未接入，先用模拟值（界面会标注"模拟"）
-        self.level_storage: float = _clamp(config.SIM_LEVEL_STORAGE_INITIAL)
-        self.level_heater: float = _clamp(config.SIM_LEVEL_HEATER_INITIAL)
-        self._last_level_ts = time.time()
+        # 温度/压力/加热通道（/api/data 一次带回；离线或读数无效时为 None）
+        self.storage_temp: float | None = None   # 探头1 → 储水槽水温℃
+        self.heater_temp: float | None = None    # 探头2 → 加热槽水温℃
+        self.pressure: float | None = None       # 水压 kPa（固件 MPa × 1000）
+        self.heater_state: str | None = None     # on / off / None(未知)
+        # 液位通道（双水槽）：仅加热槽接超声波传感器；未接入的槽位恒为 0，不做任何模拟
+        self.level_storage: float = 0.0
+        self.level_heater: float = 0.0
+        # 光照通道（/api/light，lx；GY-302 未识别时固件 503 → None）
+        self.light: float | None = None
         # 链路状态
         self.sensor_online = False
         self.last_error = ""
@@ -64,19 +73,17 @@ class WaterPlant:
                 payload = self.client.data()
             except DeviceError as exc:
                 self._mark_failed(str(exc))
-                # 模拟水位是本地生成的，不应因设备掉线而冻结，否则界面动画会"卡死"
-                self._update_levels()
                 return self.status()
             self._apply(payload)
 
-            # 温度通道：仅当固件声明支持时读取（当前固件不支持，恒为 None）
-            if config.DEVICE_FEATURES.get("temperature"):
-                try:
-                    self.temperature = self.client.temperature()
-                except DeviceError:
-                    self.temperature = None
-
             self._update_levels()
+
+            # 光照：独立接口 /api/light（GY-302 未识别时 503 → None；网络异常保留上次读数）
+            if config.DEVICE_FEATURES.get("light"):
+                try:
+                    self.light = self.client.light()
+                except DeviceError:
+                    pass
 
             # 设备健康信息（IP/RSSI/运行时长）按较低频率刷新，减少设备连接压力
             now = time.time()
@@ -89,22 +96,34 @@ class WaterPlant:
             return self.status()
 
     def _update_levels(self) -> None:
-        """更新双水槽液位：已接入的读真实传感器，未接入的走模拟。
+        """更新双水槽液位：仅读取已接入传感器的槽位。
 
-        模拟部分与设备通信解耦——设备掉线时水位仍按"无水流"继续演化，
-        避免动画冻结。调用方需已持有 self._lock。
+        未接入的通道（DEVICE_FEATURES 为 False / LEVEL_PATH 为空）恒为 0，
+        不做任何模拟。调用方需已持有 self._lock。
         """
-        need_sim = False
         for tank in config.TANKS:
             if config.DEVICE_FEATURES.get(f"level_{tank}"):
                 self._read_level(tank)
-            else:
-                need_sim = True
-        if need_sim:
-            self._simulate_levels()
+
+    @staticmethod
+    def _valid(value, ok_flag) -> float | None:
+        """读数有效性判定：ok 位为 False 或数值非法时返回 None（不伪造数据）。
+
+        ok_flag 缺失(None)时视为有效，仅按数值能否解析判断。
+        """
+        if ok_flag is False:
+            return None
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return None
 
     def _apply(self, payload: dict) -> None:
-        """把 /api/data 原始字段标准化到实例属性。"""
+        """把 /api/data 原始字段标准化到实例属性。
+
+        温度/压力/加热通道按 DEVICE_FEATURES 裁剪；固件在 /api/data 一次带回全部字段，
+        无需逐通道发请求（tempOk/tempOk2/pressureOk 为读数质量位）。
+        """
         self.flow_rate = self.client._as_float(payload.get("flowRate"))
         self.total_liters = self.client._as_float(payload.get("totalLiters"))
         self.pump_target = self.client._as_float(payload.get("pumpTarget")) or 0.0
@@ -113,6 +132,19 @@ class WaterPlant:
         pump = payload.get("pump")
         if isinstance(pump, bool):
             self.pump_state = "on" if pump else "off"
+        # 温度×2：探头1→储水槽，探头2→加热槽
+        if config.DEVICE_FEATURES.get("temperature"):
+            self.storage_temp = self._valid(payload.get("temperature"), payload.get("tempOk"))
+            self.heater_temp = self._valid(payload.get("temperature2"), payload.get("tempOk2"))
+        # 压力：固件单位 MPa，统一换算为 kPa 入库与展示
+        if config.DEVICE_FEATURES.get("pressure"):
+            pressure_mpa = self._valid(payload.get("pressure"), payload.get("pressureOk"))
+            self.pressure = round(pressure_mpa * 1000.0, 3) if pressure_mpa is not None else None
+        # 加热继电器状态
+        if config.DEVICE_FEATURES.get("heater"):
+            heater = payload.get("heater")
+            if isinstance(heater, bool):
+                self.heater_state = "on" if heater else "off"
         # 流量读取成功即视为在线
         self.sensor_online = True
         self.last_error = ""
@@ -128,19 +160,36 @@ class WaterPlant:
             self.pump_state = "unknown"
             self.pulses = None
             self.window_ms = None
-            self.temperature = None
-            # 液位为本地模拟值，与设备通信无关，离线时保留不置空
+            self.storage_temp = None
+            self.heater_temp = None
+            self.pressure = None
+            self.heater_state = None
+            self.light = None
+            # 液位无数据一律归 0（不做模拟，也不保留旧值），界面同时提示设备离线
+            self.level_storage = 0.0
+            self.level_heater = 0.0
 
     def _read_level(self, tank: str) -> None:
-        """读取指定水槽的真实液位传感器（传感器接入后启用）。支持 % 与 cm/mm 两种单位。"""
+        """读取指定水槽的液位传感器。支持 % 与 cm/mm 两种单位。
+
+        无数据一律归 0（用户要求：清除模拟数据，没有数据就保持 0）：
+          - 未配置传感器路径     → 0（该槽无数据来源，界面标注「无传感器」）
+          - 通道返回 503/404     → 0（传感器异常或通道缺失，属实无有效读数）
+          - 网络异常(DeviceError) → 保留上次读数，避免单次丢包造成水位闪烁；
+                                   持续离线由 _mark_failed 归 0
+        """
         path = (config.LEVEL_PATH_STORAGE if tank == "storage" else config.LEVEL_PATH_HEATER)
+        if not path:
+            setattr(self, f"level_{tank}", 0.0)
+            return
         height = (config.TANK_HEIGHT_CM_STORAGE if tank == "storage"
                   else config.TANK_HEIGHT_CM_HEATER)
         try:
             payload = self.client.level(path)
         except DeviceError:
-            payload = None
+            return
         if not payload or payload.get("value") is None:
+            setattr(self, f"level_{tank}", 0.0)
             return
         value = float(payload["value"])
         unit = payload.get("unit")
@@ -151,57 +200,6 @@ class WaterPlant:
             if height > 0:
                 value = value / height * 100.0
         setattr(self, f"level_{tank}", _clamp(value))
-
-    def _simulate_levels(self) -> None:
-        """模拟双水槽液位（传感器未接入时使用，仅演示用，非真实液位）。
-
-        按「水量守恒」模拟一套闭合水循环：
-          水泵运行(有流量) → 把水从储水槽送到加热槽，储水槽保留 SIM_LEVEL_STORAGE_MIN
-                             作为最低水位（防抽干），两槽都不越界；
-          水泵停止         → 两槽通过回路缓慢回平（水位差按比例收敛）。
-        dt 单步上限 2s，防止长时间暂停后一步跳变。
-        只对「未接入真实传感器」的水槽生效；已接入的一侧保持实测值，并参与守恒计算。
-        """
-        now = time.time()
-        dt = min(now - self._last_level_ts, 2.0)
-        self._last_level_ts = now
-
-        sim_storage = not config.DEVICE_FEATURES.get("level_storage")
-        sim_heater = not config.DEVICE_FEATURES.get("level_heater")
-        if not (sim_storage or sim_heater) or dt <= 0:
-            return
-
-        storage, heater = self.level_storage, self.level_heater
-        flow = float(self.flow_rate or 0.0)
-
-        if flow > 0.1:
-            ref = config.SIM_LEVEL_FLOW_REF
-            speed = min(2.0, flow / ref) if ref > 0 else 1.0
-            move = config.SIM_LEVEL_TRANSFER_PER_S * speed * dt
-            # 受限于：储水槽不抽干、加热槽不满溢
-            if sim_storage:
-                move = min(move, max(0.0, storage - config.SIM_LEVEL_STORAGE_MIN))
-            if sim_heater:
-                move = min(move, max(0.0, 100.0 - heater))
-            if sim_storage:
-                storage -= move
-            if sim_heater:
-                heater += move
-        else:
-            # 停机后两槽缓慢回平（只搬动模拟侧的水）
-            balance = (storage - heater) * config.SIM_LEVEL_BALANCE_RATE * dt
-            if sim_storage and not sim_heater:
-                storage -= balance          # 加热槽为实测值，只调整储水槽
-            elif sim_heater and not sim_storage:
-                heater += balance
-            elif sim_storage and sim_heater:
-                storage -= balance / 2.0
-                heater += balance / 2.0
-
-        if sim_storage:
-            self.level_storage = _clamp(storage)
-        if sim_heater:
-            self.level_heater = _clamp(heater)
 
     def status(self) -> dict:
         """返回当前缓存状态的标准化字典（不发起网络请求）。"""
@@ -214,15 +212,16 @@ class WaterPlant:
                 "pump_target": self.pump_target,
                 "pulses": self.pulses,
                 "window_ms": self.window_ms,
-                # 液位通道（双水槽；当前为模拟值，传感器接入后自动切真实值）
+                # 液位通道（双水槽；仅加热槽为超声波实测，未接入或无数据时恒为 0）
                 "level_storage": round(self.level_storage, 2),
                 "level_heater": round(self.level_heater, 2),
-                # 以下通道当前固件不支持，恒为 None
-                "storage_temp": None,
-                "heater_temp": None,
-                "temperature": self.temperature,
+                # 温度/压力/加热/光照通道（离线或读数无效时为 None）
+                "temperature": self.storage_temp,   # 兼容旧字段名：探头1=储水槽水温
+                "storage_temp": self.storage_temp,
+                "heater_temp": self.heater_temp,
                 "pressure": self.pressure,
                 "heater_state": self.heater_state,
+                "light": self.light,
                 # 链路
                 "sensor_online": self.sensor_online,
                 "last_error": self.last_error,
@@ -270,10 +269,31 @@ class WaterPlant:
             self._last_ok_ts = time.time()
 
     def heater_control(self, action: str) -> None:
-        """加热模块开关：当前固件无加热通道，直接报错（保留接口以便固件升级后启用）。"""
+        """加热模块开关：action 为 on / off / toggle。
+
+        指令下发后回读设备真实状态，保证界面显示与硬件一致；
+        通信失败直接抛出 DeviceError，由接口层返回 40003（不伪造成功）。
+        """
         if not config.DEVICE_FEATURES.get("heater"):
             raise DeviceError("当前采集设备不支持加热模块控制")
-        raise DeviceError("加热控制尚未实现：请先确认固件接口路径")
+        if action not in ("on", "off", "toggle"):
+            raise DeviceError(f"不支持的加热指令: {action}")
+        with self._lock:
+            if action == "on":
+                payload = self.client.heater_on()
+            elif action == "off":
+                payload = self.client.heater_off()
+            else:
+                payload = self.client.heater_toggle()
+            # 优先用指令回包，回包无布尔值时回读一次真实状态
+            state = payload.get("heater")
+            if not isinstance(state, bool):
+                state = self.client.heater_state()
+            if isinstance(state, bool):
+                self.heater_state = "on" if state else "off"
+            self.sensor_online = True
+            self.last_error = ""
+            self._last_ok_ts = time.time()
 
     # ---------- 定量浇水 ----------
     def set_pump_target(self, liters: float) -> float:

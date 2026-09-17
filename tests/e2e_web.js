@@ -322,9 +322,17 @@ async function main() {
     const cols = await cdp.eval(
       "return ['.ck-kpi','.ck-loop','.ck-ops'].map(s => Math.round(__e2e.q(s).getBoundingClientRect().left));");
     check("三栏自左向右排列且不重叠", cols[0] < cols[1] && cols[1] < cols[2], JSON.stringify(cols));
-    check("KPI 卡片 4 张", (await cdp.eval("return __e2e.count('.kpi-card');")) === 4,
+    // KPI/操作卡数量随固件能力动态变化：基础3张(流量/累计/设备；水泵状态由顶部开关与回路图表达)
+    // + 温度×2(features.temperature) + 压力×1(features.pressure) + 光照×1(features.light)
+    const featE2e = (await api("GET", "/api/water/realtime")).data?.features || {};
+    const kpiExpected = 3 + (featE2e.temperature ? 2 : 0) + (featE2e.pressure ? 1 : 0)
+        + (featE2e.light ? 1 : 0);
+    check(`KPI 卡片 ${kpiExpected} 张(按固件能力)`, (await cdp.eval("return __e2e.count('.kpi-card');")) === kpiExpected,
           "实际 " + await cdp.eval("return __e2e.count('.kpi-card');"));
-    check("操作卡 3 张(定量/最近操作/更多)", (await cdp.eval("return __e2e.count('.op-card');")) === 3);
+    // 操作卡：基础3张(定量/最近操作/更多) + PID恒温闭环卡(pid_supported 且有 cfg_alarm 权限)
+    const pidSupportedE2e = (await api("GET", "/api/water/system")).data?.pid_supported || false;
+    const opsExpected = 3 + (pidSupportedE2e ? 1 : 0);
+    check(`操作卡 ${opsExpected} 张(定量/PID/最近操作/更多)`, (await cdp.eval("return __e2e.count('.op-card');")) === opsExpected);
 
     // —— 循环回路 ——
     check("回路 SVG 1 个（两槽合并为一张整体图）", (await cdp.eval("return __e2e.count('.loop-svg');")) === 1);
@@ -345,7 +353,10 @@ async function main() {
 
     const pcts = await cdp.eval("return __e2e.qa('.tank-pct').map(e => e.textContent.trim());");
     check("水位百分比文本已渲染", pcts.length === 2 && pcts.every((t) => /^\d{1,3}%$/.test(t)), JSON.stringify(pcts));
-    check("模拟水槽带「模拟」角标", (await cdp.eval("return __e2e.count('.tank-sim-tag');")) >= 1);
+    // 未接入传感器的槽位（储水槽）不带任何模拟值：水位显示 0 并标注「无传感器」
+    const tankTags = await cdp.eval("return __e2e.qa('.tank-tag').map(e => e.textContent.trim());");
+    check("未接传感器的水槽带「无传感器」角标", tankTags.includes("无传感器"), JSON.stringify(tankTags));
+    check("无数据槽位水位显示 0%", pcts.includes("0%"), JSON.stringify(pcts));
     const waterH = await cdp.eval(
       "return __e2e.qa('.loop-svg rect[fill^=\"url\"]').map(r => parseFloat(r.getAttribute('height')));");
     check("两槽水高均在 0~350 之间", waterH.length === 2 && waterH.every((h) => h >= 0 && h <= 350), JSON.stringify(waterH));

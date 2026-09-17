@@ -1,8 +1,7 @@
 """水循环异常告警引擎：按阈值检查各采集通道，超限/恢复自动入库并更新活跃态。
 
-通道由 config.DEVICE_FEATURES 决定：当前现场固件只有流量通道，
-故仅「水流量」参与告警；温度/压力通道的检查项已保留，
-待对应固件通道启用（DEVICE_FEATURES 置 True）后自动生效，无需改本文件。
+通道由 config.DEVICE_FEATURES 决定：流量/温度×2/压力/光照通道均已启用；
+后续新增通道只需在 CHANNELS 加一行并在 DEVICE_FEATURES 声明能力即可，无需改检查逻辑。
 
 阈值在"系统配置"页可改，存数据库 config 表覆盖 config.py 默认值。
 读数无效（None，即设备离线或该通道无数据）时不产生告警，避免误报。
@@ -19,6 +18,7 @@ CHANNELS = (
     ("storage_temp", "储水槽温度", "storage_temp_max", "storage_temp_min", "temperature"),
     ("heater_temp",  "加热槽温度", "heater_temp_max",  "heater_temp_min",  "temperature"),
     ("pressure",     "水压",       "pressure_max",     "pressure_min",     "pressure"),
+    ("light",        "光照",       "light_max",        "light_min",        "light"),
 )
 
 
