@@ -1,9 +1,11 @@
-"""自定义传感器通道管理器（全链路）。
+"""自定义传感器通道管理器（全链路，卡片即声明）。
 
-前端在系统配置页声明通道（名称/URL/取值路径/轮询周期/单位）存 config 表 sys.custom_channels；
-本管理器在采集循环中按各通道周期轮询 JSON 取值：
+实时监控页的「自定义接口卡」本身就是声明：卡片 source.kind == "custom" 时携带
+url / path / period（不再有独立的通道声明表，系统配置页也不再重复填一遍）。
+本管理器直接从仪表盘布局派生通道，在采集循环中按各通道周期轮询 JSON 取值：
   值有效 → 写入 realtime 快照（卡片/联动用）并入库 custom_sensor_data 表（历史/统计用）；
   无数据（取不到/接口失败）→ 跳过，不入库不做模拟。
+通道 id 使用卡片 id，历史曲线 / 统计 / 联动均按它索引。
 """
 import json
 import threading
@@ -17,9 +19,32 @@ import store
 
 
 def load_channels() -> list[dict]:
-    """读取声明的自定义通道；过滤缺字段的无效项。"""
-    ch = store.get_json("custom_channels", [])
-    return [c for c in ch if isinstance(c, dict) and c.get("id") and c.get("url") and c.get("path")]
+    """从仪表盘布局派生自定义通道（卡片即声明）；过滤缺字段的无效卡片。"""
+    try:
+        layout = store.get_json("dashboard_layout", None)
+    except Exception:  # noqa: BLE001
+        layout = None
+    widgets = (layout or {}).get("widgets") if isinstance(layout, dict) else None
+    out: list[dict] = []
+    for w in widgets or []:
+        if not isinstance(w, dict):
+            continue
+        src = w.get("source") or {}
+        if src.get("kind") != "custom":
+            continue
+        cid = str(w.get("id") or "").strip()
+        url = str(src.get("url") or "").strip()
+        path = str(src.get("path") or "").strip()
+        if not cid or not url or not path:
+            continue
+        try:
+            period = float(src.get("period") or 5)
+        except (TypeError, ValueError):
+            period = 5.0
+        out.append({"id": cid, "name": str(w.get("title") or cid),
+                    "unit": str(w.get("unit") or ""), "url": url, "path": path,
+                    "period": period})
+    return out
 
 
 def _fetch_value(url: str, path: str):

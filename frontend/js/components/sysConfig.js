@@ -12,11 +12,9 @@ window.ViewSysConfig = {
       system: {},
       // 界面文案（站点标题/副标题/浏览器标签标题）
       siteCopy: { title: "", subtitle: "", browser: "" },
-      // 报警联动（v2 个体化）：执行器档案 + 规则（触发源/阈值/动作/恢复动作）
+      // 报警联动（v3 卡片即来源）：触发源与动作都直接选自实时监控页的卡片
       links: [],
-      actuators: [],
-      customDecls: [],         // 自定义传感器通道声明（全链路：轮询入库+历史统计+联动）
-      linkChannels: [],        // 可选本机触发通道 [{key,label}]，按 features 裁剪
+      cards: [],               // 实时监控页的卡片（内置 + 自建），联动选择项的唯一来源
       // 账号
       users: [],
       roles: [],
@@ -28,6 +26,18 @@ window.ViewSysConfig = {
   },
   mounted() {
     this.load();
+  },
+  computed: {
+    /* 可作触发源的卡片：数值卡 / 迷你曲线 / 趋势曲线 / 单水槽卡（水槽取 percent） */
+    sourceCards() {
+      const ok = ["value", "spark", "line", "tank"];
+      return this.cards.filter((c) => ok.indexOf(c.type) !== -1 && c.source && c.source.kind);
+    },
+    /* 可作动作目标的卡片：控制开关卡（内置泵/加热或自定义指令）+ 定量浇水卡 */
+    targetCards() {
+      return this.cards.filter((c) => c.type === "control"
+        || (c.type === "builtin" && c.builtin === "quant"));
+    },
   },
   methods: {
     perm(p) { return window.Auth ? window.Auth.has(p) : false; },
@@ -47,21 +57,18 @@ window.ViewSysConfig = {
       } catch (e) { /* silent */ }
       try { this.system = await API.system(); this.period = this.system.period || 1.0; } catch (e) { /* silent */ }
       if (this.system.features) this.features = this.system.features;
-      // 联动通道按设备能力裁剪（与告警引擎 CHANNELS 一致）
-      const lc = [{ key: "flow_rate", label: "水流量" }];
-      if (this.features.temperature) lc.push({ key: "storage_temp", label: "储水槽温度" }, { key: "heater_temp", label: "加热槽温度" });
-      if (this.features.pressure) lc.push({ key: "pressure", label: "水压" });
-      if (this.features.light) lc.push({ key: "light", label: "光照" });
-      this.linkChannels = lc;
-      if (this.perm("cfg_alarm")) {
-        try {
-          const ld = await API.alarmLinksGet();
-          this.links = ld.links || [];
-          this.actuators = ld.actuators || [];
-        } catch (e) { /* silent */ }
+      // 联动选择项来源 = 实时监控页的卡片（内置 + 自建）；布局从未保存时用前端默认布局
+      try {
+        const saved = (await API.dashboardLayoutGet()).layout;
+        this.cards = (saved && Array.isArray(saved.widgets) && saved.widgets.length)
+          ? saved.widgets : window.Widgets.defaultLayout(this.features || {});
+      } catch (e) {
+        try { this.cards = window.Widgets.defaultLayout(this.features || {}); }
+        catch (e2) { this.cards = []; }
       }
-      try { this.customDecls = (await API.customChannelsGet()).channels || []; }
-      catch (e) { /* silent */ }
+      if (this.perm("cfg_alarm")) {
+        try { this.links = (await API.alarmLinksGet()).links || []; } catch (e) { /* silent */ }
+      }
       try { this.siteCopy = Object.assign(this.siteCopy, await API.siteGet()); }
       catch (e) { /* silent */ }
       const caps = this.system.tank_capacities;
@@ -125,50 +132,44 @@ window.ViewSysConfig = {
         alert("水槽容积已保存（实时水位界面即时生效）");
       } catch (e) { alert(e.message); }
     },
-    // ---------- 报警联动（v2 个体化） ----------
-    channelLabel(key) {
-      const c = this.linkChannels.find((x) => x.key === key);
-      return c ? c.label : key;
+    // ---------- 报警联动（v3 卡片即来源） ----------
+    cardById(id) { return this.cards.find((c) => c.id === id) || null; },
+    cardTitle(id) { const c = this.cardById(id); return c ? (c.title || c.id) : (id || "?"); },
+    /* 卡片当前数据源快照：保存规则时一并落库，卡片被删后规则仍可兜底运行 */
+    sourceOf(card) {
+      const s = (card && card.source) || {};
+      return { kind: s.kind, url: s.url || "", path: s.path || "", period: s.period || 5 };
     },
-    actionLabel(t) {
-      return { off_pump: "关本机水泵", off_heater: "关本机加热", cancel_target: "取消定量", actuator: "执行器" }[t] || t;
+    /* 卡片当前动作快照：自定义指令 URL → url；内置泵/加热 → pump/heater；定量卡 → quant */
+    actionOf(card, state) {
+      const st = state === "on" ? "on" : "off";
+      const cmd = (card && card.cmd) || {};
+      const url = st === "on" ? (cmd.on || "") : (cmd.off || "");
+      if (url) return { card: card.id, state: st, kind: "url", url };
+      if (card && card.builtin === "quant") return { card: card.id, state: "off", kind: "quant", url: "" };
+      return { card: card.id, state: st, kind: (card && card.ctl === "heater") ? "heater" : "pump", url: "" };
     },
-    actuatorName(id) {
-      const a = this.actuators.find((x) => x.id === id);
-      return a ? a.name : (id || "?");
+    actionText(a) {
+      const t = this.cardTitle(a.card);
+      if (a.kind === "quant") return t + " · 取消定量";
+      return t + " · " + (a.state === "on" ? "开" : "关");
     },
-    // 执行器档案
-    addActuator() {
-      this.actuators.push({ id: "a" + Date.now().toString(36), name: "", on_url: "", off_url: "" });
-    },
-    delActuator(i) {
-      if (!confirm("删除该执行器档案？引用它的联动规则保存时会报错。")) return;
-      this.actuators.splice(i, 1);
-    },
-    async saveActuators() {
-      for (const a of this.actuators) {
-        if (!a.name.trim()) { alert("执行器名称不能为空"); return; }
-        const on = (a.on_url || "").trim(), off = (a.off_url || "").trim();
-        if (!on && !off) { alert(`执行器[${a.name}] 开/关指令 URL 至少填一条`); return; }
-        for (const u of [on, off]) {
-          if (u && !/^https?:\/\//.test(u)) { alert("指令 URL 需以 http:// 或 https:// 开头"); return; }
-        }
-      }
-      try {
-        const d = await API.alarmActuatorsSet(JSON.parse(JSON.stringify(this.actuators)));
-        this.actuators = d.actuators || [];
-        alert("执行器档案已保存");
-      } catch (e) { alert(e.message); }
+    /* 换卡片或换开/关后，按卡片当前配置重新生成动作（指令 URL 随之更新） */
+    syncAction(a) {
+      const card = this.cardById(a.card);
+      if (card) Object.assign(a, this.actionOf(card, a.state));
     },
     // 联动规则
     addLink() {
+      const src = this.sourceCards[0];
+      const tgt = this.targetCards[0];
       this.links.push({
         id: "r" + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36),
         name: "", enabled: true,
-        sensor: { kind: "builtin", channel: (this.linkChannels[0] || {}).key || "flow_rate",
-                  url: "", path: "", period: 5 },
+        source_card: src ? src.id : "",
+        source: this.sourceOf(src),
         threshold: 0, direction: "above",
-        actions: [{ type: "off_pump" }],
+        actions: tgt ? [this.actionOf(tgt, "off")] : [],
         recover: { actions: [] },
       });
     },
@@ -177,14 +178,9 @@ window.ViewSysConfig = {
       this.links.splice(i, 1);
     },
     addAction(actions, e) {
-      const t = e.target.value;
-      if (!t) return;
-      if (t === "actuator") {
-        if (!this.actuators.length) { alert("请先在上方「执行器档案」中添加执行器"); e.target.value = ""; return; }
-        actions.push({ type: "actuator", actuator: this.actuators[0].id, state: "off" });
-      } else {
-        actions.push({ type: t });
-      }
+      const card = this.cardById(e.target.value);
+      if (!card) { e.target.value = ""; return; }
+      actions.push(this.actionOf(card, "off"));
       e.target.value = "";
     },
     delAction(actions, j) {
@@ -192,23 +188,28 @@ window.ViewSysConfig = {
     },
     async saveLinks() {
       for (const l of this.links) {
-        if (isNaN(Number(l.threshold))) { alert(`规则[${l.name || l.id}] 阈值必须为数值`); return; }
-        if (l.sensor.kind === "custom") {
-          if (!/^https?:\/\//.test((l.sensor.url || "").trim())) { alert("自定义传感器 URL 需以 http:// 或 https:// 开头"); return; }
-          if (!(l.sensor.path || "").trim()) { alert("自定义传感器必须填写取值路径"); return; }
+        const card = this.cardById(l.source_card);
+        if (!card) { alert(`规则[${l.name || l.id}] 的触发源卡片不存在，请重新选择`); return; }
+        Object.assign(l, { source: this.sourceOf(card) });   // 以卡片当前配置为准
+        if (l.source.kind === "custom" && !/^https?:\/\//.test((l.source.url || "").trim())) {
+          alert(`触发源卡片[${this.cardTitle(card.id)}] 未配置接口 URL`); return;
         }
-        for (const a of [...l.actions, ...(l.recover.actions || [])]) {
-          if (a.type === "actuator" && !this.actuators.some((x) => x.id === a.actuator)) {
-            alert("动作引用的执行器不存在，请先保存执行器档案"); return;
+        if (isNaN(Number(l.threshold))) { alert(`规则[${l.name || l.id}] 阈值必须为数值`); return; }
+        if (l.direction !== "above" && l.direction !== "below") { alert(`规则[${l.name || l.id}] 触发方向非法`); return; }
+        const acts = [...(l.actions || []), ...((l.recover || {}).actions || [])];
+        if (!acts.length) { alert(`规则[${l.name || l.id}] 至少配置一个动作`); return; }
+        for (const a of acts) {
+          const c = this.cardById(a.card);
+          if (!c) { alert(`规则[${l.name || l.id}] 的动作卡片不存在，请重新选择`); return; }
+          Object.assign(a, this.actionOf(c, a.state));      // 以卡片当前配置为准
+          if (a.kind === "url" && !a.url) {
+            alert(`卡片[${this.cardTitle(c.id)}] 未配置${a.state === "on" ? "开" : "关"}指令 URL`); return;
           }
         }
       }
       try {
-        // 先保存执行器档案（规则引用它），再保存规则
-        await API.alarmActuatorsSet(JSON.parse(JSON.stringify(this.actuators)));
         const d = await API.alarmLinksSet(JSON.parse(JSON.stringify(this.links)));
         this.links = d.links || [];
-        this.actuators = (await API.alarmLinksGet()).actuators || [];
         alert("报警联动已保存");
       } catch (e) { alert(e.message); }
     },
@@ -225,30 +226,6 @@ window.ViewSysConfig = {
         }
         document.title = s.browser || s.title;
         alert("界面文案已保存（顶栏与浏览器标签即时生效）");
-      } catch (e) { alert(e.message); }
-    },
-    // ---------- 自定义传感器通道（全链路声明） ----------
-    addCustomDecl() {
-      this.customDecls.push({
-        id: "c" + Date.now().toString(36), name: "", unit: "",
-        url: "", path: "value", period: 5,
-      });
-    },
-    delCustomDecl(i) {
-      if (!confirm("删除该自定义通道？其历史数据将保留但不再采集与展示。")) return;
-      this.customDecls.splice(i, 1);
-    },
-    async saveCustomDecls() {
-      for (const c of this.customDecls) {
-        if (!c.name.trim()) { alert("通道名称不能为空"); return; }
-        if (!/^https?:\/\//.test((c.url || "").trim())) { alert("接口 URL 需以 http:// 或 https:// 开头"); return; }
-        if (!(c.path || "").trim()) { alert("取值路径不能为空"); return; }
-        if (!(Number(c.period) >= 2)) { alert("轮询周期须 ≥2 秒"); return; }
-      }
-      try {
-        const d = await API.customChannelsSet(JSON.parse(JSON.stringify(this.customDecls)));
-        this.customDecls = d.channels || [];
-        alert("自定义传感器通道已保存（采集循环已按新声明轮询，历史/统计/联动即时可用）");
       } catch (e) { alert(e.message); }
     },
     async createUser() {
@@ -423,56 +400,22 @@ window.ViewSysConfig = {
       </div>
     </div>
 
-    <!-- 报警联动（v2 个体化）：哪个传感器的阈值 → 触发哪个执行器 -->
+    <!-- 报警联动（v3 卡片即来源）：触发源与动作都直接选自实时监控页的卡片 -->
     <div class="section" v-show="tab==='alarm'" style="margin-top:14px;">
-      <h3>报警联动 <span class="desc">哪个传感器的阈值触发哪个执行器 · 越限沿触发，回正常沿可选恢复</span></h3>
-
-      <!-- 执行器档案 -->
-      <div class="alarm-rule" style="font-weight:600;">执行器档案
-        <span class="desc" style="font-weight:400;">外部装置个体（如水阀/外接泵）：名称 + 开/关指令 URL，规则动作里按名称引用</span>
-      </div>
-      <div v-for="(a, i) in actuators" :key="a.id" class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
-        <input v-model="a.name" placeholder="名称(如 水阀1)" style="width:120px;" :disabled="!perm('cfg_alarm')">
-        <input v-model="a.on_url" placeholder="开指令 GET URL(可空)" style="width:250px;" :disabled="!perm('cfg_alarm')">
-        <input v-model="a.off_url" placeholder="关指令 GET URL(可空)" style="width:250px;" :disabled="!perm('cfg_alarm')">
-        <button class="btn-ghost danger" :disabled="!perm('cfg_alarm')" @click="delActuator(i)">删除</button>
-      </div>
-      <div class="alarm-rule" style="margin-top:6px;">
-        <button class="btn-ghost" :disabled="!perm('cfg_alarm')" @click="addActuator">+ 添加执行器</button>
-        <button class="btn-ghost" :disabled="!perm('cfg_alarm') || !actuators.length" @click="saveActuators">保存执行器档案</button>
-        <span class="desc">指令经后端代理 GET 下发（仅白名单主机）并写入操作日志。</span>
-      </div>
+      <h3>报警联动 <span class="desc">触发源与动作都选自实时监控页的卡片 · 越限沿触发，回正常沿可选恢复</span></h3>
 
       <!-- 联动规则 -->
       <div class="alarm-rule" style="font-weight:600;margin-top:16px;">联动规则
-        <span class="desc" style="font-weight:400;">每条规则自带阈值：触发源（本机传感器或自定义接口）越限沿执行动作，回正常沿执行恢复动作（可选）</span>
+        <span class="desc" style="font-weight:400;">每条规则自带阈值：选一张实时监控页的卡片作触发源，越限时执行选中的卡片动作</span>
       </div>
       <div v-for="(l, i) in links" :key="l.id" class="link-rule">
         <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
           <input v-model="l.name" placeholder="规则名(如 光照过强停泵)" style="width:170px;" :disabled="!perm('cfg_alarm')">
-          <select v-model="l.sensor.kind" :disabled="!perm('cfg_alarm')" title="触发源">
-            <option value="builtin">本机传感器</option>
-            <option value="channel">自定义通道</option>
-            <option value="custom">自定义接口</option>
+          <span class="desc">触发源</span>
+          <select v-model="l.source_card" :disabled="!perm('cfg_alarm')" title="触发源卡片（实时监控页）">
+            <option v-for="c in sourceCards" :key="c.id" :value="c.id">{{ c.title || c.id }}</option>
           </select>
-          <template v-if="l.sensor.kind === 'builtin'">
-            <select v-model="l.sensor.channel" :disabled="!perm('cfg_alarm')" title="本机通道">
-              <option v-for="c in linkChannels" :key="c.key" :value="c.key">{{ c.label }}</option>
-            </select>
-          </template>
-          <template v-else-if="l.sensor.kind === 'channel'">
-            <select v-model="l.sensor.channel_id" :disabled="!perm('cfg_alarm')" title="自定义通道">
-              <option v-for="c in customDecls" :key="c.id" :value="c.id">{{ c.name }}</option>
-            </select>
-            <span class="desc">阈值按该通道读数判定</span>
-          </template>
-          <template v-else>
-            <input v-model="l.sensor.url" placeholder="传感器 GET URL" style="width:230px;" :disabled="!perm('cfg_alarm')">
-            <input v-model="l.sensor.path" placeholder="取值路径 如 value" style="width:120px;" :disabled="!perm('cfg_alarm')">
-            <label class="rule-item" style="flex:none;gap:4px;">轮询
-              <input type="number" v-model.number="l.sensor.period" min="2" max="300" style="width:58px;" :disabled="!perm('cfg_alarm')">秒
-            </label>
-          </template>
+          <span class="desc" v-if="!sourceCards.length">实时监控页暂无可取数值的卡片</span>
           <label class="rule-item" style="flex:none;gap:4px;">启用
             <input type="checkbox" v-model="l.enabled" :disabled="!perm('cfg_alarm')">
           </label>
@@ -490,76 +433,49 @@ window.ViewSysConfig = {
           </label>
           <span class="desc">越限时执行：</span>
           <span v-for="(a, j) in l.actions" :key="'a'+j" class="badge ok" style="align-items:center;gap:5px;">
-            {{ a.type === 'actuator' ? '执行器[' + actuatorName(a.actuator) + '] ' + (a.state === 'on' ? '开' : '关') : actionLabel(a.type) }}
-            <template v-if="a.type === 'actuator'">
-              <select v-model="a.actuator" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;">
-                <option v-for="x in actuators" :key="x.id" :value="x.id">{{ x.name }}</option>
-              </select>
-              <select v-model="a.state" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;">
-                <option value="off">关</option><option value="on">开</option>
-              </select>
-            </template>
+            {{ actionText(a) }}
+            <select v-model="a.card" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option v-for="x in targetCards" :key="x.id" :value="x.id">{{ x.title || x.id }}</option>
+            </select>
+            <select v-if="a.kind !== 'quant'" v-model="a.state" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option value="off">关</option><option value="on">开</option>
+            </select>
             <button class="btn-ghost" style="padding:0 5px;font-size:11px;" :disabled="!perm('cfg_alarm')" @click="delAction(l.actions, j)">×</button>
           </span>
-          <select :disabled="!perm('cfg_alarm')" @change="addAction(l.actions, $event)">
+          <select :disabled="!perm('cfg_alarm') || !targetCards.length" @change="addAction(l.actions, $event)">
             <option value="">+ 添加动作</option>
-            <option value="off_pump">关本机水泵</option>
-            <option value="off_heater">关本机加热</option>
-            <option value="cancel_target">取消定量</option>
-            <option value="actuator">执行器(档案)</option>
+            <option v-for="x in targetCards" :key="'t'+x.id" :value="x.id">{{ x.title || x.id }}</option>
           </select>
+          <span class="desc" v-if="!targetCards.length">实时监控页暂无控制开关卡</span>
         </div>
         <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
           <span class="desc">恢复动作(可选，读数回正常时执行)：</span>
           <span v-for="(a, j) in l.recover.actions" :key="'r'+j" class="badge" style="align-items:center;gap:5px;background:var(--ok-soft);color:var(--ok);">
-            {{ a.type === 'actuator' ? '执行器[' + actuatorName(a.actuator) + '] ' + (a.state === 'on' ? '开' : '关') : actionLabel(a.type) }}
-            <template v-if="a.type === 'actuator'">
-              <select v-model="a.actuator" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;">
-                <option v-for="x in actuators" :key="x.id" :value="x.id">{{ x.name }}</option>
-              </select>
-              <select v-model="a.state" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;">
-                <option value="off">关</option><option value="on">开</option>
-              </select>
-            </template>
+            {{ actionText(a) }}
+            <select v-model="a.card" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option v-for="x in targetCards" :key="x.id" :value="x.id">{{ x.title || x.id }}</option>
+            </select>
+            <select v-if="a.kind !== 'quant'" v-model="a.state" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option value="off">关</option><option value="on">开</option>
+            </select>
             <button class="btn-ghost" style="padding:0 5px;font-size:11px;" :disabled="!perm('cfg_alarm')" @click="delAction(l.recover.actions, j)">×</button>
           </span>
-          <select :disabled="!perm('cfg_alarm')" @change="addAction(l.recover.actions, $event)">
+          <select :disabled="!perm('cfg_alarm') || !targetCards.length" @change="addAction(l.recover.actions, $event)">
             <option value="">+ 添加恢复动作</option>
-            <option value="off_pump">关本机水泵</option>
-            <option value="off_heater">关本机加热</option>
-            <option value="cancel_target">取消定量</option>
-            <option value="actuator">执行器(档案)</option>
+            <option v-for="x in targetCards" :key="'tr'+x.id" :value="x.id">{{ x.title || x.id }}</option>
           </select>
         </div>
       </div>
       <div class="alarm-rule" style="margin-top:10px;">
         <button class="btn-ghost" :disabled="!perm('cfg_alarm')" @click="addLink">+ 添加规则</button>
         <button class="btn-primary" :disabled="!perm('cfg_alarm')" @click="saveLinks">保存报警联动</button>
-        <span class="desc">触发源 = 本机传感器或自定义接口（后端按轮询秒自动拉取）；动作显式指向执行器个体，写操作日志。</span>
+        <span class="desc">触发源与动作都取自实时监控页的卡片（内置 + 自建）；自定义指令经后端代理 GET 下发（仅白名单主机）并写操作日志。</span>
       </div>
       <div class="note" style="margin-top:0;">
         触发语义：读数越过阈值瞬间执行「触发动作」一次，回到正常区间执行「恢复动作」（未配置则不做）。
         加热槽温度建议直接使用恒温闭环(PID)；联动规则建议不超过 10 条。保存后立即生效。
-      </div>
-
-      <!-- 自定义传感器通道（全链路声明）：后端轮询入库，历史/统计/告警/联动原生兼容 -->
-      <div class="alarm-rule" style="font-weight:600;margin-top:18px;">自定义传感器通道
-        <span class="desc" style="font-weight:400;">声明后由后端按周期轮询入库——历史曲线、数据统计、告警联动全链路兼容（任务前置：接口 URL 须在代理白名单内）</span>
-      </div>
-      <div v-for="(c, i) in customDecls" :key="c.id" class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
-        <input v-model="c.name" placeholder="名称(如 环境温度)" style="width:120px;" :disabled="!perm('cfg_system')">
-        <input v-model="c.url" placeholder="传感器 GET URL" style="width:250px;" :disabled="!perm('cfg_system')">
-        <input v-model="c.path" placeholder="取值路径 如 value" style="width:120px;" :disabled="!perm('cfg_system')">
-        <label class="rule-item" style="flex:none;gap:4px;">轮询
-          <input type="number" v-model.number="c.period" min="2" max="300" style="width:58px;" :disabled="!perm('cfg_system')">秒
-        </label>
-        <input v-model="c.unit" placeholder="单位" style="width:60px;" :disabled="!perm('cfg_system')">
-        <button class="btn-ghost danger" :disabled="!perm('cfg_system')" @click="delCustomDecl(i)">删除</button>
-      </div>
-      <div class="alarm-rule" style="margin-top:6px;">
-        <button class="btn-ghost" :disabled="!perm('cfg_system')" @click="addCustomDecl">+ 添加通道</button>
-        <button class="btn-primary" :disabled="!perm('cfg_system')" @click="saveCustomDecls">保存自定义通道</button>
-        <span class="desc">保存后历史曲线/数据统计页会出现对应标签；实时监控用「自定义接口」卡、取值路径填 <code>custom.通道id</code> 即可显示实时值。</span>
+        自定义传感器直接加「自定义接口」卡即可：卡片即声明，历史曲线、数据统计与联动会自动跟随，
+        不需要在配置页再填一遍接口。
       </div>
     </div>
 

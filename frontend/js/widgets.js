@@ -25,6 +25,21 @@ window.Widgets = (() => {
     return Number(v).toFixed(decimals === 0 ? 0 : (decimals || 1));
   }
 
+  /* 开关类取值归一化：把布尔、0/1、字符串 on/off/true/false 统一归到
+     "on" / "off" / "unknown"。
+     本机通道由后端归一化成字符串（pump_state="on"/"off"），而自定义接口常直接返回
+     布尔值（如 {"pump2":true}）；控制开关卡与状态卡共用本函数后两种来源都能正确显示。 */
+  function ctlState(v) {
+    if (v === true) return "on";
+    if (v === false) return "off";
+    if (v === null || v === undefined) return "unknown";
+    const s = String(v).trim().toLowerCase();
+    if (s === "" ) return "unknown";
+    if (s === "on" || s === "true" || s === "1") return "on";
+    if (s === "off" || s === "false" || s === "0") return "off";
+    return "unknown";
+  }
+
   let seq = 0;
   const uid = () => "w" + Date.now().toString(36) + (seq++).toString(36);
 
@@ -179,6 +194,6 @@ window.Widgets = (() => {
     return widgets;
   }
 
-  return { TYPES, CATALOG, resolvePath, fmtVal, uid, fromCatalog, defaultLayout,
+  return { TYPES, CATALOG, resolvePath, fmtVal, ctlState, uid, fromCatalog, defaultLayout,
            targetProgress, actionLabel, isSystemLog, operatorText };
 })();

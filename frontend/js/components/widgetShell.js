@@ -71,13 +71,17 @@ window.WidgetShell = {
       }
       return this.w.foot || "";
     },
+    /* 开关/状态取值归一化：布尔、0/1、on/off 字符串都归到 on/off/unknown。
+       本机通道由后端归一化成 "on"/"off" 字符串，自定义接口常直接返回布尔值
+       （如 {"pump2":true}），归一化后两类来源都能正确显示。 */
+    ctlState() { return window.Widgets.ctlState(this.val); },
     stateText() {
-      const v = this.val;
-      return v === "on" ? "已开启" : v === "off" ? "已关闭" : "未知";
+      const s = this.ctlState;
+      return s === "on" ? "已开启" : s === "off" ? "已关闭" : "未知";
     },
     stateClass() {
-      const v = this.val;
-      return v === "on" ? "ok" : v === "off" ? "off" : "";
+      const s = this.ctlState;
+      return s === "on" ? "ok" : s === "off" ? "off" : "";
     },
     chartId() { return this.w.domId || ("wg-chart-" + this.w.id); },
     hasChart() { return this.w.type === "spark" || this.w.type === "line"; },
@@ -105,7 +109,7 @@ window.WidgetShell = {
       return `${f(v)} / ${f(c)} L`;
     },
     // ---- 控制开关卡 ----
-    ctlOn() { return this.val === "on"; },
+    ctlOn() { return this.ctlState === "on"; },
     canCtl() { return window.Auth ? window.Auth.has("ctrl_light") : false; },
     ctlDisabled() { return this.busy || !this.online || !this.canCtl; },
     // ---- 定量浇水卡 ----
@@ -225,15 +229,30 @@ window.WidgetShell = {
         const cmdUrl = (this.w.cmd || {})[action === "on" ? "on" : "off"];
         if (cmdUrl) {
           await API.dashboardProxy(cmdUrl, true);   // 代理 GET 下发 + 审计日志
+          await this.refreshCtlState(action);       // 下发后立即回读，不等下一个轮询周期
         } else {
           const ctl = this.w.ctl === "heater" ? "heater" : "pump";
           const d = ctl === "pump" ? await API.pump(action) : await API.heater(action);
           Object.assign(this.realtime, d);
         }
       } catch (err) {
-        e.target.checked = this.ctlOn;
         alert(err.message);
-      } finally { this.busy = false; }
+      } finally {
+        this.busy = false;
+        /* 以回读结果为准：指令未生效或设备未响应时，不留下与真实状态不符的开关位置 */
+        e.target.checked = this.ctlOn;
+      }
+    },
+    /* 指令下发后立即回读一次状态：自定义接口源按自身周期轮询（默认 5s），
+       不回读则开关要等下一轮才更新。设备响应有延迟时 1.5s 后再确认一次。 */
+    async refreshCtlState(action) {
+      if ((this.w.source || {}).kind !== "custom") return;   // realtime 源由全局 2s 轮询刷新
+      const want = action === "on" ? "on" : "off";
+      await this.pollCustom();
+      if (this.ctlState !== want) {
+        await new Promise((r) => setTimeout(r, 1500));
+        await this.pollCustom();
+      }
     },
     /* ---------- 内置操作卡动作（与旧固定操作区同一接口） ---------- */
     async saveTarget() {

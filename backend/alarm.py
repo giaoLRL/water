@@ -6,11 +6,14 @@
 阈值在"系统配置"页可改，存数据库 config 表覆盖 config.py 默认值。
 读数无效（None，即设备离线或该通道无数据）时不产生告警，避免误报。
 
-报警联动（v2 个体化）：规则自带阈值，触发源 = 本机传感器（CHANNELS）或自定义接口传感器
-（URL+取值路径+轮询周期）；动作指向明确的执行器个体——本机水泵/本机加热/取消定量，
-或执行器档案中的外部装置（开/关 GET URL，如水阀）。可选恢复动作：读数回到正常区间后自动执行。
-规则与执行器档案存 config 表 sys.alarm_links / sys.actuators，系统配置页编辑；
-每个动作写 control_log(link_*，source=auto)。
+报警联动（v3：卡片即来源）：规则自带阈值，触发源与动作都**直接选自实时监控页的卡片**
+（内置卡或后加的自定义卡），不再有独立的执行器档案/通道声明：
+  - 触发源 source_card：卡片 source.kind=realtime 直接读采集快照；kind=custom
+    （自定义接口卡）由 custom_channels 轮询后并入 data["custom"]，卡片已不在布局中时
+    由 check_custom 按保存时的快照 URL 兜底轮询；
+  - 动作 {card, state, kind, url}：卡片当前配置优先（改了卡片规则自动跟随），
+    kind=url（控制卡自定义指令，走白名单 GET）/pump/heater（内置泵、加热）/quant（取消定量）。
+规则存 config 表 sys.alarm_links，系统配置页编辑；每个动作写 control_log(link_*，source=auto)。
 """
 import threading
 import time
@@ -34,10 +37,10 @@ CHANNELS = (
 # 联动合法通道与方向
 LINK_CHANNELS = {c[0] for c in CHANNELS}
 LINK_DIRECTIONS = ("above", "below")
-# 联动动作类型：off_pump 关本机水泵 / off_heater 关本机加热 / cancel_target 取消定量 /
-# actuator 执行器档案中的外部装置（按 state 开/关）
-LINK_ACTION_TYPES = ("off_pump", "off_heater", "cancel_target", "actuator")
-LINK_SENSOR_KINDS = ("builtin", "custom", "channel")   # channel = 自定义通道（全链路声明）
+# 触发源取值方式：realtime = 本机采集快照；custom = 自定义接口卡（后端按卡片周期轮询）
+LINK_SOURCE_KINDS = ("realtime", "custom")
+# 动作执行方式：url = 卡片自定义开/关指令；pump/heater = 内置执行器；quant = 取消定量
+LINK_TARGET_KINDS = ("url", "pump", "heater", "quant")
 
 
 class AlarmEngine:
@@ -48,40 +51,44 @@ class AlarmEngine:
         self._thresholds: dict[str, float] = {}
         self._active: dict[str, dict] = {}   # type -> 告警项
         self.plant = None                    # 联动动作的执行对象（main 启动时注入 WaterPlant）
-        self._links: list[dict] = []         # 报警联动规则（v2 个体化）
-        self._actuators: list[dict] = []     # 执行器档案（外部装置：名称+开/关 URL）
+        self._links: list[dict] = []         # 报警联动规则（v3：卡片即来源）
+        self._cards: dict[str, dict] = {}    # 仪表盘卡片 id -> 卡片（规则解析用）
         self._link_state: dict[str, bool] = {}     # 规则id -> 当前是否越限（触发/恢复沿判断）
         self._custom_ts: dict[str, float] = {}     # 规则id -> 自定义源上次轮询时间
         self.reload_links()
         self.reload()
 
     def reload_links(self) -> None:
-        """从 config 表读取联动规则（sys.alarm_links）与执行器档案（sys.actuators）。
+        """从 config 表读取联动规则（sys.alarm_links）并缓存仪表盘卡片。
 
-        旧版（v1，无 sensor 字段）规则直接丢弃——本项目无生产规则数据，不做迁移。
+        规则必须带 source_card（v3 卡片即来源）；旧版规则（v1 无 sensor、v2 走档案）直接丢弃
+        ——本项目无生产规则数据，不做迁移。
         """
         try:
             links = store.get_json("alarm_links", [])
         except Exception:  # noqa: BLE001
             links = []
         try:
-            actuators = store.get_json("actuators", [])
+            layout = store.get_json("dashboard_layout", None)
         except Exception:  # noqa: BLE001
-            actuators = []
+            layout = None
+        widgets = (layout or {}).get("widgets") if isinstance(layout, dict) else None
+        cards = {str(w["id"]): w for w in (widgets or [])
+                 if isinstance(w, dict) and w.get("id")}
         with self._lock:
             self._links = [r for r in links
-                           if isinstance(r, dict) and isinstance(r.get("sensor"), dict)]
-            self._actuators = actuators if isinstance(actuators, list) else []
+                           if isinstance(r, dict) and r.get("source_card")
+                           and isinstance(r.get("source"), dict)]
+            self._cards = cards
 
     def links(self) -> list[dict]:
         """当前联动规则（供系统配置接口返回）。"""
         with self._lock:
             return list(self._links)
 
-    def actuators(self) -> list[dict]:
-        """当前执行器档案（供系统配置接口返回）。"""
+    def _card(self, card_id) -> dict | None:
         with self._lock:
-            return list(self._actuators)
+            return self._cards.get(str(card_id or ""))
 
     def reload(self) -> None:
         """从数据库读取最新阈值(覆盖默认值)；非法值回退默认值。"""
@@ -157,24 +164,69 @@ class AlarmEngine:
         return snapshot
 
     def check_custom(self) -> None:
-        """联动自定义传感器源轮询（采集循环每周期调用一次，内部按各自 period 节流）。"""
+        """联动自定义源兜底轮询（采集循环每周期调用一次，内部按各自 period 节流）。
+
+        卡片仍在实时监控页时，读数由 custom_channels 轮询并并入 data["custom"]，这里跳过；
+        卡片已被删除但规则仍引用它时，按规则保存时的快照 URL 继续轮询，避免规则静默失效。
+        """
         now = time.time()
         with self._lock:
             tasks = []
             for rule in self._links:
-                sensor = rule.get("sensor") or {}
-                if not rule.get("enabled") or sensor.get("kind") != "custom":
+                if not rule.get("enabled"):
                     continue
-                period = max(2.0, float(sensor.get("period") or 5))
+                src = self._rule_source(rule)
+                if src.get("kind") != "custom" or self._card(rule.get("source_card")):
+                    continue
+                try:
+                    period = max(2.0, float(src.get("period") or 5))
+                except (TypeError, ValueError):
+                    period = 5.0
                 if now - self._custom_ts.get(rule["id"], 0.0) < period:
                     continue
                 tasks.append(rule)
                 self._custom_ts[rule["id"]] = now   # 先占位：请求慢也不会每周期重复打
         for rule in tasks:
-            sensor = rule["sensor"]
-            value = self._fetch_sensor(sensor.get("url", ""), sensor.get("path", ""))
+            src = self._rule_source(rule)
+            value = self._fetch_sensor(src.get("url", ""), src.get("path", ""))
             if value is not None:
                 self._eval_link(rule, value)
+
+    def _rule_source(self, rule: dict) -> dict:
+        """规则触发源：卡片当前配置优先（改卡片规则自动跟随），卡片不在布局时回退保存时快照。"""
+        card = self._card(rule.get("source_card"))
+        src = (card or {}).get("source")
+        return src if isinstance(src, dict) else (rule.get("source") or {})
+
+    @staticmethod
+    def _numeric(value):
+        """读数归一化为 float：水槽卡等对象源取 percent；非数值返回 None。"""
+        if isinstance(value, dict):
+            value = value.get("percent")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_action(self, act: dict) -> dict:
+        """动作目标解析：卡片当前配置优先，卡片不在布局时回退保存时快照。"""
+        out = {"card": act.get("card"), "state": act.get("state") or "off",
+               "kind": act.get("kind"), "url": act.get("url") or "", "title": ""}
+        card = self._card(act.get("card"))
+        if not isinstance(card, dict):
+            return out
+        out["title"] = card.get("title") or ""
+        cmd = card.get("cmd") or {}
+        url = cmd.get("on") if out["state"] == "on" else cmd.get("off")
+        if url:
+            out["kind"], out["url"] = "url", url
+        elif card.get("builtin") == "quant":
+            out["kind"], out["state"] = "quant", "off"
+        elif card.get("ctl") == "heater":
+            out["kind"] = "heater"
+        elif card.get("ctl") == "pump":
+            out["kind"] = "pump"
+        return out
 
     def active_alarms(self) -> list[dict]:
         """当前活跃告警(供实时接口返回)。"""
@@ -214,23 +266,28 @@ class AlarmEngine:
             return None
 
     def _eval_builtin_links(self, data: dict) -> None:
-        """联动评估（随采集循环）：本机通道取 data 字段；自定义通道取 data["custom"][id]。"""
+        """联动评估（随采集循环）：按规则触发源卡片的来源取值。
+
+        realtime 源直接读本机采集快照（路径取自卡片）；custom 源读 custom_channels 的轮询结果
+        （卡片已不在布局中时交给 check_custom 兜底，这里跳过）。
+        """
         with self._lock:
             rules = [r for r in self._links if r.get("enabled")]
         for rule in rules:
-            sensor = rule.get("sensor") or {}
-            if sensor.get("kind") == "channel":
-                value = (data.get("custom") or {}).get(sensor.get("channel_id"))
-            elif sensor.get("kind") == "builtin":
-                value = data.get(sensor.get("channel"))
+            src = self._rule_source(rule)
+            kind = src.get("kind")
+            if kind == "realtime":
+                raw = self._get_path(data, src.get("path", ""))
+            elif kind == "custom":
+                raw = (data.get("custom") or {}).get(str(rule.get("source_card") or ""))
             else:
-                continue   # custom（裸 URL）由 check_custom 轮询
+                continue
+            if raw is None:
+                continue
+            value = self._numeric(raw)
             if value is None:
                 continue
-            try:
-                self._eval_link(rule, float(value))
-            except (TypeError, ValueError):
-                continue
+            self._eval_link(rule, value)
 
     def _eval_link(self, rule: dict, value: float) -> None:
         """单规则评估：越限沿（正常→越限）触发动作，回正常沿执行可选恢复动作。"""
@@ -266,45 +323,34 @@ class AlarmEngine:
 
     def _exec_action(self, rule: dict, act: dict, ctx: dict, phase: str) -> None:
         """执行单个联动动作并写审计日志；任何失败都只记 fail 不抛出。"""
-        atype = str(act.get("type", ""))
         prefix = (f'联动[{ctx["name"]}]: {ctx["text"]}'
                   f'({ctx["value"]:.2f} / 阈值{ctx["threshold"]}) {phase}')
         try:
-            if atype == "off_pump":
-                self.plant.pump_control("off")
-                database.insert_control_log("link_off_pump", "success",
-                                            f"{prefix} → 本机水泵 关", source="auto")
-            elif atype == "off_heater":
-                self.plant.heater_control("off")
-                database.insert_control_log("link_off_heater", "success",
-                                            f"{prefix} → 本机加热 关", source="auto")
-            elif atype == "cancel_target":
-                self.plant.set_pump_target(0)
-                database.insert_control_log("link_cancel_target", "success",
-                                            f"{prefix} → 取消定量", source="auto")
-            elif atype == "actuator":
-                dev = self._find_actuator(act.get("actuator"))
-                state = "on" if act.get("state") == "on" else "off"
-                url = str(dev.get(f"{state}_url", "") or "")
+            target = self._resolve_action(act)
+            kind = str(target.get("kind") or "")
+            state = "on" if target.get("state") == "on" else "off"
+            label = target.get("title") or target.get("card") or "卡片"
+            if kind == "url":
+                url = str(target.get("url") or "")
                 if not url:
-                    raise ValueError(f"执行器[{dev.get('name')}] 未配置{'开' if state == 'on' else '关'}指令 URL")
+                    raise ValueError(f"卡片[{label}] 未配置该方向的指令 URL")
                 self._http_get(url)
-                database.insert_control_log("link_actuator", "success",
-                                            f"{prefix} → 执行器[{dev.get('name')}] {state.upper()} {url[:140]}",
-                                            source="auto")
+                detail, action = f"卡片[{label}] {state.upper()} {url[:140]}", f"link_card_{state}"
+            elif kind == "pump":
+                self.plant.pump_control(state)
+                detail, action = f"卡片[{label}] 本机水泵 {state.upper()}", f"link_pump_{state}"
+            elif kind == "heater":
+                self.plant.heater_control(state)
+                detail, action = f"卡片[{label}] 本机加热 {state.upper()}", f"link_heater_{state}"
+            elif kind == "quant":
+                self.plant.set_pump_target(0)
+                detail, action = f"卡片[{label}] 取消定量浇水", "link_quant_cancel"
             else:
-                return
+                raise ValueError(f"非法联动动作: {kind or act}")
+            database.insert_control_log(action, "success", f"{prefix} → {detail}", source="auto")
         except Exception as exc:  # noqa: BLE001
-            database.insert_control_log(
-                f"link_{atype}" if atype in LINK_ACTION_TYPES else "link_unknown",
-                "fail", f"{prefix} → 动作执行失败: {exc}"[:250], source="auto")
-
-    def _find_actuator(self, actuator_id) -> dict:
-        with self._lock:
-            for a in self._actuators:
-                if a.get("id") == actuator_id:
-                    return a
-        raise ValueError(f"执行器档案不存在: {actuator_id}")
+            database.insert_control_log("link_fail", "fail",
+                                        f"{prefix} → 动作执行失败: {exc}"[:250], source="auto")
 
     @staticmethod
     def _http_get(url: str) -> None:

@@ -124,10 +124,10 @@ tests/
   迁移在 `database._migrate_control_log()` 中幂等执行。**日志中不得出现密码明文。**
 - `config`：key-value。业务阈值用原名，运行期配置用 `sys.` 前缀（见 `store.py`）。
   仪表盘布局存 `sys.dashboard_layout`（JSON，全局共享一套；不建新表）。
-  报警联动规则/执行器档案存 `sys.alarm_links`/`sys.actuators`；自定义传感器通道声明存
-  `sys.custom_channels`。
-- `custom_sensor_data`：自定义传感器通道数据（系统配置页声明、后端轮询入库）。
-  channel_id + ts + value；历史曲线/数据统计/联动按通道查询。
+  报警联动规则存 `sys.alarm_links`。**不再有执行器档案/通道声明**：`sys.actuators`、
+  `sys.custom_channels` 是 2026-09-18 之前的遗留键，代码不读取，可随时清理。
+- `custom_sensor_data`：自定义传感器通道数据（**由实时监控页的自定义接口卡派生**、
+  后端轮询入库）。channel_id 即卡片 id，+ ts + value；历史曲线/数据统计/联动按通道查询。
 - `users`：账号、密码哈希、角色、状态。
 
 时间戳统一 `yyyy-MM-dd HH:mm:ss`。
@@ -172,36 +172,37 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
 布局读写/重置：`/api/water/dashboard/layout[/reset]`，全局共享一套，未保存时按设备能力生成
 默认布局；loadLayout 按 builtin 去重防同类卡重复。
 
-**报警联动（v2 个体化）**：「哪个传感器的阈值 → 触发哪个执行器」，规则自带阈值。
-- 触发源 `sensor`：`{kind:"builtin", channel}`（本机 5 通道，随采集循环评估）或
-  `{kind:"custom", url, path, period}`（自定义接口传感器，主机须在代理白名单，
-  main.py 采集循环调 `alarm.check_custom()` 按 period≥2s 轮询 JSON 取值）。
-- 动作 `actions`：off_pump 关本机水泵 / off_heater 关本机加热 / cancel_target 取消定量 /
-  `{type:"actuator", actuator:id, state:"on"|"off"}`——引用**执行器档案**（sys.actuators，
-  外部装置个体：名称+开/关 GET URL，至少一条；URL 走代理白名单校验，alarm.py 直接下发）。
+**报警联动（v3：卡片即来源）**：「实时监控页哪张卡片的阈值 → 触发哪张卡片的动作」，
+规则自带阈值。**触发源与动作都直接选自实时监控页的卡片，没有独立档案/声明表**——
+用户加一张卡就等于完成声明，不需要在系统配置页再填一遍 URL。
+- 触发源：规则存 `source_card`（卡片 id）+ `source{kind,url,path,period}` 快照。
+  系统配置页下拉列出**可读数值的卡片**（type ∈ value/spark/line/tank；水槽卡取 percent）。
+  `kind="realtime"` 直接读采集快照路径；`kind="custom"`（自定义接口卡）由
+  `custom_channels.CustomChannelManager` 轮询后并入 `data["custom"]`，卡片已不在布局中时
+  由 `alarm.check_custom()` 按快照 URL 兜底轮询。URL 主机须在代理白名单。
+- 动作：规则存 `{card, state:"on"|"off", kind, url}` 快照。下拉列出**可执行卡片**
+  （type=control 或 builtin=quant）。执行时优先按卡片**当前**配置解析（改了卡片规则自动跟随），
+  卡片不存在时回退快照：kind=url → 白名单 GET 下发；pump/heater → 本机水泵/加热；
+  quant → 取消定量。
 - 沿语义：读数越过阈值沿执行 actions 一次，回正常沿执行可选 `recover.actions`；
-  状态去重（同方向不重复触发）。
-- 存储/端点：规则 sys.alarm_links、档案 sys.actuators；系统配置页「报警联动」区编辑
-  （cfg_alarm），`GET/POST /api/water/alarm/links`（GET 同时返回档案）、
-  `GET/POST /api/water/alarm/actuators`；保存即 reload_links 生效，写日志 config.link；
-  动作写 control_log（action=link_*，source=auto）。
+  状态去重（同方向不重复触发）。越限/恢复写 alarms 表（type=custom:<规则id>）。
+- 存储/端点：规则 sys.alarm_links；系统配置页「报警联动」区编辑（cfg_alarm），
+  `GET/POST /api/water/alarm/links`；保存即 reload_links 生效，写日志 config.link；
+  动作写 control_log（action=link_card_*/link_pump_*/link_heater_*/link_quant_cancel，失败 link_fail，source=auto）。
+  仪表盘布局保存/重置时会同时 reload 自定义通道与联动规则（api `_reload_card_consumers()`）。
 - 注意：后端重启后越限状态归零，已越限规则会重新触发一次（安全动作，可接受）；
-  off_heater 与 PID 无互锁（加热联动建议用 PID）；规则建议 ≤10 条（同步执行，单动作超时 1.5s）。
+  heater 动作与 PID 无互锁（加热建议用 PID）；规则建议 ≤10 条（同步执行，单动作超时 1.5s）。
 
-**自定义传感器通道（全链路）**：系统配置页「自定义传感器通道」声明
-（id/名称/URL/取值路径/轮询周期 2~300s/单位；URL 主机须在代理白名单；cfg_system 编辑）。
-后端 `custom_channels.CustomChannelManager` 在采集循环按各通道周期轮询 JSON 取值：
-- 值有效 → 写入 realtime 快照（`realtime.custom.<id>` 与 `realtime.custom_channels` 元数据；
-  实时监控加「自定义接口」卡、取值路径填 `custom.<id>` 即显示实时值）并入库
-  `custom_sensor_data` 表（channel_id+ts+value）；
+**自定义传感器通道（卡片即声明）**：实时监控页加一张「自定义接口」卡
+（source.kind=custom，含 URL/取值路径/轮询周期 2~300s），后端即按此轮询：
+- 值有效 → 写入 realtime 快照（`realtime.custom.<卡片id>` 与 `realtime.custom_channels`
+  元数据）并入库 `custom_sensor_data`（channel_id=卡片id）；
 - 历史曲线页出现对应标签（`/api/water/custom/history`），统计页出现指标卡
   （`/api/water/custom/stats`），均按时间范围查询；
-- 联动规则触发源可选「自定义通道」（sensor.kind=channel，channel_id 引用声明）；
-  越限/恢复沿写 alarms 表（type=custom:<规则id>，告警记录页可见）。
-- 端点：`GET/POST /api/water/custom/channels`（读 view_monitor、写 cfg_system，写日志
-  config.channel）、`GET /api/water/custom/history|stats`（view_history）。
-- 无数据不入库不做模拟；通道 id 仅字母/数字/下划线；轮询在采集循环内同步执行（规则/通道
-  建议合计 ≤10 条）。
+- 联动规则的触发源下拉会自动列出这张卡片（卡片删除后不再采集，规则回退快照兜底）。
+- 端点：`GET /api/water/custom/history|stats`（view_history）；**声明类端点已删除**
+  （不再有 `POST /api/water/custom/channels`、`/api/water/alarm/actuators`）。
+- 无数据不入库不做模拟；轮询在采集循环内同步执行（自定义卡建议 ≤10 张）。
 
 **真实数据原则**：设备不支持或离线时，接口返回 `None` 与 `features` 能力表；
 水位类字段按用户要求**无数据一律为 0**，但必须同时带 `source="none"` 或离线标志。
@@ -233,8 +234,9 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
 - [ ] 卡片接口可编辑：显示卡配置里 URL 留空读实时快照、填了走代理轮询；控制卡可配自定义开/关指令 URL（成对校验、代理下发、写入 device.custom 日志）
 - [ ] 通用单水槽卡默认两张（储水槽/加热槽）左右并排，无传感器槽位标注「无传感器」、离线标注「离线」，水位与后端一致；无循环回路系统
 - [ ] 清零累计卡不在默认布局（危险操作降权），从目录添加后需二次确认且权限受控；未接传感器的槽位标注「无传感器」、离线时标注「离线」
-- [ ] 报警联动可在系统配置页编辑（执行器档案 + 规则自带阈值：本机/自定义传感器源 → 明确的执行器个体），保存即生效并写入 config.link 日志；越限沿执行 link_* 动作日志，恢复沿执行可选恢复动作
-- [ ] 自定义传感器通道：系统配置页声明后，realtime 快照含读数、历史曲线/统计页出现对应标签、联动触发源可选；联动越限/恢复写告警记录（custom:<规则id>）
+- [ ] 报警联动可在系统配置页编辑，**触发源与动作都从实时监控页的卡片里选**（内置卡/后加的自定义卡），保存即生效并写入 config.link 日志；越限沿执行 link_* 动作日志，恢复沿执行可选恢复动作
+- [ ] 自定义传感器通道：实时监控页加「自定义接口」卡即完成声明，realtime 快照含读数、历史曲线/统计页出现对应标签、联动触发源可选；删卡即停止采集；越限/恢复写告警记录（custom:<规则id>）
+- [ ] 系统配置页不再出现「执行器档案」「自定义传感器通道」区块，后端无 `/api/water/alarm/actuators`、`/api/water/custom/channels` 端点
 - [ ] 全站无模拟数据：无数据的水位恒显示 0，设备离线时两槽水位归 0 并提示离线
 - [ ] 操作日志记录操作人（人工为账号名，自动动作为「系统 · 恒温闭环 / 判定服务」），支持分类筛选
 - [ ] 系统配置与账号管理类操作均已入日志，且不含密码明文

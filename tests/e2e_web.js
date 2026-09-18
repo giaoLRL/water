@@ -670,26 +670,21 @@ async function main() {
     await sleep(1500);
     check("采集周期已恢复", (await api("GET", "/api/water/system")).data.period === per0);
 
-    console.log("== 7.3b 报警联动（个体化） ==");
+    console.log("== 7.3b 报警联动（卡片即来源） ==");
     check("联动编辑区已渲染", await cdp.eval("return document.body.textContent.includes('报警联动');"));
-    // 先建执行器档案：E2E水阀（指令 URL 指向本机只读接口，安全）
-    check("添加执行器", await cdp.eval("return __e2e.clickText('button','+ 添加执行器');"));
-    await sleep(300);
-    await cdp.eval(`const set=(el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));};
-      const byPh=(ph)=>[...document.querySelectorAll('input')].find(i=>i.placeholder && i.placeholder.includes(ph));
-      set(byPh('名称(如 水阀1)'),'E2E水阀');
-      set(byPh('开指令 GET URL'),'http://127.0.0.1:8000/api/water/realtime?token=${apiToken}');
-      set(byPh('关指令 GET URL'),'http://127.0.0.1:8000/api/water/realtime?token=${apiToken}');
-      return true;`);
-    check("保存执行器档案", await cdp.eval("return __e2e.clickText('button','保存执行器档案');"));
-    await sleep(1200);
-    check("执行器档案已入后端", await (async () => {
-      const a = (await api("GET", "/api/water/alarm/actuators")).data.actuators || [];
-      return a.length === 1 && a[0].name === "E2E水阀";
-    })());
-    // 再建规则：本机光照 + 阈值 99999(实测不会越限，安全) + 默认动作关本机水泵
+    check("执行器档案区块已移除", !(await cdp.eval("return document.body.textContent.includes('执行器档案');")));
+    check("自定义通道声明区块已移除", !(await cdp.eval("return document.body.textContent.includes('自定义传感器通道');")));
     check("添加联动规则", await cdp.eval("return __e2e.clickText('button','+ 添加规则');"));
-    await sleep(300);
+    await sleep(500);
+    const srcOpts = await cdp.eval(`const r=document.querySelector('.link-rule');
+      const s=r && r.querySelector('select[title="触发源卡片（实时监控页）"]');
+      return s ? [...s.options].map(o=>o.textContent.trim()) : [];`);
+    check("触发源下拉取自实时监控页卡片", srcOpts.length > 0 && srcOpts.some(t=>t.includes('流量')), JSON.stringify(srcOpts));
+    const actOpts = await cdp.eval(`const r=document.querySelector('.link-rule');
+      const s=r && [...r.querySelectorAll('select')].find(x=>[...x.options].some(o=>o.textContent.includes('+ 添加动作')));
+      return s ? [...s.options].map(o=>o.textContent.trim()) : [];`);
+    check("动作下拉取自实时监控页控制卡", actOpts.some(t=>t.includes('水泵')), JSON.stringify(actOpts));
+    // 阈值 99999：本机流量不可能越限，规则绝不会真实触发（安全）
     await cdp.eval(`const set=(el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));};
       const rule=document.querySelector('.link-rule');
       const name=rule.querySelector('input[placeholder*="规则名"]');
@@ -700,39 +695,48 @@ async function main() {
     check("保存报警联动", await cdp.eval("return __e2e.clickText('button','保存报警联动');"));
     await sleep(1200);
     const linksApi = (await api("GET", "/api/water/alarm/links")).data.links || [];
-    check("联动规则已入后端(本机通道+阈值99999+关本机水泵)",
-          linksApi.length === 1 && linksApi[0].sensor.kind === "builtin"
-          && linksApi[0].sensor.channel === "flow_rate" && Number(linksApi[0].threshold) === 99999
-          && linksApi[0].actions[0].type === "off_pump",
+    check("规则已入后端(卡片触发源 + 卡片动作)",
+          linksApi.length === 1 && linksApi[0].source_card === "b-flow"
+          && Number(linksApi[0].threshold) === 99999
+          && linksApi[0].source.kind === "realtime" && linksApi[0].source.path === "flow_rate"
+          && linksApi[0].actions[0].card === "b-ctl_pump" && linksApi[0].actions[0].kind === "pump",
           JSON.stringify(linksApi));
-    // 恢复：清空规则与执行器档案
     await api("POST", "/api/water/alarm/links", { links: [] });
-    await api("POST", "/api/water/alarm/actuators", { actuators: [] });
-    check("联动规则与执行器档案已恢复空",
-          ((await api("GET", "/api/water/alarm/links")).data.links || []).length === 0
-          && ((await api("GET", "/api/water/alarm/actuators")).data.actuators || []).length === 0);
+    check("联动规则已恢复空", ((await api("GET", "/api/water/alarm/links")).data.links || []).length === 0);
 
-    console.log("== 7.3c 自定义传感器通道（全链路） ==");
-    check("通道声明区已渲染", await cdp.eval("return document.body.textContent.includes('自定义传感器通道');"));
-    check("添加自定义通道", await cdp.eval("return __e2e.clickText('button','+ 添加通道');"));
-    await sleep(300);
-    await cdp.eval(`const set=(el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));};
-      const byPh=(ph)=>[...document.querySelectorAll('input')].find(i=>i.placeholder && i.placeholder.includes(ph));
-      set(byPh('名称(如 环境温度)'),'E2E通道');
-      set(byPh('传感器 GET URL'),'http://127.0.0.1:8000/api/water/realtime?token=${apiToken}');
-      set(byPh('取值路径 如 value'),'data.flow_rate');
-      return true;`);
-    check("保存自定义通道", await cdp.eval("return __e2e.clickText('button','保存自定义通道');"));
-    await sleep(1200);
-    check("自定义通道已入后端", await (async () => {
-      const c = (await api("GET", "/api/water/custom/channels")).data.channels || [];
-      return c.length === 1 && c[0].name === "E2E通道" && c[0].path === "data.flow_rate";
-    })());
-    check("联动触发源下拉含自定义通道", await cdp.eval(
-      "const s=[...document.querySelectorAll('select')].find(x=>[...x.options].some(o=>o.value==='channel' && o.textContent==='自定义通道'));"
-      + "return !!s;"));
-    await api("POST", "/api/water/custom/channels", { channels: [] });
-    check("自定义通道已恢复空", ((await api("GET", "/api/water/custom/channels")).data.channels || []).length === 0);
+    console.log("== 7.3c 自定义传感器通道（卡片即声明） ==");
+    // 只加一张自定义接口卡（URL 指向本机只读接口），卡片即声明，后端自动轮询入库
+    const declLayout = { version: 1, widgets: [
+      { id: "e2e-decl", type: "value", title: "E2E声明卡", unit: "L/min", decimals: 2,
+        source: { kind: "custom", url: `http://127.0.0.1:8000/api/water/realtime?token=${apiToken}`,
+                  path: "data.flow_rate", period: 2 },
+        grid: { x: 0, y: 0, w: 3, h: 2 } }] };
+    await api("POST", "/api/water/dashboard/layout", { layout: declLayout });
+    await sleep(3200);
+    const rtDecl = (await api("GET", "/api/water/realtime")).data;
+    check("自定义卡自动成为后端通道（卡片即声明）",
+          (rtDecl.custom_channels || []).some((c) => c.id === "e2e-decl"), JSON.stringify(rtDecl.custom_channels));
+    check("该通道已轮询到读数", rtDecl.custom && rtDecl.custom["e2e-decl"] !== undefined, JSON.stringify(rtDecl.custom));
+    // 配置页重新加载后，触发源下拉里应能看到这张卡片
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");   // 导航后重新注入页面内辅助函数
+    check("重新进入系统配置", await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
+    await sleep(1500);
+    check("添加联动规则（声明卡）", await cdp.eval("return __e2e.clickText('button','+ 添加规则');"));
+    await sleep(500);
+    const srcOpts2 = await cdp.eval(`const r=document.querySelector('.link-rule');
+      const s=r && r.querySelector('select[title="触发源卡片（实时监控页）"]');
+      return s ? [...s.options].map(o=>o.textContent.trim()) : [];`);
+    check("触发源下拉含自定义接口卡", srcOpts2.indexOf("E2E声明卡") !== -1, JSON.stringify(srcOpts2));
+    // 清理测试布局，并让页面回到默认布局（后续响应式检查依赖默认卡片）
+    await api("POST", "/api/water/dashboard/layout/reset");
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("清理后重新进入系统配置", await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
+    await sleep(1500);
+    check("测试布局已清理", (await api("GET", "/api/water/dashboard/layout")).data.layout === null);
 
     console.log("== 7.4 账号管理 ==");
     check("切到账号管理标签", await cdp.eval("return __e2e.clickText('.tab','账号管理');"));

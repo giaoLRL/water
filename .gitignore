@@ -13,4 +13,5 @@ Thumbs.db
 .vscode/
 
 # 依赖目录（如有）
+.venv/
 node_modules/

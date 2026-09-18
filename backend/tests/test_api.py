@@ -395,53 +395,80 @@ def main() -> None:
     r = request("GET", "/api/water/dashboard/layout")
     check("布局已恢复", r["code"] == 0 and r["data"]["layout"] == saved_before, str(r))
 
-    print("== 9.3 报警联动（v2 个体化） ==")
+    print("== 9.3 报警联动（v3 卡片即来源） ==")
+    layout_before_links = request("GET", "/api/water/dashboard/layout")["data"]["layout"]
     r = request("GET", "/api/water/alarm/links")
-    check("联动读取接口可用(含执行器档案)",
-          r["code"] == 0 and "links" in r["data"] and "actuators" in r["data"], str(r))
+    check("联动读取接口可用", r["code"] == 0 and "links" in r["data"], str(r))
     r = request_raw("GET", "/api/water/alarm/links", token=viewer_token)
     check("viewer 读取联动被拒 40301", r["code"] == 40301, str(r))
-    # 执行器档案：外部装置个体（指令 URL 指向本机只读接口，安全）
-    act = [{"id": "a1", "name": "E2E水阀",
-            "on_url": f"{BASE}/api/water/realtime?token={TOKEN}",
-            "off_url": f"{BASE}/api/water/realtime?token={TOKEN}"}]
-    r = request("POST", "/api/water/alarm/actuators", {"actuators": act})
-    check("保存执行器档案成功", r["code"] == 0 and len(r["data"]["actuators"]) == 1, str(r))
-    r = request("POST", "/api/water/alarm/actuators",
-                {"actuators": [{"id": "a2", "name": "坏", "off_url": "http://evil.example.com/x"}]})
-    check("执行器白名单外主机被拒 40002", r["code"] == 40002, str(r))
-    r = request("POST", "/api/water/alarm/actuators",
-                {"actuators": [{"id": "a3", "name": "空URL"}]})
-    check("执行器开/关 URL 全空被拒 40002", r["code"] == 40002, str(r))
-    # 联动规则 v2：规则自带阈值；动作显式指向执行器个体
+    # 测试布局：自定义接口卡（可作触发源）+ 自定义指令控制卡（可作动作）+ 本机数值卡
+    # 指令/数据 URL 全部指向本机只读接口，绝不触发真实水泵
+    RO = f"{BASE}/api/water/realtime?token={TOKEN}"
+    test_layout = {"version": 1, "widgets": [
+        {"id": "e2e-custom", "type": "value", "title": "E2E自定义卡", "unit": "L/min",
+         "decimals": 2, "source": {"kind": "custom", "url": RO, "path": "data.flow_rate", "period": 2},
+         "grid": {"x": 0, "y": 0, "w": 3, "h": 2}},
+        {"id": "e2e-ctl", "type": "control", "title": "E2E控制卡",
+         "cmd": {"on": RO, "off": RO},
+         "source": {"kind": "realtime", "path": "pump_state"},
+         "grid": {"x": 3, "y": 0, "w": 3, "h": 2}},
+        {"id": "e2e-flow", "type": "value", "title": "E2E流量卡", "unit": "L/min", "decimals": 2,
+         "source": {"kind": "realtime", "path": "flow_rate"},
+         "grid": {"x": 6, "y": 0, "w": 3, "h": 2}},
+    ]}
+    r = request("POST", "/api/water/dashboard/layout", {"layout": test_layout})
+    check("联动测试卡片布局已保存", r["code"] == 0, str(r))
     good = [{"id": "t1", "name": "E2E联动", "enabled": True,
-             "sensor": {"kind": "builtin", "channel": "light"},
+             "source_card": "e2e-flow",
+             "source": {"kind": "realtime", "path": "flow_rate", "url": "", "period": 5},
              "threshold": 99999, "direction": "above",
-             "actions": [{"type": "off_pump"},
-                         {"type": "actuator", "actuator": "a1", "state": "off"}],
-             "recover": {"actions": [{"type": "actuator", "actuator": "a1", "state": "on"}]}}]
+             "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}],
+             "recover": {"actions": [{"card": "e2e-ctl", "state": "on", "kind": "url", "url": RO}]}}]
     r = request("POST", "/api/water/alarm/links", {"links": good})
     check("保存联动规则成功", r["code"] == 0 and len(r["data"]["links"]) == 1, str(r))
     r = request("GET", "/api/water/alarm/links")
     saved = r["data"]["links"]
-    check("规则回读一致(自带阈值+执行器引用)",
-          saved and saved[0]["sensor"]["channel"] == "light"
+    check("规则回读一致(卡片引用+自带阈值)",
+          saved and saved[0]["source_card"] == "e2e-flow"
           and float(saved[0]["threshold"]) == 99999
-          and saved[0]["actions"][1]["actuator"] == "a1"
+          and saved[0]["actions"][0]["card"] == "e2e-ctl"
           and saved[0]["recover"]["actions"][0]["state"] == "on", str(saved))
+    r = request("POST", "/api/water/alarm/links",
+                {"links": [{"id": "t2", "name": "E2E自定义源", "enabled": True,
+                            "source_card": "e2e-custom",
+                            "source": {"kind": "custom", "url": RO, "path": "data.flow_rate", "period": 2},
+                            "threshold": 99999, "direction": "above",
+                            "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}],
+                            "recover": {"actions": []}}]})
+    check("自定义卡作触发源可保存", r["code"] == 0, str(r))
     bad = [
-        ({"sensor": {"kind": "builtin", "channel": "nope"}, "threshold": 1, "direction": "above",
-          "actions": [{"type": "off_pump"}]}, "非法通道"),
-        ({"sensor": {"kind": "custom", "url": "http://evil.example.com/x", "path": "v", "period": 5},
-          "threshold": 1, "direction": "above", "actions": [{"type": "off_pump"}]}, "自定义源白名单外"),
-        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
-          "actions": [{"type": "actuator", "actuator": "ghost", "state": "off"}]}, "引用不存在执行器"),
-        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
-          "actions": [{"type": "actuator", "actuator": "a1", "state": "blink"}]}, "执行器状态非法"),
-        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": "abc", "direction": "above",
-          "actions": [{"type": "off_pump"}]}, "阈值非数值"),
-        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
-          "actions": []}, "空动作列表"),
+        ({"source": {"kind": "realtime", "path": "flow_rate"}, "threshold": 1, "direction": "above",
+          "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]}, "缺少触发源卡片"),
+        ({"source_card": "e2e-flow", "source": {"kind": "nope", "path": "flow_rate"}, "threshold": 1,
+          "direction": "above", "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]},
+         "触发源类型非法"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": ""}, "threshold": 1,
+          "direction": "above", "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]},
+         "触发源缺取值路径"),
+        ({"source_card": "e2e-custom", "source": {"kind": "custom", "url": "http://evil.example.com/x",
+          "path": "v", "period": 5}, "threshold": 1, "direction": "above",
+          "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]}, "触发源白名单外"),
+        ({"source_card": "e2e-custom", "source": {"kind": "custom", "url": RO, "path": "v", "period": 1},
+          "threshold": 1, "direction": "above",
+          "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]}, "触发源周期 <2s"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": "flow_rate"}, "threshold": 1,
+          "direction": "above", "actions": [{"state": "off", "kind": "url", "url": RO}]}, "动作缺卡片"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": "flow_rate"}, "threshold": 1,
+          "direction": "above", "actions": [{"card": "e2e-ctl", "state": "blink", "kind": "url", "url": RO}]},
+         "动作状态非法"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": "flow_rate"}, "threshold": 1,
+          "direction": "above", "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url",
+                                              "url": "http://evil.example.com/x"}]}, "动作指令白名单外"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": "flow_rate"}, "threshold": "abc",
+          "direction": "above", "actions": [{"card": "e2e-ctl", "state": "off", "kind": "url", "url": RO}]},
+         "阈值非数值"),
+        ({"source_card": "e2e-flow", "source": {"kind": "realtime", "path": "flow_rate"}, "threshold": 1,
+          "direction": "above", "actions": []}, "空动作列表"),
     ]
     for rule, name in bad:
         r = request("POST", "/api/water/alarm/links", {"links": [dict(rule, id="bad")]})
@@ -454,40 +481,35 @@ def main() -> None:
           str([it["action"] for it in r["data"]["items"]][:10]))
     r = request("POST", "/api/water/alarm/links", {"links": []})
     check("联动规则已恢复空", r["code"] == 0 and r["data"]["links"] == [], str(r))
-    r = request("POST", "/api/water/alarm/actuators", {"actuators": []})
-    check("执行器档案已恢复空", r["code"] == 0 and r["data"]["actuators"] == [], str(r))
 
-    print("== 9.4 自定义传感器通道（全链路） ==")
-    r = request("GET", "/api/water/custom/channels")
-    check("自定义通道读取可用", r["code"] == 0 and "channels" in r["data"], str(r))
-    ch = [{"id": "c1", "name": "E2E通道", "unit": "lx",
-           "url": f"{BASE}/api/water/realtime?token={TOKEN}", "path": "data.flow_rate", "period": 2}]
-    r = request("POST", "/api/water/custom/channels", {"channels": ch})
-    check("声明自定义通道成功", r["code"] == 0 and len(r["data"]["channels"]) == 1, str(r))
-    r = request("POST", "/api/water/custom/channels",
-                {"channels": [{"id": "c2", "name": "坏", "url": "http://evil.example.com/x",
-                               "path": "v", "period": 5}]})
-    check("通道白名单外主机被拒 40002", r["code"] == 40002, str(r))
-    r = request("POST", "/api/water/custom/channels",
-                {"channels": [{"id": "c3", "name": "坏", "url": f"{BASE}/x", "path": "v", "period": 1}]})
-    check("轮询周期 <2s 被拒 40002", r["code"] == 40002, str(r))
-    r = request_raw("POST", "/api/water/custom/channels", {"channels": ch}, token=viewer_token)
-    check("viewer 声明通道被拒 40301", r["code"] == 40301, str(r))
-    time.sleep(3)   # 等采集循环至少轮询一次（period=2s）
+    print("== 9.4 自定义传感器通道（卡片即声明） ==")
+    time.sleep(3)   # 等采集循环按卡片周期(2s)至少轮询一次
     r = request("GET", "/api/water/realtime")
-    check("realtime 快照含自定义通道与读数",
-          "custom" in r["data"] and "custom_channels" in r["data"], str(sorted(r["data"].keys())))
-    qs = urllib.parse.urlencode({"channel_id": "c1", "start": now_fmt(-5), "end": now_fmt(5)})
+    chans = r["data"].get("custom_channels") or []
+    vals = r["data"].get("custom") or {}
+    check("realtime 快照含卡片派生的自定义通道",
+          any(c.get("id") == "e2e-custom" for c in chans), str(chans))
+    check("自定义通道已轮询到读数", vals.get("e2e-custom") is not None, str(vals))
+    qs = urllib.parse.urlencode({"channel_id": "e2e-custom", "start": now_fmt(-5), "end": now_fmt(5)})
     r = request("GET", f"/api/water/custom/history?{qs}")
     check("自定义通道历史可查询", r["code"] == 0 and isinstance(r["data"]["points"], list), str(r))
-    qs = urllib.parse.urlencode({"channel_id": "c1", "start": now_fmt(-5), "end": now_fmt(5)})
+    qs = urllib.parse.urlencode({"channel_id": "e2e-custom", "start": now_fmt(-5), "end": now_fmt(5)})
     r = request("GET", f"/api/water/custom/stats?{qs}")
     check("自定义通道统计可查询", r["code"] == 0 and "samples" in r["data"], str(r))
-    r = request("GET", "/api/water/logs?category=config&page_size=20")
-    check("通道声明已入日志(config.channel)", "config.channel" in [it["action"] for it in r["data"]["items"]],
-          str([it["action"] for it in r["data"]["items"]][:10]))
-    r = request("POST", "/api/water/custom/channels", {"channels": []})
-    check("自定义通道已恢复空", r["code"] == 0 and r["data"]["channels"] == [], str(r))
+    # 删除卡片后通道自动消失（卡片即声明，不再轮询）
+    r = request("POST", "/api/water/dashboard/layout", {"layout": {"version": 1, "widgets": []}})
+    check("清空布局成功", r["code"] == 0, str(r))
+    time.sleep(1.0)
+    r = request("GET", "/api/water/realtime")
+    check("卡片删除后通道不再采集", not (r["data"].get("custom_channels") or []),
+          str(r["data"].get("custom_channels")))
+    # 还原布局
+    if layout_before_links:
+        request("POST", "/api/water/dashboard/layout", {"layout": layout_before_links})
+    else:
+        request("POST", "/api/water/dashboard/layout/reset")
+    r = request("GET", "/api/water/dashboard/layout")
+    check("联动测试布局已还原", r["code"] == 0 and r["data"]["layout"] == layout_before_links, str(r))
 
     print("== 10. 账号清理 ==")
     me = request("GET", "/api/auth/users")
