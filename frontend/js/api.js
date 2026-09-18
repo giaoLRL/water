@@ -94,5 +94,18 @@ window.API = (() => {
     dashboardLayoutSave: (layout) => req("POST", "/api/water/dashboard/layout", { layout }),
     dashboardLayoutReset: () => req("POST", "/api/water/dashboard/layout/reset"),
     dashboardProxy: (url, log) => req("GET", "/api/water/dashboard/proxy?url=" + encodeURIComponent(url) + (log ? "&log=1" : "")),
+    // 报警联动（v2 个体化）：执行器档案 + 规则（触发源/阈值/动作/恢复动作）
+    alarmLinksGet: () => req("GET", "/api/water/alarm/links"),
+    alarmLinksSet: (links) => req("POST", "/api/water/alarm/links", { links }),
+    alarmActuatorsGet: () => req("GET", "/api/water/alarm/actuators"),
+    alarmActuatorsSet: (actuators) => req("POST", "/api/water/alarm/actuators", { actuators }),
+    // 自定义传感器通道（全链路：声明→轮询入库→历史/统计）
+    customChannelsGet: () => req("GET", "/api/water/custom/channels"),
+    customChannelsSet: (channels) => req("POST", "/api/water/custom/channels", { channels }),
+    customHistory: (channelId, start, end) => req("GET", "/api/water/custom/history" + qs({ channel_id: channelId, start, end })),
+    customStats: (channelId, start, end) => req("GET", "/api/water/custom/stats" + qs({ channel_id: channelId, start, end })),
+    // 站点文案（浏览器标题/顶栏标题/副标题；GET 无需登录）
+    siteGet: () => req("GET", "/api/water/site"),
+    siteSet: (site) => req("POST", "/api/water/site", site),
   };
 })();

@@ -1036,6 +1036,12 @@ td { font-variant-numeric: tabular-nums; }
 /* 控制开关卡：复用全局 .toggle 开关样式 */
 .wg-ctl { flex: 1; display: flex; align-items: center; gap: 14px; margin-top: 6px; }
 .wg-ctl .kpi-state { font-size: 16px; }
+/* 报警联动规则块（系统配置页，个体化编辑） */
+.link-rule {
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 8px;
+  display: flex; flex-direction: column; gap: 8px; background: var(--bg-deep);
+}
 
 /* --- 操作卡（定量/PID/最近操作/清零，现为网格内 builtin 卡的卡身） --- */
 .op-card { padding: 12px 14px; }

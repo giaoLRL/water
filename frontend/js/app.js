@@ -33,6 +33,24 @@ const app = createApp({
     const popTimers = {};
     const authUser = computed(() => (window.Auth && window.Auth.user) || null);
 
+    // 站点文案（浏览器标题/顶栏标题/副标题）：系统配置页可编辑，全局响应式
+    const site = reactive({
+      title: "智能水循环监测与温控系统",
+      subtitle: "水循环监测 · 流量计量 · 定量浇水 · 报警 · 数据统计",
+      browser: "",
+    });
+    async function loadSite() {
+      try {
+        const s = await API.siteGet();
+        if (s.title) site.title = s.title;
+        if (s.subtitle) site.subtitle = s.subtitle;
+        site.browser = s.browser || "";
+        document.title = s.browser || s.title;
+      } catch (e) { /* silent */ }
+    }
+    loadSite();
+    window.AppSite = site;   // 系统配置页保存后同步更新
+
     function dismissAlarmPopup(key) {
       const t = popTimers[key];
       if (t) { clearTimeout(t); delete popTimers[key]; }
@@ -128,7 +146,7 @@ const app = createApp({
     });
 
     return {
-      state, ICONS, perm, authUser,
+      state, ICONS, perm, authUser, site,
       openJudge, openConfig, backHome, onLogged, doLogout,
       dismissAlarmPopup,
     };
@@ -139,8 +157,8 @@ const app = createApp({
       <div class="brand">
         <div class="logo"><span v-html="ICONS.drop"></span></div>
         <div>
-          <h1>智能水循环监测与温控系统</h1>
-          <div class="subtitle">水循环监测 · 流量计量 · 定量浇水 · 报警 · 数据统计</div>
+          <h1>{{ site.title }}</h1>
+          <div class="subtitle">{{ site.subtitle }}</div>
         </div>
       </div>
       <div class="status-chips">

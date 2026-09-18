@@ -24,6 +24,8 @@ window.ViewWaterDash = {
       histPoints: [],
       histRangeKey: "1h",
       histType: "all",
+      histCustomId: "",        // 选中的自定义通道（历史曲线页，全链路）
+      customStats: {},         // 自定义通道统计 {id: {samples,avg,max,min}}
       customStart: "",
       customEnd: "",
       // 统计/告警/日志
@@ -121,28 +123,55 @@ window.ViewWaterDash = {
     },
     // ---------- 历史 ----------
     async fetchHistory(key, start, end) {
-      this.histRangeKey = key || this.histRangeKey;
-      let s, e;
-      if (key === "custom" && start && end) {
-        s = String(start).replace("T", " ");
-        e = String(end).replace("T", " ");
-      } else { s = this.rangeStart(this.histRangeKey); e = this.rangeEnd(); }
+      if (key && key.startsWith("c:")) {
+        // 自定义通道（全链路）：时间范围沿用当前选择
+        this.histCustomId = key.slice(2);
+      } else if (key) {
+        this.histRangeKey = key;   // 保留 histCustomId：切时间范围仍看同一自定义通道
+      }
+      const s = start ? String(start).replace("T", " ") : this.rangeStart(this.histRangeKey);
+      const e = end ? String(end).replace("T", " ") : this.rangeEnd();
+      if (this.histCustomId) {
+        try {
+          const d = await API.customHistory(this.histCustomId, s, e);
+          this.histPoints = (d.points || []).map((p) => ({ ts: p.ts, cval: p.value }));
+          this.renderChart();
+        } catch (err) { /* silent */ }
+        return;
+      }
       try {
         const d = await API.history(s, e);
         this.histPoints = d.points || [];
         this.renderChart();
       } catch (err) { /* silent */ }
     },
+    pickCustomChannel(id) {
+      this.histCustomId = id;
+      this.fetchHistory(this.histRangeKey);
+    },
     queryCustom() {
       if (!this.customStart || !this.customEnd) { alert("请选择自定义时间范围的开始和结束时间"); return; }
       this.fetchHistory("custom", this.customStart, this.customEnd);
     },
-    pickHistType(t) { this.histType = t; this.renderChart(); },
+    pickHistType(t) {
+      this.histType = t;
+      this.histCustomId = "";          // 切回本机通道曲线
+      this.fetchHistory(this.histRangeKey);
+    },
     renderChart() {
       const el = document.getElementById("water-hist-chart");
       if (!el || !window.echarts) return;
       const pts = this.histPoints || [];
       const times = pts.map((p) => p.ts);
+      // 自定义通道曲线（全链路）：单序列 + 通道单位
+      if (this.histCustomId) {
+        const ch = (this.realtime.custom_channels || []).find((c) => c.id === this.histCustomId) || {};
+        window.Charts.init("water-hist-chart", {
+          ...window.Charts.baseOption(times, ch.unit || ""),
+          series: [window.Charts.lineSeries(ch.name || "自定义通道", pts.map((p) => p.cval), "#a78bfa")],
+        });
+        return;
+      }
       if (this.histType !== "all") {
         const def = {
           flow: ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0],
@@ -183,6 +212,15 @@ window.ViewWaterDash = {
       const e = this.rangeEnd();
       try { this.stats = await API.stats(s, e); } catch (err) { /* silent */ }
       this.renderStatsChart();
+      this.fetchCustomStats(s, e);
+    },
+    async fetchCustomStats(s, e) {
+      // 自定义通道统计（全链路）：逐通道拉取均值/极值/采样数
+      const out = {};
+      for (const c of (this.realtime.custom_channels || [])) {
+        try { out[c.id] = await API.customStats(c.id, s, e); } catch (err) { /* silent */ }
+      }
+      this.customStats = out;
     },
     renderStatsChart() {
       const el = document.getElementById("water-stats-chart");
@@ -505,6 +543,8 @@ window.ViewWaterDash = {
           <span class="tab" v-if="features.temperature" :class="{ active: histType==='htemp' }" @click="pickHistType('htemp')">加热槽温度</span>
           <span class="tab" v-if="features.pressure" :class="{ active: histType==='pressure' }" @click="pickHistType('pressure')">水压</span>
           <span class="tab" v-if="features.light" :class="{ active: histType==='light' }" @click="pickHistType('light')">光照</span>
+          <span class="tab" v-for="c in (realtime.custom_channels || [])" :key="'c' + c.id"
+                :class="{ active: histCustomId === c.id }" @click="pickCustomChannel(c.id)">{{ c.name }}</span>
         </div>
         <div class="chart" id="water-hist-chart"></div>
       </div>
@@ -533,6 +573,12 @@ window.ViewWaterDash = {
         <div class="metric"><div class="label">水压最低</div><div class="value">{{ stats.min_pressure ?? '--' }}<span class="unit">kPa</span></div></div>
         <div class="metric" v-if="features.light"><div class="label">光照最高</div><div class="value">{{ stats.max_light ?? '--' }}<span class="unit">lx</span></div></div>
         <div class="metric" v-if="features.light"><div class="label">光照最低</div><div class="value">{{ stats.min_light ?? '--' }}<span class="unit">lx</span></div></div>
+      </div>
+      <div class="grid-4" v-for="c in (realtime.custom_channels || [])" :key="'cs' + c.id" style="margin-bottom:14px;">
+        <div class="metric"><div class="label">{{ c.name }} 均值</div><div class="value">{{ (customStats[c.id] || {}).avg_value ?? '--' }}<span class="unit">{{ c.unit }}</span></div></div>
+        <div class="metric"><div class="label">{{ c.name }} 最高</div><div class="value">{{ (customStats[c.id] || {}).max_value ?? '--' }}<span class="unit">{{ c.unit }}</span></div></div>
+        <div class="metric"><div class="label">{{ c.name }} 最低</div><div class="value">{{ (customStats[c.id] || {}).min_value ?? '--' }}<span class="unit">{{ c.unit }}</span></div></div>
+        <div class="metric"><div class="label">{{ c.name }} 采样点数</div><div class="value">{{ (customStats[c.id] || {}).samples ?? '--' }}<span class="unit">条</span></div></div>
       </div>
       <div class="grid-4">
         <div class="metric"><div class="label">区间起始累计</div><div class="value">{{ stats.start_total ?? '--' }}<span class="unit">L</span></div></div>

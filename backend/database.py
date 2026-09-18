@@ -149,6 +149,19 @@ def init_database() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            # 自定义传感器数据（前端声明通道，后端按周期轮询入库；全链路：历史/统计/联动）
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS custom_sensor_data (
+                    id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    channel_id VARCHAR(48) NOT NULL,
+                    ts         DATETIME NOT NULL,
+                    value      DOUBLE NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_custom (channel_id, ts)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
             # 操作日志（设备控制 + 系统配置 + 账号管理）
             # operator: 操作账号名；系统自动动作(恒温闭环/判定服务)为空
             # source  : manual(人工) / auto(本地自动) / judge(判定服务)
@@ -477,6 +490,51 @@ def insert_control_log(action: str, result: str, detail: str | None = None,
                 "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (DEVICE_ID, datetime.now(), action, result, detail, operator, source),
             )
+    finally:
+        conn.close()
+
+
+# ---------- 自定义传感器通道（全链路：声明→轮询入库→历史/统计） ----------
+def insert_custom_sensor(channel_id: str, value: float) -> None:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO custom_sensor_data (channel_id, ts, value) VALUES (%s, %s, %s)",
+                (channel_id, datetime.now(), float(value)),
+            )
+    finally:
+        conn.close()
+
+
+def query_custom_history(channel_id: str, start: str, end: str, limit: int = 5000) -> list[dict]:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ts, value FROM custom_sensor_data "
+                "WHERE channel_id=%s AND ts BETWEEN %s AND %s ORDER BY ts ASC LIMIT %s",
+                (channel_id, start, end, limit),
+            )
+            return [{"ts": r["ts"].strftime("%Y-%m-%d %H:%M:%S"), "value": r["value"]}
+                    for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def custom_sensor_stats(channel_id: str, start: str, end: str) -> dict:
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS samples, AVG(value) AS avg_value, MAX(value) AS max_value, "
+                "MIN(value) AS min_value FROM custom_sensor_data "
+                "WHERE channel_id=%s AND ts BETWEEN %s AND %s",
+                (channel_id, start, end),
+            )
+            row = cur.fetchone()
+            return {"samples": row["samples"], "avg_value": row["avg_value"],
+                    "max_value": row["max_value"], "min_value": row["min_value"]}
     finally:
         conn.close()
 

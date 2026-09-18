@@ -114,10 +114,16 @@ window.Widgets = (() => {
 
   const ACTION_LABELS = {
     "config.alarm": "修改告警阈值",
+    "config.link": "修改报警联动",
     "config.period": "修改采集周期",
     "config.tank": "修改水槽容积",
     "config.dashboard": "修改仪表盘布局",
+    "config.site": "修改站点文案",
     "device.custom": "自定义指令",
+    "link_off_pump": "联动关水泵",
+    "link_off_heater": "联动关加热",
+    "link_cancel_target": "联动取消定量",
+    "link_actuator": "联动执行器动作",
     "account.create": "创建账号",
     "account.password": "重置密码",
     "account.role": "修改角色",

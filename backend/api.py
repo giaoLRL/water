@@ -15,6 +15,7 @@ import auth
 import config
 import database
 import store
+from alarm import LINK_ACTION_TYPES, LINK_CHANNELS, LINK_DIRECTIONS, LINK_SENSOR_KINDS
 from state import services
 
 router = APIRouter(prefix="/api")
@@ -187,6 +188,9 @@ def _snapshot() -> dict:
         "active_alarms": alarms,
         "alarm_count": len(alarms),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # 自定义传感器通道（全链路：声明+最近读数，卡片取值路径 custom.<id>）
+        "custom_channels": services.custom.channels() if services.custom else [],
+        "custom": services.custom.values() if services.custom else {},
     }
 
 
@@ -443,6 +447,222 @@ def alarm_config_set(body: AlarmConfigRequest, user: dict = Depends(auth.require
     database.insert_control_log("config.alarm", "success", detail,
                                 operator=user.get("username") or None, source="manual")
     return ok({"thresholds": services.alarm.thresholds})
+
+
+# ---------- 站点文案（浏览器标题/顶栏标题/副标题；登录页也需展示，故 GET 无需登录） ----------
+SITE_DEFAULTS = {
+    "title": "智能水循环监测与温控系统",
+    "subtitle": "水循环监测 · 流量计量 · 定量浇水 · 报警 · 数据统计",
+    "browser": "",   # 留空 = 同站点标题
+}
+
+
+@router.get("/water/site")
+def site_get():
+    cfg = database.get_all_config()
+    out = dict(SITE_DEFAULTS)
+    for k in SITE_DEFAULTS:
+        v = cfg.get(f"site_{k}")
+        if v:
+            out[k] = v
+    return ok(out)
+
+
+@router.post("/water/site")
+def site_set(body: dict, user: dict = Depends(auth.require_perm("cfg_system"))):
+    for k in SITE_DEFAULTS:
+        if k in body:
+            database.set_config(f"site_{k}", str(body[k]).strip())
+    database.insert_control_log("config.site", "success",
+                                f"修改站点文案: {body.get('title', '')}"[:250],
+                                operator=user.get("username") or None, source="manual")
+    return site_get()
+
+
+# ---------- 报警联动（v2 个体化：规则自带阈值，触发源/执行器均区分个体） ----------
+def _validate_link_url(url: str, what: str):
+    """联动相关 URL 的通用校验：http(s) + 代理白名单主机，非法抛 ValueError。"""
+    u = urlparse(str(url or ""))
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError(f"{what} 非法（仅支持 http/https）: {url}")
+    if u.hostname not in config.DASHBOARD_PROXY_HOSTS:
+        raise ValueError(f"{what} 目标主机不在白名单: {u.hostname}")
+
+
+def _validate_link_actions(actions):
+    """校验动作数组（触发与恢复共用）：类型合法、执行器引用存在。"""
+    if not isinstance(actions, list) or not actions:
+        raise ValueError("动作列表不能为空")
+    known = {a.get("id") for a in (services.alarm.actuators() if services.alarm else [])}
+    for a in actions:
+        if not isinstance(a, dict) or a.get("type") not in LINK_ACTION_TYPES:
+            raise ValueError(f"非法联动动作: {a}")
+        if a.get("type") == "actuator":
+            if a.get("actuator") not in known:
+                raise ValueError(f"动作引用的执行器不存在: {a.get('actuator')}")
+            if a.get("state") not in ("on", "off"):
+                raise ValueError(f"执行器动作状态非法: {a.get('state')}")
+
+
+@router.get("/water/alarm/actuators")
+def alarm_actuators_get(_: dict = Depends(auth.require_perm("cfg_alarm"))):
+    return ok({"actuators": services.alarm.actuators() if services.alarm else []})
+
+
+@router.post("/water/alarm/actuators")
+def alarm_actuators_set(body: dict, user: dict = Depends(auth.require_perm("cfg_alarm"))):
+    """执行器档案：外部装置个体（名称 + 开/关 GET 指令 URL，至少一条）。"""
+    actuators = body.get("actuators")
+    if not isinstance(actuators, list):
+        return err(40002, "actuators 必须为数组")
+    seen: set[str] = set()
+    for a in actuators:
+        if not isinstance(a, dict):
+            return err(40002, "执行器档案格式错误")
+        aid = str(a.get("id", "")).strip()
+        name = str(a.get("name", "")).strip()
+        if not aid or aid in seen:
+            return err(40002, "每个执行器必须有唯一 id")
+        if not name:
+            return err(40002, "执行器名称不能为空")
+        seen.add(aid)
+        try:
+            if not str(a.get("on_url", "")).strip() and not str(a.get("off_url", "")).strip():
+                raise ValueError(f"执行器[{name}] 开/关指令 URL 至少填一条")
+            if str(a.get("on_url", "")).strip():
+                _validate_link_url(a["on_url"], f"执行器[{name}] 开指令")
+            if str(a.get("off_url", "")).strip():
+                _validate_link_url(a["off_url"], f"执行器[{name}] 关指令")
+        except ValueError as exc:
+            return err(40002, str(exc))
+    store.set_json("actuators", actuators)
+    if services.alarm:
+        services.alarm.reload_links()
+    database.insert_control_log("config.link", "success",
+                                f"保存执行器档案 {len(actuators)} 条",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"actuators": actuators})
+
+
+@router.get("/water/alarm/links")
+def alarm_links_get(_: dict = Depends(auth.require_perm("cfg_alarm"))):
+    if services.alarm:
+        return ok({"links": services.alarm.links(), "actuators": services.alarm.actuators()})
+    return ok({"links": [], "actuators": []})
+
+
+@router.post("/water/alarm/links")
+def alarm_links_set(body: dict, user: dict = Depends(auth.require_perm("cfg_alarm"))):
+    """联动规则 v2：规则自带阈值；触发源 = 本机通道或自定义接口传感器；
+    动作显式指向执行器个体（本机水泵/加热/定量，或执行器档案中的装置）。"""
+    links = body.get("links")
+    if not isinstance(links, list):
+        return err(40002, "links 必须为数组")
+    seen_ids: set[str] = set()
+    try:
+        for r in links:
+            if not isinstance(r, dict):
+                return err(40002, "联动规则格式错误")
+            rid = str(r.get("id", "")).strip()
+            if not rid or rid in seen_ids:
+                return err(40002, "每条规则必须有唯一 id")
+            seen_ids.add(rid)
+            sensor = r.get("sensor")
+            if not isinstance(sensor, dict) or sensor.get("kind") not in LINK_SENSOR_KINDS:
+                return err(40002, f"触发源类型非法: {sensor}")
+            if sensor["kind"] == "builtin":
+                if sensor.get("channel") not in LINK_CHANNELS:
+                    return err(40002, f"非法联动通道: {sensor.get('channel')}")
+            else:
+                _validate_link_url(sensor.get("url"), "传感器接口 URL")
+                if not str(sensor.get("path", "")).strip():
+                    return err(40002, "自定义传感器必须填写取值路径")
+                if not (2 <= float(sensor.get("period") or 5) <= 300):
+                    return err(40002, "自定义传感器轮询周期须在 2~300 秒")
+            try:
+                if float(r.get("threshold")) != float(r.get("threshold")):
+                    raise ValueError("阈值不能为空")
+            except (TypeError, ValueError):
+                return err(40002, f"规则[{rid}] 阈值必须为有效数值")
+            if r.get("direction") not in LINK_DIRECTIONS:
+                return err(40002, f"非法联动方向: {r.get('direction')}")
+            _validate_link_actions(r.get("actions"))
+            recover = r.get("recover") or {}
+            if recover.get("actions"):
+                _validate_link_actions(recover["actions"])
+    except ValueError as exc:
+        return err(40002, str(exc))
+    store.set_json("alarm_links", links)
+    if services.alarm:
+        services.alarm.reload_links()
+    database.insert_control_log("config.link", "success",
+                                f"保存报警联动规则 {len(links)} 条",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"links": links})
+
+
+# ---------- 自定义传感器通道（全链路：声明→轮询入库→历史/统计） ----------
+@router.get("/water/custom/channels")
+def custom_channels_get(_: dict = Depends(auth.require_perm("view_monitor"))):
+    if services.custom:
+        return ok({"channels": services.custom.channels(), "values": services.custom.values()})
+    return ok({"channels": [], "values": {}})
+
+
+@router.post("/water/custom/channels")
+def custom_channels_set(body: dict, user: dict = Depends(auth.require_perm("cfg_system"))):
+    """声明自定义传感器通道：后端采集循环轮询入库，历史/统计/联动全链路兼容。"""
+    channels = body.get("channels")
+    if not isinstance(channels, list):
+        return err(40002, "channels 必须为数组")
+    seen: set[str] = set()
+    for c in channels:
+        if not isinstance(c, dict):
+            return err(40002, "通道声明格式错误")
+        cid = str(c.get("id", "")).strip()
+        if not cid or cid in seen:
+            return err(40002, "每个通道必须有唯一 id")
+        seen.add(cid)
+        if not str(c.get("name", "")).strip():
+            return err(40002, f"通道[{cid}] 名称不能为空")
+        try:
+            _validate_link_url(c.get("url"), f"通道[{cid}] 接口 URL")
+            if not str(c.get("path", "")).strip():
+                raise ValueError(f"通道[{cid}] 必须填写取值路径")
+            if not (2 <= float(c.get("period") or 5) <= 300):
+                raise ValueError(f"通道[{cid}] 轮询周期须为 2~300 秒")
+        except (TypeError, ValueError) as exc:
+            return err(40002, str(exc))
+    store.set_json("custom_channels", channels)
+    if services.custom:
+        services.custom.reload()
+    database.insert_control_log("config.channel", "success",
+                                f"保存自定义传感器通道 {len(channels)} 条",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"channels": channels})
+
+
+@router.get("/water/custom/history")
+def custom_history(channel_id: str = Query(...),
+                   start: str = Query(...), end: str = Query(...),
+                   limit: int = Query(default=5000, ge=1, le=50000),
+                   _: dict = Depends(auth.require_perm("view_history"))):
+    try:
+        _validate_range(start, end)
+    except ValueError as exc:
+        return err(40002, str(exc))
+    return ok({"points": database.query_custom_history(channel_id, start, end, limit)})
+
+
+@router.get("/water/custom/stats")
+def custom_stats(channel_id: str = Query(...),
+                 start: str = Query(...), end: str = Query(...),
+                 _: dict = Depends(auth.require_perm("view_history"))):
+    try:
+        _validate_range(start, end)
+    except ValueError as exc:
+        return err(40002, str(exc))
+    return ok(database.custom_sensor_stats(channel_id, start, end))
 
 
 @router.get("/water/alarms")

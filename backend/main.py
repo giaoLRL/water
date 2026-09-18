@@ -21,6 +21,7 @@ import config
 import database
 import store
 from alarm import AlarmEngine
+from custom_channels import CustomChannelManager
 from api import router
 from auth import ensure_admin
 from judge_service import JudgeService
@@ -47,6 +48,10 @@ def run_cycle() -> None:
             if ing.get(k) is not None:
                 data[k] = float(ing[k])
         data["total_flow"] = data.get("total_liters")
+
+    # 自定义传感器通道：按各自周期轮询 → 入库 → 值并入 data["custom"]（全链路）
+    services.custom.poll()
+    data["custom"] = services.custom.values()
 
     # 恒温闭环控制(PID)：需设备同时支持温度与加热通道（任务六）
     if config.pid_supported() and store.pid_enabled():
@@ -81,6 +86,8 @@ def run_cycle() -> None:
 
     # 告警检查(任务六异常告警)：仅检查设备实际支持的通道
     services.alarm.check(data)
+    # 报警联动：本机通道规则随 check 评估；自定义传感器源按各自周期在此轮询
+    services.alarm.check_custom()
 
     # 判定服务：上报 + 轮询指令 + 执行反馈(任务五)
     judge = services.judge
@@ -138,6 +145,8 @@ async def lifespan(app: FastAPI):
     ensure_admin()
     services.plant = WaterPlant()
     services.alarm = AlarmEngine()
+    services.alarm.plant = services.plant   # 报警联动动作的执行对象
+    services.custom = CustomChannelManager()  # 自定义传感器通道（全链路）
     services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
     services.judge = JudgeService()
     enabled = [k for k, v in config.DEVICE_FEATURES.items() if v]

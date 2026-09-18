@@ -395,6 +395,100 @@ def main() -> None:
     r = request("GET", "/api/water/dashboard/layout")
     check("布局已恢复", r["code"] == 0 and r["data"]["layout"] == saved_before, str(r))
 
+    print("== 9.3 报警联动（v2 个体化） ==")
+    r = request("GET", "/api/water/alarm/links")
+    check("联动读取接口可用(含执行器档案)",
+          r["code"] == 0 and "links" in r["data"] and "actuators" in r["data"], str(r))
+    r = request_raw("GET", "/api/water/alarm/links", token=viewer_token)
+    check("viewer 读取联动被拒 40301", r["code"] == 40301, str(r))
+    # 执行器档案：外部装置个体（指令 URL 指向本机只读接口，安全）
+    act = [{"id": "a1", "name": "E2E水阀",
+            "on_url": f"{BASE}/api/water/realtime?token={TOKEN}",
+            "off_url": f"{BASE}/api/water/realtime?token={TOKEN}"}]
+    r = request("POST", "/api/water/alarm/actuators", {"actuators": act})
+    check("保存执行器档案成功", r["code"] == 0 and len(r["data"]["actuators"]) == 1, str(r))
+    r = request("POST", "/api/water/alarm/actuators",
+                {"actuators": [{"id": "a2", "name": "坏", "off_url": "http://evil.example.com/x"}]})
+    check("执行器白名单外主机被拒 40002", r["code"] == 40002, str(r))
+    r = request("POST", "/api/water/alarm/actuators",
+                {"actuators": [{"id": "a3", "name": "空URL"}]})
+    check("执行器开/关 URL 全空被拒 40002", r["code"] == 40002, str(r))
+    # 联动规则 v2：规则自带阈值；动作显式指向执行器个体
+    good = [{"id": "t1", "name": "E2E联动", "enabled": True,
+             "sensor": {"kind": "builtin", "channel": "light"},
+             "threshold": 99999, "direction": "above",
+             "actions": [{"type": "off_pump"},
+                         {"type": "actuator", "actuator": "a1", "state": "off"}],
+             "recover": {"actions": [{"type": "actuator", "actuator": "a1", "state": "on"}]}}]
+    r = request("POST", "/api/water/alarm/links", {"links": good})
+    check("保存联动规则成功", r["code"] == 0 and len(r["data"]["links"]) == 1, str(r))
+    r = request("GET", "/api/water/alarm/links")
+    saved = r["data"]["links"]
+    check("规则回读一致(自带阈值+执行器引用)",
+          saved and saved[0]["sensor"]["channel"] == "light"
+          and float(saved[0]["threshold"]) == 99999
+          and saved[0]["actions"][1]["actuator"] == "a1"
+          and saved[0]["recover"]["actions"][0]["state"] == "on", str(saved))
+    bad = [
+        ({"sensor": {"kind": "builtin", "channel": "nope"}, "threshold": 1, "direction": "above",
+          "actions": [{"type": "off_pump"}]}, "非法通道"),
+        ({"sensor": {"kind": "custom", "url": "http://evil.example.com/x", "path": "v", "period": 5},
+          "threshold": 1, "direction": "above", "actions": [{"type": "off_pump"}]}, "自定义源白名单外"),
+        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
+          "actions": [{"type": "actuator", "actuator": "ghost", "state": "off"}]}, "引用不存在执行器"),
+        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
+          "actions": [{"type": "actuator", "actuator": "a1", "state": "blink"}]}, "执行器状态非法"),
+        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": "abc", "direction": "above",
+          "actions": [{"type": "off_pump"}]}, "阈值非数值"),
+        ({"sensor": {"kind": "builtin", "channel": "light"}, "threshold": 1, "direction": "above",
+          "actions": []}, "空动作列表"),
+    ]
+    for rule, name in bad:
+        r = request("POST", "/api/water/alarm/links", {"links": [dict(rule, id="bad")]})
+        check(f"非法规则被拒 40002（{name}）", r["code"] == 40002, str(r))
+    r = request_raw("POST", "/api/water/alarm/links", {"links": good}, token=viewer_token)
+    check("viewer 保存联动被拒 40301", r["code"] == 40301, str(r))
+    r = request("GET", "/api/water/logs?category=config&page_size=20")
+    check("联动配置已入日志(config.link)",
+          "config.link" in [it["action"] for it in r["data"]["items"]],
+          str([it["action"] for it in r["data"]["items"]][:10]))
+    r = request("POST", "/api/water/alarm/links", {"links": []})
+    check("联动规则已恢复空", r["code"] == 0 and r["data"]["links"] == [], str(r))
+    r = request("POST", "/api/water/alarm/actuators", {"actuators": []})
+    check("执行器档案已恢复空", r["code"] == 0 and r["data"]["actuators"] == [], str(r))
+
+    print("== 9.4 自定义传感器通道（全链路） ==")
+    r = request("GET", "/api/water/custom/channels")
+    check("自定义通道读取可用", r["code"] == 0 and "channels" in r["data"], str(r))
+    ch = [{"id": "c1", "name": "E2E通道", "unit": "lx",
+           "url": f"{BASE}/api/water/realtime?token={TOKEN}", "path": "data.flow_rate", "period": 2}]
+    r = request("POST", "/api/water/custom/channels", {"channels": ch})
+    check("声明自定义通道成功", r["code"] == 0 and len(r["data"]["channels"]) == 1, str(r))
+    r = request("POST", "/api/water/custom/channels",
+                {"channels": [{"id": "c2", "name": "坏", "url": "http://evil.example.com/x",
+                               "path": "v", "period": 5}]})
+    check("通道白名单外主机被拒 40002", r["code"] == 40002, str(r))
+    r = request("POST", "/api/water/custom/channels",
+                {"channels": [{"id": "c3", "name": "坏", "url": f"{BASE}/x", "path": "v", "period": 1}]})
+    check("轮询周期 <2s 被拒 40002", r["code"] == 40002, str(r))
+    r = request_raw("POST", "/api/water/custom/channels", {"channels": ch}, token=viewer_token)
+    check("viewer 声明通道被拒 40301", r["code"] == 40301, str(r))
+    time.sleep(3)   # 等采集循环至少轮询一次（period=2s）
+    r = request("GET", "/api/water/realtime")
+    check("realtime 快照含自定义通道与读数",
+          "custom" in r["data"] and "custom_channels" in r["data"], str(sorted(r["data"].keys())))
+    qs = urllib.parse.urlencode({"channel_id": "c1", "start": now_fmt(-5), "end": now_fmt(5)})
+    r = request("GET", f"/api/water/custom/history?{qs}")
+    check("自定义通道历史可查询", r["code"] == 0 and isinstance(r["data"]["points"], list), str(r))
+    qs = urllib.parse.urlencode({"channel_id": "c1", "start": now_fmt(-5), "end": now_fmt(5)})
+    r = request("GET", f"/api/water/custom/stats?{qs}")
+    check("自定义通道统计可查询", r["code"] == 0 and "samples" in r["data"], str(r))
+    r = request("GET", "/api/water/logs?category=config&page_size=20")
+    check("通道声明已入日志(config.channel)", "config.channel" in [it["action"] for it in r["data"]["items"]],
+          str([it["action"] for it in r["data"]["items"]][:10]))
+    r = request("POST", "/api/water/custom/channels", {"channels": []})
+    check("自定义通道已恢复空", r["code"] == 0 and r["data"]["channels"] == [], str(r))
+
     print("== 10. 账号清理 ==")
     me = request("GET", "/api/auth/users")
     tid = next((u["id"] for u in me["data"]["users"] if u["username"] == test_user), None)
