@@ -52,6 +52,7 @@ window.ViewWaterDash = {
       widgets: [],
       editing: false,
       layoutReady: false,
+      hasPrevLayout: false,   // 是否存在可恢复的「上一次布局」（后端保存时自动备份）
       dlg: { show: false, mode: "add", tab: "builtin", target: null, form: {}, previewText: "", previewRaw: "", previewBusy: false },
       timer: null,
     };
@@ -482,8 +483,12 @@ window.ViewWaterDash = {
     /* 读取布局：已保存过用服务端的（全局共享），否则按设备能力生成默认布局。
        按 builtin 去重，防止历史/手编布局出现两张同类特殊卡（如双回路卡 SVG id 冲突）。 */
     async loadLayout() {
-      let saved = null;
-      try { saved = (await API.dashboardLayoutGet()).layout; } catch (e) { /* silent */ }
+      let resp = null;
+      try { resp = await API.dashboardLayoutGet(); } catch (e) { /* silent */ }
+      const saved = (resp && resp.layout) || null;
+      // 版本号：保存时回传，服务端据此判断"这个页面拿到的布局是不是最新的"
+      this._layoutRev = resp && typeof resp.rev === "number" ? resp.rev : null;
+      this.hasPrevLayout = !!(resp && resp.has_prev);
       this._layoutFromServer = !!(saved && Array.isArray(saved.widgets) && saved.widgets.length);
       let widgets = this._layoutFromServer ? saved.widgets : window.Widgets.defaultLayout(this.features);
       const seen = new Set();
@@ -542,9 +547,18 @@ window.ViewWaterDash = {
     async saveLayout() {
       try {
         const widgets = this.widgets.map((w) => this.serialize(w));
-        await API.dashboardLayoutSave({ version: 1, widgets });
+        const res = await API.dashboardLayoutSave({ version: 1, widgets }, this._layoutRev);
+        if (res && typeof res.rev === "number") this._layoutRev = res.rev;
+        this.hasPrevLayout = true;      // 保存即产生一份"上一次布局"备份
         this._layoutFromServer = true;
-      } catch (e) { /* 保存失败不打断编辑 */ }
+      } catch (e) {
+        // 版本冲突：说明别的窗口改过布局，这里不能硬覆盖，改为载入最新布局
+        if (/其他窗口修改/.test((e && e.message) || "")) {
+          alert("仪表盘布局已被其他窗口修改，已为你载入最新布局，请重新编辑。");
+          await this.loadLayout();
+        }
+        /* 其他失败不打断编辑 */
+      }
     },
     toggleEdit() {
       this.editing = !this.editing;
@@ -556,12 +570,33 @@ window.ViewWaterDash = {
     },
     async resetLayout() {
       if (!confirm("恢复为默认布局？已添加的自定义卡片与排版将被清除。")) return;
-      try { await API.dashboardLayoutReset(); } catch (e) { /* silent */ }
+      try {
+        const res = await API.dashboardLayoutReset();
+        if (res && typeof res.rev === "number") this._layoutRev = res.rev;
+        this.hasPrevLayout = true;      // 重置前的那一版已自动备份，可「恢复上一次」
+      } catch (e) { /* silent */ }
       this._layoutFromServer = false;
       this.widgets = window.Widgets.defaultLayout(this.features);
       this.editing = false;
       if (this._grid) { this._grid.enableMove(false); this._grid.enableResize(false); }
       this.rebuildGrid();
+    },
+    /* 一键回到「上一次布局」：后端在每次保存/重置前自动备份上一版，
+       用于误删卡片、被别的窗口覆盖等情况的快速回退（可反复点击在两版之间切换）。 */
+    async restorePrevLayout() {
+      try {
+        const res = await API.dashboardLayoutRestorePrev();
+        const lay = res && res.layout;
+        if (lay && Array.isArray(lay.widgets)) {
+          this.widgets = lay.widgets;
+          this._layoutFromServer = true;
+          this.hasPrevLayout = true;
+          if (typeof res.rev === "number") this._layoutRev = res.rev;
+          this.rebuildGrid();
+        }
+      } catch (e) {
+        alert("恢复上一次布局失败：" + ((e && e.message) || e));
+      }
     },
     bottomY() {
       return this.widgets.reduce((m, w) => Math.max(m, ((w.grid || {}).y || 0) + ((w.grid || {}).h || 2)), 0);
@@ -752,6 +787,8 @@ window.ViewWaterDash = {
         <button class="btn-ghost" @click="toggleEdit">{{ editing ? '完成' : '编辑卡片' }}</button>
         <template v-if="editing">
           <button class="btn-ghost" @click="openAdd">+ 添加卡片</button>
+          <button class="btn-ghost" v-if="hasPrevLayout" @click="restorePrevLayout"
+                  title="回退到上一次保存前的布局（后端每次保存前自动备份）">恢复上一次</button>
           <button class="btn-ghost" @click="resetLayout">恢复默认</button>
         </template>
       </div>

@@ -1095,6 +1095,63 @@ async function main() {
           await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
     await sleep(1200);
 
+    console.log("== 7.3i 布局一键恢复上一次（并发保护配套） ==");
+    // 布局全局共享一份；后端每次保存/重置前会把上一版存为「上一次布局」，
+    // 这里验证：保存 A 再保存 B 后，界面上点一次「恢复上一次」能回到 A（再点回到 B）。
+    const layoutA = { version: 1, widgets: [
+      { id: "e2e-mark-a1", type: "value", title: "E2E标记A1", unit: "", decimals: 1,
+        source: { kind: "realtime", path: "flow_rate" }, grid: { x: 0, y: 0, w: 2, h: 2 } },
+      { id: "e2e-mark-a2", type: "value", title: "E2E标记A2", unit: "", decimals: 1,
+        source: { kind: "realtime", path: "total_liters" }, grid: { x: 2, y: 0, w: 2, h: 2 } },
+    ] };
+    const layoutB = { version: 1, widgets: [
+      { id: "e2e-mark-b1", type: "value", title: "E2E标记B1", unit: "", decimals: 1,
+        source: { kind: "realtime", path: "flow_rate" }, grid: { x: 0, y: 0, w: 2, h: 2 } },
+    ] };
+    await api("POST", "/api/water/dashboard/layout", { layout: layoutA });
+    await api("POST", "/api/water/dashboard/layout", { layout: layoutB });
+    const revNow = (await api("GET", "/api/water/dashboard/layout")).data;
+    check("保存两版布局后后端记录了可恢复的上一版",
+          (revNow.layout.widgets || []).length === 1 && revNow.has_prev === true,
+          JSON.stringify({ n: revNow.layout.widgets.length, has_prev: revNow.has_prev }));
+    // 旧版本号保存必须被拒（防止停在旧布局的窗口把新布局整片覆盖）
+    const stale = await api("POST", "/api/water/dashboard/layout",
+      { layout: layoutA, base_rev: revNow.rev - 5 });
+    check("版本号过期时后端拒绝保存（code=40009）", stale.code === 40009, JSON.stringify(stale).slice(0, 160));
+    // 页面刷新后拿到最新版本号，进编辑模式点按钮
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("标记布局 B 已在页面生效（1 张卡）", (await cdp.eval("return __e2e.count('.kpi-card');")) === 1);
+    check("进入编辑模式", await cdp.eval("return __e2e.clickText('button','编辑卡片');"));
+    await sleep(600);
+    check("编辑模式出现「恢复上一次」按钮",
+          await cdp.eval("return __e2e.qa('button').some(b=>b.textContent.trim().includes('恢复上一次'));"));
+    check("点击「恢复上一次」", await cdp.eval("return __e2e.clickText('button','恢复上一次');"));
+    await sleep(2000);
+    const backA = (await api("GET", "/api/water/dashboard/layout")).data.layout;
+    check("一键恢复到上一版布局 A（2 张标记卡）",
+          (backA.widgets || []).map((w) => w.id).join(",") === "e2e-mark-a1,e2e-mark-a2",
+          JSON.stringify((backA.widgets || []).map((w) => w.id)));
+    check("再点一次可切回布局 B（恢复前会备份当前版）",
+          await cdp.eval("return __e2e.clickText('button','恢复上一次');"));
+    await sleep(2000);
+    const backB = (await api("GET", "/api/water/dashboard/layout")).data.layout;
+    check("已切回布局 B（1 张标记卡）",
+          (backB.widgets || []).map((w) => w.id).join(",") === "e2e-mark-b1",
+          JSON.stringify((backB.widgets || []).map((w) => w.id)));
+    const logActs = (await api("GET", "/api/water/logs?category=config&page_size=10")).data.items
+      .map((i) => i.detail || "");
+    check("恢复操作写入操作日志", logActs.some((d) => d.includes("恢复上一次")), JSON.stringify(logActs.slice(0, 4)));
+    // 本节收尾：复位为默认布局并回到配置页（后续用例依赖默认布局）
+    await api("POST", "/api/water/dashboard/layout/reset");
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("布局标记已清理并回到配置页",
+          await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
+    await sleep(1200);
+
     console.log("== 7.4 账号管理 ==");
     check("切到账号管理标签", await cdp.eval("return __e2e.clickText('.tab','账号管理');"));
     await sleep(1500);
@@ -1195,6 +1252,18 @@ async function main() {
     try {
       if (layoutBefore) await api("POST", "/api/water/dashboard/layout", { layout: layoutBefore });
       else await api("POST", "/api/water/dashboard/layout/reset");
+      // 还原后再核对一次卡片数：布局是全局共享的，若还有别的页面停在编辑模式，
+      // 它可能在这之后又把旧布局写回去，这里至少要把情况说出来（可点「恢复上一次」回退）。
+      const restored = (await api("GET", "/api/water/dashboard/layout")).data?.layout;
+      const want = layoutBefore ? (layoutBefore.widgets || []).length : 0;
+      const got = ((restored || {}).widgets || []).length;
+      if (got !== want) {
+        console.log(`  [WARN] 布局还原后卡片数不符（期望 ${want}，实际 ${got}）：`
+          + "可能有其它页面正在并发写仪表盘布局；请在页面上点「恢复上一次」回退，"
+          + "或先关闭/退出编辑模式的页面后重跑。");
+      } else {
+        console.log(`  布局已还原：${got} 张卡片`);
+      }
     } catch (e) { /* ignore */ }
     try { if (cdp) await cdp.send("Browser.close"); } catch (e) { /* ignore */ }
     await sleep(500);

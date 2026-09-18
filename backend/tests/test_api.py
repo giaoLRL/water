@@ -792,6 +792,36 @@ def main() -> None:
     check("闭环测试布局已还原",
           all(w["id"] != "p-pid" for w in (request("GET", "/api/water/dashboard/layout")["data"]["layout"] or {"widgets": []})["widgets"]))
 
+    print("== 9.8 布局并发保护与一键恢复上一版 ==")
+    base = request("GET", "/api/water/dashboard/layout")["data"]
+    check("布局接口返回版本号与备份标志",
+          isinstance(base.get("rev"), int) and "has_prev" in base, str(base)[:160])
+    layout_keep = base.get("layout") or {"version": 1, "widgets": []}
+    # 正常保存（带上载入时的版本号）：版本号 +1
+    r = request("POST", "/api/water/dashboard/layout",
+                {"layout": {"version": 1, "widgets": []}, "base_rev": base["rev"]})
+    check("带正确版本号可保存并返回新版本号",
+          r["code"] == 0 and r["data"]["rev"] == base["rev"] + 1, str(r)[:160])
+    # 拿旧版本号再保存：必须被拒（防止旧页面把新布局整片覆盖）
+    r = request("POST", "/api/water/dashboard/layout",
+                {"layout": {"version": 1, "widgets": []}, "base_rev": base["rev"]})
+    check("版本号过期时拒绝保存（40009）", r["code"] == 40009, str(r)[:200])
+    # 老客户端/脚本不带版本号仍可用（向后兼容）
+    r = request("POST", "/api/water/dashboard/layout", {"layout": layout_keep})
+    check("不传版本号时保持向后兼容", r["code"] == 0, str(r)[:160])
+    # 一键恢复上一版：应把刚保存的 layout_keep 换成上一版（空布局）
+    r = request("POST", "/api/water/dashboard/layout/restore_prev")
+    check("一键恢复上一次布局成功",
+          r["code"] == 0 and r["data"]["layout"]["widgets"] == [], str(r)[:200])
+    # 再点一次即可切回（恢复本身也会备份），并写审计日志
+    r = request("POST", "/api/water/dashboard/layout/restore_prev")
+    check("恢复可反复切换（恢复前会备份当前版）",
+          r["code"] == 0 and r["data"]["layout"]["widgets"] == layout_keep.get("widgets", []), str(r)[:200])
+    acts = [i["action"] for i in request("GET", "/api/water/logs?category=config&page_size=10")["data"]["items"]]
+    check("恢复操作写入操作日志", "config.dashboard" in acts, str(acts[:5]))
+    # 收尾：把布局还原成进入本节前的样子
+    request("POST", "/api/water/dashboard/layout", {"layout": layout_keep})
+
     print("== 10. 账号清理 ==")
     me = request("GET", "/api/auth/users")
     tid = next((u["id"] for u in me["data"]["users"] if u["username"] == test_user), None)

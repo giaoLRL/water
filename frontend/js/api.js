@@ -127,8 +127,10 @@ window.API = (() => {
     system: () => req("GET", "/api/water/system"),
     // 仪表盘布局（全局共享）与自定义卡片代理（白名单 GET 代发）
     dashboardLayoutGet: () => req("GET", "/api/water/dashboard/layout"),
-    dashboardLayoutSave: (layout) => req("POST", "/api/water/dashboard/layout", { layout }),
+    // baseRev：载入布局时服务端给的版本号，用于并发保护（布局全局共享一份，防旧页面覆盖新改动）
+    dashboardLayoutSave: (layout, baseRev) => req("POST", "/api/water/dashboard/layout", { layout, base_rev: baseRev }),
     dashboardLayoutReset: () => req("POST", "/api/water/dashboard/layout/reset"),
+    dashboardLayoutRestorePrev: () => req("POST", "/api/water/dashboard/layout/restore_prev"),
     dashboardProxy: (url, log) => req("GET", "/api/water/dashboard/proxy?url=" + encodeURIComponent(url) + (log ? "&log=1" : "")),
     // 报警联动（v3 卡片即来源）：触发源与动作都指向实时监控页的卡片
     alarmLinksGet: () => req("GET", "/api/water/alarm/links"),

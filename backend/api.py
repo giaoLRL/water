@@ -1092,6 +1092,42 @@ def system_status(_: dict = Depends(auth.require_perm("view_device"))):
 class DashboardLayoutRequest(BaseModel):
     """仪表盘布局配置：{widgets: [...]}，单卡片字段由前端 widgets.js 定义。"""
     layout: dict
+    # 并发保护：前端载入这份布局时服务端返回的版本号（GET 的 rev）。
+    # 网页端总是回传；测试脚本/接口直调可以不传，表示"不校验"（向后兼容）。
+    base_rev: int | None = None
+
+
+def _layout_rev() -> int:
+    """当前布局版本号：每次保存/重置/恢复 +1，用于识别"拿着旧布局的页面"。"""
+    try:
+        return int(float(store.get("dashboard_layout_rev", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _layout_backup_now() -> None:
+    """把当前布局备份为「上一次布局」（保存/重置前调用），供一键恢复。
+
+    这是防"误覆盖/被别的窗口覆盖"的安全网：布局是全局共享一份，
+    任何一次保存都会让上一版留在 sys.dashboard_layout_prev。
+    """
+    current = store.get_json("dashboard_layout", None)
+    if current is None:
+        return
+    store.set_json("dashboard_layout_prev", current)
+    store.set("dashboard_layout_prev_ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def _layout_write(layout) -> int:
+    """写入布局（先自动备份当前布局），返回新的版本号。layout=None 表示恢复默认（清空）。"""
+    _layout_backup_now()
+    if layout is None:
+        store.set("dashboard_layout", "")
+    else:
+        store.set_json("dashboard_layout", layout)
+    rev = _layout_rev() + 1
+    store.set("dashboard_layout_rev", str(rev))
+    return rev
 
 
 def _reload_card_consumers() -> None:
@@ -1110,34 +1146,68 @@ def _reload_card_consumers() -> None:
 
 @router.get("/water/dashboard/layout")
 def dashboard_layout_get(_: dict = Depends(auth.require_perm("view_monitor"))):
-    """读取全局仪表盘布局；从未保存过返回 layout=null（前端用内置默认布局）。"""
-    return ok({"layout": store.get_json("dashboard_layout", None)})
+    """读取全局仪表盘布局；从未保存过返回 layout=null（前端用内置默认布局）。
+
+    rev 用于保存时回传（并发保护），has_prev/prev_ts 表示是否存在可恢复的上一次布局。
+    """
+    prev = store.get_json("dashboard_layout_prev", None)
+    return ok({
+        "layout": store.get_json("dashboard_layout", None),
+        "rev": _layout_rev(),
+        "has_prev": prev is not None,
+        "prev_ts": store.get("dashboard_layout_prev_ts", None),
+    })
 
 
 @router.post("/water/dashboard/layout")
 def dashboard_layout_set(body: DashboardLayoutRequest,
                          user: dict = Depends(auth.require_perm("cfg_system"))):
-    """保存全局仪表盘布局（覆盖式）。"""
+    """保存全局仪表盘布局（覆盖式，保存前自动备份上一版）。"""
     raw = json.dumps(body.layout, ensure_ascii=False)
     if len(raw) > 200_000:
         return err(40002, "布局配置过大（超过 200KB）")
-    store.set_json("dashboard_layout", body.layout)
+    current_rev = _layout_rev()
+    if body.base_rev is not None and body.base_rev != current_rev:
+        # 页面载入的布局已被别人改过：拒绝保存，避免把别人的改动整片覆盖
+        # （实测过：另一个停留在旧布局的页面点"完成"会把恢复回来的布局冲掉）
+        return err(40009, f"仪表盘布局已被其他窗口修改（当前版本 {current_rev}，"
+                          f"你载入的是 {body.base_rev}）：请刷新页面后重新编辑")
+    rev = _layout_write(body.layout)
     database.insert_control_log(
         "config.dashboard", "success",
         f"更新仪表盘布局（{len(body.layout.get('widgets', []))} 张卡片）",
         operator=user.get("username") or None, source="manual")
     _reload_card_consumers()
-    return ok({"layout": body.layout})
+    return ok({"layout": body.layout, "rev": rev})
 
 
 @router.post("/water/dashboard/layout/reset")
 def dashboard_layout_reset(user: dict = Depends(auth.require_perm("cfg_system"))):
-    """清除已保存布局，前端回退为内置默认布局。"""
-    store.set("dashboard_layout", "")
+    """清除已保存布局，前端回退为内置默认布局（清除前同样备份当前布局）。"""
+    rev = _layout_write(None)
     database.insert_control_log("config.dashboard", "success", "恢复默认仪表盘布局",
                                 operator=user.get("username") or None, source="manual")
     _reload_card_consumers()
-    return ok({"layout": None})
+    return ok({"layout": None, "rev": rev})
+
+
+@router.post("/water/dashboard/layout/restore_prev")
+def dashboard_layout_restore_prev(user: dict = Depends(auth.require_perm("cfg_system"))):
+    """一键恢复「上一次布局」（保存/重置前自动备份的那一份）。
+
+    恢复本身也会备份当前布局，所以可以反复点击在最近两版之间来回切换——
+    用于误删卡片、被别的窗口覆盖等突发情况的一键回退。
+    """
+    prev = store.get_json("dashboard_layout_prev", None)
+    if prev is None:
+        return err(40004, "没有可恢复的上一次布局（本机尚未保存过布局）")
+    rev = _layout_write(prev)
+    count = len(prev.get("widgets", []) or [])
+    database.insert_control_log("config.dashboard", "success",
+                                f"恢复上一次仪表盘布局（{count} 张卡片）",
+                                operator=user.get("username") or None, source="manual")
+    _reload_card_consumers()
+    return ok({"layout": prev, "rev": rev})
 
 
 @router.get("/water/dashboard/proxy")
