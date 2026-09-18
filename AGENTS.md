@@ -102,9 +102,11 @@ backend/
 ├── gateway.py                  # 外部设备接入适配器（Modbus TCP / 串口服务器 / 本机串口）
 ├── scheduler.py                # 定时任务调度（每天某时刻 / 每 N 秒执行卡片动作）
 ├── calibration.py              # 通道标定（scale/offset，两点标定换算工程值）
+├── preflight.py                # 启动自检（仅标准库）：Python/依赖/文件/端口/数据库，失败必写日志并给修复命令
 └── tests/
     ├── test_api.py             # 接口功能测试（需先启动后端）
     ├── test_level.py           # 液位通道契约单元测试（无模拟数据、无数据为 0，可独立运行）
+    ├── test_preflight.py       # 启动自检模块单元测试（版本/依赖/前端目录/端口/数据库错误分类/日志）
     ├── modbus_sim.py           # Modbus 从站模拟器（外部设备接入自测，无需真实硬件）
     └── mock_judge.py           # 模拟智能判定服务（上报/轮询/反馈联调）
 tests/
@@ -319,15 +321,25 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
 3. **范围克制**：只实现用户要求的改动，不做超出范围的顺手重构。
 4. **离线优先**：不得引入 CDN 依赖；新增 Python/JS 依赖最小化并同步 `requirements.txt`。
    调用设备仅用标准库 `urllib`。
-5. **命名与注释**：标识符英文，注释中文。
-6. **避免破坏性操作**：不执行 `rm -rf`、`git reset --hard` 等；不擅自调用 `/api/reset` 清零
+5. **启动失败必须留痕（用户 2026-09-18 指令）**：任何原因导致"部署/启动跑不起来"都必须输出日志——
+   自检结论打印到控制台并**追加写入 `.runtime/startup.log`**，日志里要有失败项、原因与**可执行的修复命令**。
+   实现集中在 `backend/preflight.py`（**只允许使用标准库**，否则"缺依赖"这类失败反而查不出来）：
+   `main.py` 在导入 fastapi 等业务依赖**之前**调用 `preflight.run_checks()`，失败 `sys.exit(2)`；
+   `lifespan` 里的初始化异常经 `preflight.log_exception()` 记录完整堆栈后再抛出；
+   新增失败模式时要同步补 `check_*` 分支与 `backend/tests/test_preflight.py` 的用例。
+   禁止把致命错误吞掉只留一句 `print`，也禁止只抛裸 traceback（堆栈只进日志文件，控制台给人话＋建议）。
+6. **命名与注释**：标识符英文，注释中文。
+7. **避免破坏性操作**：不执行 `rm -rf`、`git reset --hard` 等；不擅自调用 `/api/reset` 清零
    现场累计水量，不擅自开泵抽水。
-7. **以实测为准**：设备接口清单可能与现场固件不符，改动前先探测真实路由。
-8. **验证后再交付**：每次改动完成后运行相应验证并在回复中说明。
+8. **以实测为准**：设备接口清单可能与现场固件不符，改动前先探测真实路由。
+9. **验证后再交付**：每次改动完成后运行相应验证并在回复中说明。
 
 ## 7. 验证清单
 
 - [ ] `python main.py` 启动无报错，`/docs` 可访问
+- [ ] 启动自检通过并写入 `.runtime/startup.log`：依赖缺失/Python 版本过低/端口被占用/数据库连不上（2003/1045/1049）/前端目录缺失 均能给出 `[FAIL]|[WARN] + ↳ 修复命令`，退出码 2
+- [ ] `python backend/preflight.py` 一键体检可用（退出码 0/2；端口被占用时降级为提示，因为服务可能正在运行）
+- [ ] `python backend/tests/test_preflight.py` 全部通过
 - [ ] 启动日志打印采集设备地址、支持通道、PID 是否禁用
 - [ ] `/api/water/realtime` 返回真实流量/累计水量/水泵状态，`features` 正确
 - [ ] 传感数据周期入库，`/api/water/history` 按时间范围可查，无数据通道为 NULL

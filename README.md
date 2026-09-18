@@ -122,6 +122,18 @@ FastAPI 后端 + MySQL + Vue 3 前端，覆盖「感知层 - 网络层 - 平台�
 
 > 本机（Windows）已部署完成：完整流程、启停命令、配置修改与故障排查见
 > [`部署指南.md`](部署指南.md)（所有命令均已实测）。
+> **全新电脑从零开始（无环境、无网络、无代理）见 [`从零部署手册.md`](从零部署手册.md)**——
+> 含 U 盘打包清单、离线 wheel 装依赖、MySQL 建库建号、一键自检与全流程命令清单。
+>
+> 启动前建议先跑一次自检，它会告诉你"还差什么、怎么修"，并把结论写入 `.runtime\startup.log`：
+>
+> ```powershell
+> & ".\.venv\Scripts\python.exe" backend\preflight.py
+> ```
+>
+> `main.py` 自身也会在启动时自动执行同一套自检：依赖缺失、Python 版本过低、端口被占用、
+> 数据库连不上（2003/1045/1049 分别给不同建议）、前端目录缺失——**任何原因导致启动不了，
+> 都会打印失败项与修复命令并写入日志**，而不是只抛一个 traceback。
 
 ### 1. 启动数据库
 
@@ -219,6 +231,12 @@ python backend\tests\modbus_sim.py --port 15020
 
 # 5) 判定服务联调（可选：本地模拟智能判定服务，再在判定页填地址与报文模板）
 python backend\tests\mock_judge.py --port 9100
+
+# 6) 部署自检（可单独跑：检查 Python 版本/依赖/文件/端口/数据库，结论写入 .runtime\startup.log）
+python backend\preflight.py
+
+# 7) 部署自检模块的单元测试
+python backend\tests\test_preflight.py
 ```
 
 E2E 覆盖：登录页与登录校验、全卡片网格默认布局（卡数按固件能力）、单水槽卡水位渲染与角标、

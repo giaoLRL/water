@@ -5,6 +5,29 @@
 用后台线程循环，避免阻塞 uvicorn 事件循环。
 启动: python main.py（默认 http://0.0.0.0:8000）
 """
+import os
+import sys
+
+# =============================================================
+# 0) 启动自检：必须在导入业务依赖之前跑（只依赖标准库）
+#    目的：环境没配好时也要**留下日志**并给出可执行的修复建议，
+#    而不是只抛一个看不懂的 traceback（依赖缺失/数据库连不上/端口被占用…）。
+#    日志文件：仓库根目录 .runtime/startup.log（控制台同时打印）
+# =============================================================
+import preflight
+
+_PORT = 8000
+if len(sys.argv) > 1 and sys.argv[1].isdigit():
+    _PORT = int(sys.argv[1])
+_PORT = int(os.environ.get("WATER_PORT", _PORT))
+
+_PREFLIGHT_ITEMS = preflight.run_checks(port=_PORT if __name__ == "__main__" else None)
+if not preflight.report(_PREFLIGHT_ITEMS):
+    sys.exit(2)     # 详细原因与修复建议已打印并写入 .runtime/startup.log
+
+# -------------------------------------------------------------
+# 1) 业务依赖导入（自检已确认它们都在；真出错也有日志兜底）
+# -------------------------------------------------------------
 import logging
 import threading
 import time
@@ -148,22 +171,28 @@ def collect_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    database.init_database()
-    ensure_admin()
-    services.plant = WaterPlant()
-    services.alarm = AlarmEngine()
-    services.alarm.plant = services.plant   # 报警联动动作的执行对象
-    services.timers = TimerScheduler(services.alarm)   # 定时任务（复用联动动作执行器）
-    services.custom = CustomChannelManager()  # 自定义传感器通道（全链路）
-    services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
-    services.pid_loops = PidLoopManager(services.plant)   # 多路恒温闭环（卡片即来源）
-    services.judge = JudgeService()
-    services.gateway = ModbusGateway()   # 外部设备（Modbus/串口）接入适配器
-    enabled = [k for k, v in config.DEVICE_FEATURES.items() if v]
-    _log.info("采集设备: %s (超时%.1fs) 支持通道: %s", config.DEVICE_URL, config.DEVICE_TIMEOUT_S, ",".join(enabled))
-    if not config.pid_supported():
-        _log.info("恒温闭环(PID)已禁用：当前固件未提供温度/加热通道")
-    threading.Thread(target=collect_loop, daemon=True).start()
+    # 初始化失败（数据库掉线、建表失败、账号初始化失败…）也要留日志，而不是只抛 traceback
+    try:
+        database.init_database()
+        ensure_admin()
+        services.plant = WaterPlant()
+        services.alarm = AlarmEngine()
+        services.alarm.plant = services.plant   # 报警联动动作的执行对象
+        services.timers = TimerScheduler(services.alarm)   # 定时任务（复用联动动作执行器）
+        services.custom = CustomChannelManager()  # 自定义传感器通道（全链路）
+        services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
+        services.pid_loops = PidLoopManager(services.plant)   # 多路恒温闭环（卡片即来源）
+        services.judge = JudgeService()
+        services.gateway = ModbusGateway()   # 外部设备（Modbus/串口）接入适配器
+        enabled = [k for k, v in config.DEVICE_FEATURES.items() if v]
+        _log.info("采集设备: %s (超时%.1fs) 支持通道: %s", config.DEVICE_URL, config.DEVICE_TIMEOUT_S, ",".join(enabled))
+        if not config.pid_supported():
+            _log.info("恒温闭环(PID)已禁用：当前固件未提供温度/加热通道")
+        preflight.log("启动初始化完成：数据库/建表/账号/采集线程就绪")
+        threading.Thread(target=collect_loop, daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        preflight.log_exception("启动初始化失败（数据库/建表/账号等），服务未启动", exc)
+        raise
     try:
         yield
     finally:
@@ -204,4 +233,5 @@ app.mount("/", NoCacheStaticFiles(directory=str(config.FRONTEND_DIR), html=True)
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 端口：python main.py [端口] > 环境变量 WATER_PORT > 默认 8000
+    uvicorn.run(app, host="0.0.0.0", port=_PORT)

@@ -1018,8 +1018,10 @@ async function main() {
     // 用"无害执行器"验证闭环：执行器卡的指令指向本机只读接口，不触碰真实加热继电器
     const roUrl = `http://127.0.0.1:8000/api/water/realtime?token=${apiToken}`;
     await api("POST", "/api/water/dashboard/layout", { layout: { version: 1, widgets: [
+      // 温度来源卡指向**本机只读接口**（path=period，恒有数值）：
+      // 这样闭环用例不依赖现场设备是否在线（设备离线时 heater_temp 为 null，回路会按设计跳过）
       { id: "e2e-pid-sensor", type: "value", title: "E2E温度源", unit: "℃", decimals: 1,
-        source: { kind: "realtime", path: "heater_temp" }, grid: { x: 0, y: 0, w: 3, h: 2 } },
+        source: { kind: "custom", url: roUrl, path: "data.period", period: 2 }, grid: { x: 0, y: 0, w: 3, h: 2 } },
       { id: "e2e-pid-guard", type: "tank", title: "E2E液位", unit: "%", decimals: 1,
         source: { kind: "realtime", path: "tank.tanks.heater" }, grid: { x: 3, y: 0, w: 3, h: 2 } },
       { id: "e2e-pid-act", type: "control", title: "E2E加热执行器",
@@ -1067,8 +1069,15 @@ async function main() {
     // 开启闭环：执行器是自定义指令（无害 GET），应写出 pid_actuator_on 日志
     const logBeforePid = ((await api("GET", "/api/water/logs?page=1&page_size=5")).data.items || [])
       .map((l) => l.ts + "|" + l.action);
-    await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
-      + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    // 设备在线时点卡片开关（覆盖界面路径）；离线时卡片控件是禁用态，改用接口开启
+    const pidDevOnline = !!((await api("GET", "/api/water/realtime")).data || {}).sensor_online;
+    if (pidDevOnline) {
+      await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+        + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    } else {
+      await api("POST", "/api/water/pid/loops", { id: "e2e-pid-card", enabled: true });
+      warn("设备离线：闭环卡开关为禁用态，改用接口开启闭环（设备在线时走界面点击）", "");
+    }
     await sleep(3500);
     const pidLogs = ((await api("GET", "/api/water/logs?page=1&page_size=20")).data.items || [])
       .filter((l) => !logBeforePid.includes(l.ts + "|" + l.action));
@@ -1080,8 +1089,12 @@ async function main() {
           thisLoop.sensor_title === "E2E温度源" && thisLoop.actuator_title === "E2E加热执行器"
           && thisLoop.enabled === true, JSON.stringify(thisLoop));
     // 关掉闭环，避免测试结束后继续下发指令
-    await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
-      + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    if (pidDevOnline) {
+      await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+        + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    } else {
+      await api("POST", "/api/water/pid/loops", { id: "e2e-pid-card", enabled: false });
+    }
     await sleep(2000);
     check("闭环已关闭（测试收尾）",
           ((await api("GET", "/api/water/pid/loops")).data.loops || [])
