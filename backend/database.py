@@ -15,6 +15,7 @@ _pool = None
 _pool_lock = threading.Lock()
 
 DEVICE_ID = "water"   # 单套水循环系统的统一设备ID
+HISTORY_MAX_ROWS = 200_000   # 单次历史查询硬上限（1Hz 下约 55 小时），超出时保留最新部分
 
 
 def get_pool() -> PooledDB:
@@ -271,6 +272,11 @@ def insert_water_sensor(
 
 
 def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
+    """查询区间传感数据（按时间升序返回）。
+
+    超过 limit 时**保留最新的 limit 条**——此前用 `ORDER BY ts ASC LIMIT` 取到的是最早的数据，
+    长区间曲线会"停在几小时前"，最新的点被丢掉（已修正为 DESC 取数后再升序返回）。
+    """
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
@@ -279,12 +285,133 @@ def query_water_history(start: str, end: str, limit: int = 5000) -> list[dict]:
                 "total_flow, pump_target, pump_state, storage_temp, heater_temp, "
                 "pressure, heater_state, light "
                 "FROM water_sensors WHERE ts BETWEEN %s AND %s "
-                "ORDER BY ts ASC LIMIT %s",
+                "ORDER BY ts DESC LIMIT %s",
                 (start, end, limit),
             )
-            return list(cur.fetchall())
+            rows = list(cur.fetchall())
     finally:
         conn.close()
+    rows.reverse()
+    return rows
+
+
+def count_water_history(start: str, end: str) -> int:
+    """区间内总行数（导出/取样提示"是否截断"用）。"""
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM water_sensors WHERE ts BETWEEN %s AND %s",
+                        (start, end))
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
+
+
+def count_water_history_by_channel(start: str, end: str) -> dict:
+    """各通道有效读数点数（区别于含离线空行的总行数）。"""
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS total, COUNT(flow_rate) AS flow, COUNT(storage_temp) AS storage_temp, "
+                "COUNT(heater_temp) AS heater_temp, COUNT(pressure) AS pressure, COUNT(light) AS light "
+                "FROM water_sensors WHERE ts BETWEEN %s AND %s",
+                (start, end),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def weighted_avg_flow(start: str, end: str, max_gap_s: float = 60.0) -> float | None:
+    """按时间加权的区间平均流量。
+
+    每个采样值按其到下一个采样的时长加权（末点用中位间隔）；
+    间隔超过 max_gap_s（默认 60s，多为设备离线空档）的片段不计入，避免旧值长时间占权。
+    """
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT UNIX_TIMESTAMP(ts) AS t, flow_rate FROM water_sensors "
+                "WHERE ts BETWEEN %s AND %s AND flow_rate IS NOT NULL ORDER BY ts ASC",
+                (start, end),
+            )
+            rows = list(cur.fetchall())
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    gaps = [float(rows[i + 1]["t"]) - float(rows[i]["t"]) for i in range(len(rows) - 1)]
+    typical = sorted(g for g in gaps if 0 < g <= max_gap_s)
+    default_gap = typical[len(typical) // 2] if typical else 1.0
+    total_w = total_v = 0.0
+    for i, row in enumerate(rows):
+        gap = gaps[i] if i < len(gaps) else default_gap
+        if gap <= 0 or gap > max_gap_s:
+            continue
+        total_w += gap
+        total_v += float(row["flow_rate"]) * gap
+    if total_w <= 0:
+        return None
+    return round(total_v / total_w, 3)
+
+
+def _sample_rows(rows: list[dict], points: int) -> tuple[list[dict], bool]:
+    """等距降采样（保留首尾）；返回 (取样结果, 是否发生降采样)。"""
+    if points <= 0 or len(rows) <= points:
+        return rows, False
+    step = len(rows) / float(points)
+    picked = [rows[min(int(i * step), len(rows) - 1)] for i in range(points)]
+    picked[-1] = rows[-1]              # 末点必须是区间内最新一条
+    return picked, True
+
+
+def query_water_history_chart(start: str, end: str, points: int = 1500) -> dict:
+    """图表用取样：覆盖整个区间并降采样到 points 点（保证含最新数据）。"""
+    rows = query_water_history(start, end, HISTORY_MAX_ROWS)
+    picked, sampled = _sample_rows(rows, points)
+    return {"points": picked, "raw_count": len(rows), "sampled": sampled}
+
+
+def query_sensor_at(ts: str) -> dict | None:
+    """回放：取 ts 时刻最近的一条传感数据（ts <= 目标时间）。"""
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s') AS ts, flow_rate, "
+                "total_flow, pump_target, pump_state, storage_temp, heater_temp, "
+                "pressure, heater_state, light FROM water_sensors "
+                "WHERE ts <= %s ORDER BY ts DESC LIMIT 1",
+                (ts,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def query_custom_at(channel_id: str, ts: str) -> float | None:
+    """回放：取某自定义通道在 ts 时刻最近的值。"""
+    conn = get_pool().connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM custom_sensor_data WHERE channel_id=%s AND ts <= %s "
+                "ORDER BY ts DESC LIMIT 1",
+                (channel_id, ts),
+            )
+            row = cur.fetchone()
+            return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def query_history_frames(start: str, end: str, limit: int = 120) -> dict:
+    """回放帧：覆盖整个区间并降采样到约 limit 帧（含最新一帧）。"""
+    rows = query_water_history(start, end, HISTORY_MAX_ROWS)
+    picked, sampled = _sample_rows(rows, limit)
+    return {"frames": picked, "raw_count": len(rows), "sampled": sampled}
 
 
 def query_water_stats(start: str, end: str) -> dict:
@@ -311,6 +438,14 @@ def query_water_stats(start: str, end: str) -> dict:
                 (start, end, start, end, start, end),
             )
             row = cur.fetchone()
+            # 各通道有效读数点数（COUNT(列) 自动忽略 NULL，即排除设备离线写入的空行）
+            cur.execute(
+                "SELECT COUNT(*) AS total, COUNT(flow_rate) AS flow, COUNT(storage_temp) AS storage_temp, "
+                "COUNT(heater_temp) AS heater_temp, COUNT(pressure) AS pressure, COUNT(light) AS light "
+                "FROM water_sensors WHERE ts BETWEEN %s AND %s",
+                (start, end),
+            )
+            valid = cur.fetchone()
 
             def _round(value, digits=2):
                 return round(value, digits) if value is not None else None
@@ -325,10 +460,20 @@ def query_water_stats(start: str, end: str) -> dict:
             return {
                 # 流量通道（真实数据）
                 "avg_flow": _round(row["avg_flow"]),
+                # 时间加权平均流量（采样密度不均时更准确；无有效数据为 None）
+                "avg_flow_weighted": weighted_avg_flow(start, end),
                 "max_flow": _round(row["max_flow"]),
                 "min_flow": _round(row["min_flow"]),
                 "sum_flow": _round(row["sum_flow"]),
                 "samples": int(row["samples"] or 0),
+                # 各通道"有效读数"点数（总行数含设备离线时写入的空行，二者不可混淆）
+                "valid_samples": {
+                    "flow": int(valid["flow"] or 0),
+                    "storage_temp": int(valid["storage_temp"] or 0),
+                    "heater_temp": int(valid["heater_temp"] or 0),
+                    "pressure": int(valid["pressure"] or 0),
+                    "light": int(valid["light"] or 0),
+                },
                 # 累计水量
                 "start_total": _round(start_total, 3),
                 "end_total": _round(end_total, 3),
@@ -508,18 +653,28 @@ def insert_custom_sensor(channel_id: str, value: float) -> None:
 
 
 def query_custom_history(channel_id: str, start: str, end: str, limit: int = 5000) -> list[dict]:
+    """查询自定义通道区间数据（升序返回；超限时保留最新的 limit 条）。"""
     conn = get_pool().connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT ts, value FROM custom_sensor_data "
-                "WHERE channel_id=%s AND ts BETWEEN %s AND %s ORDER BY ts ASC LIMIT %s",
+                "WHERE channel_id=%s AND ts BETWEEN %s AND %s ORDER BY ts DESC LIMIT %s",
                 (channel_id, start, end, limit),
             )
-            return [{"ts": r["ts"].strftime("%Y-%m-%d %H:%M:%S"), "value": r["value"]}
+            rows = [{"ts": r["ts"].strftime("%Y-%m-%d %H:%M:%S"), "value": r["value"]}
                     for r in cur.fetchall()]
     finally:
         conn.close()
+    rows.reverse()
+    return rows
+
+
+def query_custom_history_chart(channel_id: str, start: str, end: str, points: int = 1500) -> dict:
+    """自定义通道图表用取样：覆盖整个区间并降采样到 points 点（保证含最新数据）。"""
+    rows = query_custom_history(channel_id, start, end, HISTORY_MAX_ROWS)
+    picked, sampled = _sample_rows(rows, points)
+    return {"points": picked, "raw_count": len(rows), "sampled": sampled}
 
 
 def custom_sensor_stats(channel_id: str, start: str, end: str) -> dict:

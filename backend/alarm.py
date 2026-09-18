@@ -6,13 +6,17 @@
 阈值在"系统配置"页可改，存数据库 config 表覆盖 config.py 默认值。
 读数无效（None，即设备离线或该通道无数据）时不产生告警，避免误报。
 
-报警联动（v3：卡片即来源）：规则自带阈值，触发源与动作都**直接选自实时监控页的卡片**
+报警联动（v4：卡片即来源 + 组合条件）：规则自带阈值，触发源与动作都**直接选自实时监控页的卡片**
 （内置卡或后加的自定义卡），不再有独立的执行器档案/通道声明：
   - 触发源 source_card：卡片 source.kind=realtime 直接读采集快照；kind=custom
     （自定义接口卡）由 custom_channels 轮询后并入 data["custom"]，卡片已不在布局中时
     由 check_custom 按保存时的快照 URL 兜底轮询；
   - 动作 {card, state, kind, url}：卡片当前配置优先（改了卡片规则自动跟随），
     kind=url（控制卡自定义指令，走白名单 GET）/pump/heater（内置泵、加热）/quant（取消定量）。
+  - 组合条件与持续判定（v4 新增）：extra[] 为附加条件（最多 5 条，结构与主条件相同），
+    **全部满足（且）**才算越限；hold 秒表示"连续满足这么久才触发"（0=立即）。
+    任一条件读数缺失时本轮跳过、不改状态，避免传感器抖动导致误报或误恢复。
+    典型用法：「温度>40 且 流量<5 持续 10 秒 → 关泵」。
 规则存 config 表 sys.alarm_links，系统配置页编辑；每个动作写 control_log(link_*，source=auto)。
 """
 import threading
@@ -54,7 +58,9 @@ class AlarmEngine:
         self._links: list[dict] = []         # 报警联动规则（v3：卡片即来源）
         self._cards: dict[str, dict] = {}    # 仪表盘卡片 id -> 卡片（规则解析用）
         self._link_state: dict[str, bool] = {}     # 规则id -> 当前是否越限（触发/恢复沿判断）
+        self._link_since: dict[str, float] = {}    # 规则id -> 本轮连续满足条件的起始时间（hold 用）
         self._custom_ts: dict[str, float] = {}     # 规则id -> 自定义源上次轮询时间
+        self._last_data: dict = {}                 # 最近一次采集快照（兜底轮询评估附加条件用）
         self.reload_links()
         self.reload()
 
@@ -80,6 +86,10 @@ class AlarmEngine:
                            if isinstance(r, dict) and r.get("source_card")
                            and isinstance(r.get("source"), dict)]
             self._cards = cards
+            # 清理已删除/停用规则的状态，避免残留影响下一轮判定
+            ids = {r.get("id") for r in self._links}
+            self._link_state = {k: v for k, v in self._link_state.items() if k in ids}
+            self._link_since = {k: v for k, v in self._link_since.items() if k in ids}
 
     def links(self) -> list[dict]:
         """当前联动规则（供系统配置接口返回）。"""
@@ -160,6 +170,7 @@ class AlarmEngine:
             ]
 
         # 联动评估在锁外执行：动作/轮询含网络请求，避免阻塞 active_alarms 读
+        self._last_data = data
         self._eval_builtin_links(data)
         return snapshot
 
@@ -190,13 +201,56 @@ class AlarmEngine:
             src = self._rule_source(rule)
             value = self._fetch_sensor(src.get("url", ""), src.get("path", ""))
             if value is not None:
-                self._eval_link(rule, value)
+                self._eval_rule(rule, self._last_data or {}, primary_value=value)
 
     def _rule_source(self, rule: dict) -> dict:
         """规则触发源：卡片当前配置优先（改卡片规则自动跟随），卡片不在布局时回退保存时快照。"""
         card = self._card(rule.get("source_card"))
         src = (card or {}).get("source")
         return src if isinstance(src, dict) else (rule.get("source") or {})
+
+    def _cond_source(self, cond: dict) -> dict:
+        """附加条件的来源：同样是卡片当前配置优先、快照兜底。"""
+        card = self._card(cond.get("card"))
+        src = (card or {}).get("source")
+        return src if isinstance(src, dict) else (cond.get("source") or {})
+
+    def _value_of(self, cond: dict, data: dict):
+        """取某条件的原始读数：realtime 读采集快照，custom 读自定义通道轮询结果。"""
+        src = self._cond_source(cond)
+        kind = src.get("kind")
+        if kind == "realtime":
+            return self._get_path(data, src.get("path", ""))
+        if kind == "custom":
+            return (data.get("custom") or {}).get(str(cond.get("card") or ""))
+        return None
+
+    def _rule_tripped(self, rule: dict, data: dict, primary_value=None):
+        """判断整条规则是否越限：主条件 + extra 全部满足（且）才算。
+
+        返回 (是否越限, 数据是否齐全)。任一条件读数缺失时返回 (False, False)，
+        调用方据此跳过本轮、不改状态，避免抖动造成误报/误恢复。
+        """
+        conds = [{"card": rule.get("source_card"), "source": self._rule_source(rule),
+                  "direction": rule.get("direction"), "threshold": rule.get("threshold")}]
+        for extra in (rule.get("extra") or []):
+            if isinstance(extra, dict):
+                conds.append(extra)
+        for i, cond in enumerate(conds):
+            if i == 0 and primary_value is not None:
+                value = self._numeric(primary_value)
+            else:
+                value = self._numeric(self._value_of(cond, data))
+            if value is None:
+                return False, False
+            try:
+                threshold = float(cond.get("threshold"))
+            except (TypeError, ValueError):
+                return False, False
+            hit = value > threshold if cond.get("direction") == "above" else value < threshold
+            if not hit:
+                return False, True
+        return True, True
 
     @staticmethod
     def _numeric(value):
@@ -275,38 +329,53 @@ class AlarmEngine:
             rules = [r for r in self._links if r.get("enabled")]
         for rule in rules:
             src = self._rule_source(rule)
-            kind = src.get("kind")
-            if kind == "realtime":
-                raw = self._get_path(data, src.get("path", ""))
-            elif kind == "custom":
-                raw = (data.get("custom") or {}).get(str(rule.get("source_card") or ""))
-            else:
-                continue
-            if raw is None:
-                continue
-            value = self._numeric(raw)
-            if value is None:
-                continue
-            self._eval_link(rule, value)
+            if src.get("kind") == "custom" and not self._card(rule.get("source_card")):
+                continue     # 卡片已不在布局：交给 check_custom 兜底轮询
+            self._eval_rule(rule, data)
 
-    def _eval_link(self, rule: dict, value: float) -> None:
-        """单规则评估：越限沿（正常→越限）触发动作，回正常沿执行可选恢复动作。"""
+    def _eval_rule(self, rule: dict, data: dict, primary_value=None) -> None:
+        """单规则评估：主条件 + 附加条件全满足 → 持续 hold 秒后触发；回正常沿执行恢复动作。"""
+        tripped, usable = self._rule_tripped(rule, data, primary_value)
+        if not usable:
+            return                      # 数据不齐：本轮跳过，不改状态
+        rid = rule["id"]
+        try:
+            hold = max(0.0, float(rule.get("hold") or 0))
+        except (TypeError, ValueError):
+            hold = 0.0
+        now = time.time()
+        fired = recovered = False
+        with self._lock:
+            prev = self._link_state.get(rid, False)
+            if tripped:
+                if not prev:
+                    started = self._link_since.setdefault(rid, now)   # 连续满足的起点
+                    if hold <= 0 or (now - started) >= hold:
+                        self._link_state[rid] = True
+                        self._link_since.pop(rid, None)
+                        fired = True
+            else:
+                self._link_since.pop(rid, None)
+                if prev:
+                    self._link_state[rid] = False
+                    recovered = True
+        if not (fired or recovered):
+            return
+        # 上下文取主条件当前读数（用于告警记录与日志文案）
+        value = self._numeric(primary_value)
+        if value is None:
+            primary = {"card": rule.get("source_card"), "source": self._rule_source(rule)}
+            value = self._numeric(self._value_of(primary, data))
+        if value is None:
+            value = 0.0
         try:
             threshold = float(rule.get("threshold"))
         except (TypeError, ValueError):
-            return
-        above = rule.get("direction") == "above"
-        tripped = value > threshold if above else value < threshold
-        rid = rule["id"]
-        with self._lock:
-            prev = self._link_state.get(rid, False)
-            self._link_state[rid] = tripped
-        if tripped == prev:
-            return
-        text = "超上限" if above else "低于下限"
+            threshold = 0.0
+        text = "超上限" if rule.get("direction") == "above" else "低于下限"
         ctx = {"name": rule.get("name") or rid, "value": value, "threshold": threshold,
                "direction": rule.get("direction"), "text": text}
-        if tripped:
+        if fired:
             # 触发沿：写告警记录（告警记录页可见，type=custom:<规则id>）并执行动作
             database.update_or_insert_alarm(
                 datetime.now(), f"custom:{rid}",
@@ -321,9 +390,19 @@ class AlarmEngine:
                 for act in rule["recover"]["actions"]:
                     self._exec_action(rule, act, ctx, "恢复")
 
-    def _exec_action(self, rule: dict, act: dict, ctx: dict, phase: str) -> None:
-        """执行单个联动动作并写审计日志；任何失败都只记 fail 不抛出。"""
-        prefix = (f'联动[{ctx["name"]}]: {ctx["text"]}'
+    def run_actions(self, actions, ctx: dict, phase: str = "执行", tag: str = "link",
+                    source: str = "auto") -> None:
+        """批量执行动作（定时任务等复用同一套解析与审计）。"""
+        for act in actions or []:
+            self._exec_action(None, act, ctx, phase, tag=tag, source=source)
+
+    def _exec_action(self, rule: dict, act: dict, ctx: dict, phase: str,
+                     tag: str = "link", source: str = "auto") -> None:
+        """执行单个动作并写审计日志；任何失败都只记 fail 不抛出。
+
+        tag 决定日志 action 前缀（link_* / timer_*），source 决定审计来源（auto/timer）。
+        """
+        prefix = (f'{"定时" if tag == "timer" else "联动"}[{ctx["name"]}]: {ctx["text"]}'
                   f'({ctx["value"]:.2f} / 阈值{ctx["threshold"]}) {phase}')
         try:
             target = self._resolve_action(act)
@@ -335,22 +414,22 @@ class AlarmEngine:
                 if not url:
                     raise ValueError(f"卡片[{label}] 未配置该方向的指令 URL")
                 self._http_get(url)
-                detail, action = f"卡片[{label}] {state.upper()} {url[:140]}", f"link_card_{state}"
+                detail, action = f"卡片[{label}] {state.upper()} {url[:140]}", f"{tag}_card_{state}"
             elif kind == "pump":
                 self.plant.pump_control(state)
-                detail, action = f"卡片[{label}] 本机水泵 {state.upper()}", f"link_pump_{state}"
+                detail, action = f"卡片[{label}] 本机水泵 {state.upper()}", f"{tag}_pump_{state}"
             elif kind == "heater":
                 self.plant.heater_control(state)
-                detail, action = f"卡片[{label}] 本机加热 {state.upper()}", f"link_heater_{state}"
+                detail, action = f"卡片[{label}] 本机加热 {state.upper()}", f"{tag}_heater_{state}"
             elif kind == "quant":
                 self.plant.set_pump_target(0)
-                detail, action = f"卡片[{label}] 取消定量浇水", "link_quant_cancel"
+                detail, action = f"卡片[{label}] 取消定量浇水", f"{tag}_quant_cancel"
             else:
-                raise ValueError(f"非法联动动作: {kind or act}")
-            database.insert_control_log(action, "success", f"{prefix} → {detail}", source="auto")
+                raise ValueError(f"非法动作: {kind or act}")
+            database.insert_control_log(action, "success", f"{prefix} → {detail}", source=source)
         except Exception as exc:  # noqa: BLE001
-            database.insert_control_log("link_fail", "fail",
-                                        f"{prefix} → 动作执行失败: {exc}"[:250], source="auto")
+            database.insert_control_log(f"{tag}_fail", "fail",
+                                        f"{prefix} → 动作执行失败: {exc}"[:250], source=source)
 
     @staticmethod
     def _http_get(url: str) -> None:

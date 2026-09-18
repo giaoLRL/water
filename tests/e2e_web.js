@@ -233,6 +233,18 @@ async function main() {
   // 布局快照与复位：保证卡片数量断言基于默认布局，全部结束后恢复原布局
   const layoutBefore = (await api("GET", "/api/water/dashboard/layout")).data?.layout ?? null;
   await api("POST", "/api/water/dashboard/layout/reset");
+  // 前置检查：若另一个客户端（例如你自己打开的页面停在「编辑卡片」模式）在并发写布局，
+  // "默认布局"前提会被破坏，这里显式提示，避免后续卡片数断言给出难以定位的失败。
+  let layoutAfterReset = null;
+  for (let i = 0; i < 4 && !layoutAfterReset; i += 1) {     // 采样 4 秒，捕捉并发写入
+    await sleep(1000);
+    layoutAfterReset = (await api("GET", "/api/water/dashboard/layout")).data?.layout ?? null;
+  }
+  if (layoutAfterReset) {
+    console.log("  [WARN] 检测到其他客户端正在并发改写仪表盘布局（当前已保存 "
+      + ((layoutAfterReset.widgets || []).length) + " 张卡）——通常是浏览器页面处于「编辑卡片」模式。");
+    console.log("         请退出编辑模式或关闭该页面后重跑；本次仍继续，卡片数量相关断言可能失败。");
+  }
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-chrome-"));
   const args = [
@@ -704,14 +716,56 @@ async function main() {
     await api("POST", "/api/water/alarm/links", { links: [] });
     check("联动规则已恢复空", ((await api("GET", "/api/water/alarm/links")).data.links || []).length === 0);
 
+    // 组合条件 + 持续判定：填「持续 5 秒」并加一条附加条件后保存（表单点击验证）
+    check("添加联动规则(组合条件)", await cdp.eval("return __e2e.clickText('button','+ 添加规则');"));
+    await sleep(500);
+    const numBefore = await cdp.eval("return document.querySelector('.link-rule').querySelectorAll('input[type=number]').length;");
+    await cdp.eval(`const set=(el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));};
+      const rule=document.querySelector('.link-rule');
+      const hold=[...rule.querySelectorAll('input[type=number]')].find(i=>i.closest('.rule-item') && i.closest('.rule-item').textContent.includes('持续'));
+      if(!hold) return false;
+      set(hold,'5');
+      const th=[...rule.querySelectorAll('input[type=number]')].find(i=>i.closest('.rule-item') && i.closest('.rule-item').textContent.includes('阈值'));
+      if(th) set(th,'99999');
+      return true;`);
+    check("持续秒数输入框可填", await cdp.eval(
+      "const h=[...document.querySelector('.link-rule').querySelectorAll('input[type=number]')]"
+      + ".find(i=>i.closest('.rule-item')&&i.closest('.rule-item').textContent.includes('持续')); return !!h && h.value==='5';"));
+    check("添加附加条件", await cdp.eval(`const r=document.querySelector('.link-rule');
+      const sel=[...r.querySelectorAll('select')].find(x=>[...x.options].some(o=>o.textContent.includes('+ 添加条件')));
+      if(!sel || sel.options.length < 2) return false;
+      sel.value = sel.options[1].value; sel.dispatchEvent(new Event('change',{bubbles:true})); return true;`));
+    await sleep(400);
+    check("附加条件行已出现",
+          (await cdp.eval("return document.querySelector('.link-rule').querySelectorAll('input[type=number]').length;")) === numBefore + 1,
+          `before=${numBefore}`);
+    check("保存组合条件联动", await cdp.eval("return __e2e.clickText('button','保存报警联动');"));
+    await sleep(1200);
+    const linksAdv = (await api("GET", "/api/water/alarm/links")).data.links || [];
+    const withHold = linksAdv.find((l) => Number(l.hold) === 5 && (l.extra || []).length === 1);
+    check("后端收到 hold 与附加条件",
+          !!withHold,
+          JSON.stringify(linksAdv).slice(0, 220));
+    await api("POST", "/api/water/alarm/links", { links: [] });
+    check("组合条件规则已清理", ((await api("GET", "/api/water/alarm/links")).data.links || []).length === 0);
+
     console.log("== 7.3c 自定义传感器通道（卡片即声明） ==");
     // 只加一张自定义接口卡（URL 指向本机只读接口），卡片即声明，后端自动轮询入库
     const declLayout = { version: 1, widgets: [
-      { id: "e2e-decl", type: "value", title: "E2E声明卡", unit: "L/min", decimals: 2,
+      { id: "e2e-decl", type: "value", title: "E2E声明卡", unit: "s", decimals: 2,
         source: { kind: "custom", url: `http://127.0.0.1:8000/api/water/realtime?token=${apiToken}`,
-                  path: "data.flow_rate", period: 2 },
+                  path: "data.period", period: 2 },
         grid: { x: 0, y: 0, w: 3, h: 2 } }] };
-    await api("POST", "/api/water/dashboard/layout", { layout: declLayout });
+    const saveDecl = await api("POST", "/api/water/dashboard/layout", { layout: declLayout });
+    check("测试布局保存成功", !!saveDecl && saveDecl.code === 0, JSON.stringify(saveDecl).slice(0, 160));
+    let savedDecl = (await api("GET", "/api/water/dashboard/layout")).data.layout;
+    if (!savedDecl || (savedDecl.widgets || []).length !== 1) {      // 偶发未生效时重试一次
+      await api("POST", "/api/water/dashboard/layout", { layout: declLayout });
+      await sleep(400);
+      savedDecl = (await api("GET", "/api/water/dashboard/layout")).data.layout;
+    }
+    check("测试布局已生效（1 张声明卡）", !!savedDecl && (savedDecl.widgets || []).length === 1,
+          JSON.stringify(((savedDecl || {}).widgets || []).map((w) => w.id)));
     await sleep(3200);
     const rtDecl = (await api("GET", "/api/water/realtime")).data;
     check("自定义卡自动成为后端通道（卡片即声明）",
@@ -737,6 +791,309 @@ async function main() {
     check("清理后重新进入系统配置", await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
     await sleep(1500);
     check("测试布局已清理", (await api("GET", "/api/water/dashboard/layout")).data.layout === null);
+
+    console.log("== 7.3d 外部设备接入 / 定时任务 / 通道标定 ==");
+    const gwBefore = (await api("GET", "/api/water/gateway")).data.gateways;
+    const tmBefore = (await api("GET", "/api/water/timers")).data.timers;
+    const calBefore = (await api("GET", "/api/water/calibration")).data.calibration;
+    check("外部设备接入区块已渲染", await cdp.eval("return document.body.textContent.includes('外部设备接入');"));
+    check("定时任务区块已渲染", await cdp.eval("return document.body.textContent.includes('定时任务');"));
+    check("通道标定区块已渲染", await cdp.eval("return document.body.textContent.includes('通道标定');"));
+    check("添加外部设备", await cdp.eval("return __e2e.clickText('button','+ 添加外部设备');"));
+    await sleep(400);
+    check("外部设备行含接入方式选择", await cdp.eval("return document.body.textContent.includes('串口服务器(RTU over TCP)');"));
+    check("保存外部设备", await cdp.eval("return __e2e.clickText('button','保存外部设备');"));
+    await sleep(1200);
+    check("外部设备已入后端", ((await api("GET", "/api/water/gateway")).data.gateways || []).length === 1,
+          JSON.stringify((await api("GET", "/api/water/gateway")).data.gateways));
+    check("添加定时任务", await cdp.eval("return __e2e.clickText('button','+ 添加定时任务');"));
+    await sleep(400);
+    check("保存定时任务", await cdp.eval("return __e2e.clickText('button','保存定时任务');"));
+    await sleep(1200);
+    check("定时任务已入后端", ((await api("GET", "/api/water/timers")).data.timers || []).length === 1);
+    // 两点标定：原始 100→10、200→25 ⇒ scale=0.15 offset=-5
+    await cdp.eval(`const set=(el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));};
+      const sel=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.textContent.includes('储水槽水温')));
+      if(sel){ sel.value='storage_temp'; sel.dispatchEvent(new Event('change',{bubbles:true})); }
+      const ins=[...document.querySelectorAll('input[placeholder^="原始值"], input[placeholder^="工程值"]')];
+      if(ins.length<4) return false;
+      set(ins[0],'100'); set(ins[1],'10'); set(ins[2],'200'); set(ins[3],'25'); return true;`);
+    check("点击计算系数", await cdp.eval("return __e2e.clickText('button','计算系数');"));
+    await sleep(800);
+    check("保存标定", await cdp.eval("return __e2e.clickText('button','保存标定');"));
+    await sleep(1200);
+    const calAfter = (await api("GET", "/api/water/calibration")).data.calibration;
+    check("标定系数已生效(0.15 / -5)",
+          Math.abs(Number(((calAfter.storage_temp || {}).scale ?? 1)) - 0.15) < 1e-6, JSON.stringify(calAfter));
+    await api("POST", "/api/water/gateway", { gateways: gwBefore });
+    await api("POST", "/api/water/timers", { timers: tmBefore });
+    await api("POST", "/api/water/calibration", { calibration: calBefore });
+    check("新增配置已还原",
+          ((await api("GET", "/api/water/timers")).data.timers || []).length === tmBefore.length
+          && ((await api("GET", "/api/water/gateway")).data.gateways || []).length === gwBefore.length);
+
+    console.log("== 7.3e 判定服务报文模板 ==");
+    const jtBefore = (await api("GET", "/api/water/judge/template")).data;
+    check("进入判定服务", await cdp.eval("return __e2e.clickText('.chip','判定服务');"));
+    await sleep(1500);
+    check("报文模板区已渲染", await cdp.eval("return document.body.textContent.includes('报文模板');"));
+    check("填入示例模板", await cdp.eval("return __e2e.clickText('button','填入示例');"));
+    await sleep(300);
+    check("模板含占位符", await cdp.eval("const t=document.querySelector('textarea'); return !!t && t.value.includes('{{device_id}}');"));
+    await cdp.eval(`const i=[...document.querySelectorAll('input')].find(x=>(x.placeholder||'').includes('192.168'));
+      if(i){const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(i,'http://127.0.0.1:9100');i.dispatchEvent(new Event('input',{bubbles:true}));} return true;`);
+    check("保存地址与模板", await cdp.eval("return __e2e.clickText('button','保存地址与模板');"));
+    await sleep(1200);
+    const jtAfter = (await api("GET", "/api/water/judge/template")).data;
+    check("判定地址与模板已入后端",
+          jtAfter.url === "http://127.0.0.1:9100" && !!(jtAfter.template || {}).report,
+          JSON.stringify(jtAfter).slice(0, 160));
+    await api("POST", "/api/water/judge/template", { url: jtBefore.url || "", template: jtBefore.template || {} });
+    check("判定模板已还原", !((await api("GET", "/api/water/judge/template")).data.template || {}).report);
+    check("返回面板", await cdp.eval("return __e2e.clickText('button','返回');"));
+    await sleep(1200);
+
+    console.log("== 7.3f 历史回放 ==");
+    // 本节需要一个"已保存且含自定义通道"的布局，历史页才会出现自定义标签；结束时复位
+    await api("POST", "/api/water/dashboard/layout", { layout: { version: 1, widgets: [
+      { id: "e2e-tab-chan", type: "value", title: "E2E通道卡", unit: "s", decimals: 1,
+        source: { kind: "custom", url: `http://127.0.0.1:8000/api/water/realtime?token=${apiToken}`,
+                  path: "data.period", period: 2 },
+        grid: { x: 0, y: 0, w: 3, h: 2 } }] } });
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("切到历史数据", await cdp.eval("return __e2e.clickText('.tab','历史数据');"));
+    await sleep(1500);
+    // 通道类型标签互斥：内置标签按 activeHistKey 高亮，点自定义通道后内置标签必须取消选中
+    const activeTypeTabs = "return [...document.querySelectorAll('.hist-type-tabs .tab.active')].map(t=>t.textContent.trim());";
+    check("初始仅一个通道标签选中", (await cdp.eval(activeTypeTabs)).length === 1,
+          JSON.stringify(await cdp.eval(activeTypeTabs)));
+    const customTab = await cdp.eval(
+      "const t=[...document.querySelectorAll('.hist-type-tabs .tab')].find(x=>x.textContent.trim()==='E2E通道卡');"
+      + "if(!t) return ''; t.click(); return t.textContent.trim();");
+    await sleep(2000);
+    const afterCustom = await cdp.eval(activeTypeTabs);
+    check("点自定义通道标签后只有它选中（不再两组各亮一个）",
+          !!customTab && afterCustom.length === 1 && afterCustom[0] === customTab,
+          JSON.stringify({ customTab, afterCustom }));
+    check("切回内置标签", await cdp.eval("return __e2e.clickText('.hist-type-tabs .tab','加热槽温度');"));
+    await sleep(1800);
+    const afterBuiltin = await cdp.eval(activeTypeTabs);
+    check("切回内置标签后自定义标签已取消选中",
+          afterBuiltin.length === 1 && afterBuiltin[0] === "加热槽温度", JSON.stringify(afterBuiltin));
+    check("切回全部", await cdp.eval("return __e2e.clickText('.hist-type-tabs .tab','全部');"));
+    await sleep(1500);
+    check("全部标签选中唯一", (await cdp.eval(activeTypeTabs)).length === 1,
+          JSON.stringify(await cdp.eval(activeTypeTabs)));
+    check("历史含水泵/加热状态与定量目标标签", await cdp.eval(
+      "const t=document.body.textContent; return t.includes('水泵状态') && t.includes('加热状态') && t.includes('定量目标');"));
+    check("水泵状态曲线可切换", await cdp.eval("return __e2e.clickText('.tab','水泵状态');"));
+    await sleep(1800);
+    check("状态曲线已绘制", await cdp.eval(
+      "const el=document.getElementById('water-hist-chart'); return !!el && !!el.querySelector('canvas');"));
+    check("切回全部曲线", await cdp.eval("return __e2e.clickText('.tab','全部');"));
+    await sleep(1200);
+    check("切到近24小时", await cdp.eval("return __e2e.clickText('.tab','近24小时');"));
+    await sleep(2500);
+    check("长区间显示降采样提示", await cdp.eval(
+      "const t=document.body.textContent; return t.includes('已降采样') && /区间共 \\d+ 个采样点/.test(t);"));
+    check("回放工具条已渲染", await cdp.eval("return document.body.textContent.includes('历史回放');"));
+    check("导出 CSV 按钮在位", await cdp.eval("return __e2e.clickText('button','导出 CSV') === true;"));
+    await sleep(600);
+    check("加载回放", await cdp.eval("return __e2e.clickText('button','加载回放');"));
+    await sleep(2500);
+    check("回放滑块与帧信息出现", await cdp.eval(
+      "return document.querySelectorAll('input[type=range]').length > 0 && /\\d+ \\/ \\d+ 帧/.test(document.body.textContent);"));
+    // 曲线回放游标（markLine）+ 视口跟随
+    check("曲线出现回放游标", await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); const ml=c && c.getOption().series[0].markLine;"
+      + "return !!ml && Array.isArray(ml.data) && ml.data.length===1;"));
+    const cursorIdx0 = await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); return Number(c.getOption().series[0].markLine.data[0].xAxis);");
+    check("加载回放后视口收敛到游标附近", await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); const z=(c.getOption().dataZoom||[])[0]||{};"
+      + "const s=Number(z.startValue), e=Number(z.endValue), n=c.getOption().xAxis[0].data.length;"
+      + "return isFinite(s) && isFinite(e) && e > s && (e - s) < n;"));
+    // 生长式回放：主序列只画到游标，幽灵序列保留全长轮廓；图例不出现幽灵
+    check("曲线为生长回放（主序列截至游标 + 幽灵线全长）", await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); const o=c.getOption();"
+      + "const n=o.xAxis[0].data.length; return o.series.length >= 4"
+      + " && o.series[0].data.length < n && o.series[1].data.length === n && /未回放/.test(o.series[1].name);"));
+    check("图例不含幽灵序列", await cdp.eval(
+      "const l=(window.Charts.get('water-hist-chart').getOption().legend[0]||{}).data||[];"
+      + "return l.length === 2 && !l.some((x) => /未回放/.test(x));"));
+    const growBefore = await cdp.eval("return window.Charts.get('water-hist-chart').getOption().series[0].data.length;");
+    await cdp.eval("const r=document.querySelector('input[type=range]'); r.value=Math.floor(Number(r.max)/2);"
+      + "r.dispatchEvent(new Event('input',{bubbles:true})); return true;");
+    await sleep(2200);
+    const growAfter = await cdp.eval("return window.Charts.get('water-hist-chart').getOption().series[0].data.length;");
+    check("拖动回放时曲线随之生长", growAfter > growBefore, JSON.stringify({ growBefore, growAfter }));
+    // 拖动滑块到最后一帧：游标前进，且视口跟随滚动
+    await cdp.eval("const r=document.querySelector('input[type=range]'); r.value=r.max;"
+      + "r.dispatchEvent(new Event('input',{bubbles:true})); return true;");
+    await sleep(2500);
+    const cursorIdx1 = await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); return Number(c.getOption().series[0].markLine.data[0].xAxis);");
+    check("拖动回放滑块时曲线游标前进", cursorIdx1 > cursorIdx0,
+          JSON.stringify({ cursorIdx0, cursorIdx1 }));
+    check("游标移出窗口时视口跟随滚动", await cdp.eval(
+      "const c=window.Charts.get('water-hist-chart'); const z=(c.getOption().dataZoom||[])[0]||{};"
+      + "return Number(z.startValue) > 0;"));
+    // 回到中间帧再播放（避免刚从末帧开始播、立即结束导致「暂停」按钮不存在）
+    await cdp.eval("const r=document.querySelector('input[type=range]');"
+      + "r.value=Math.floor(Number(r.max)/4); r.dispatchEvent(new Event('input',{bubbles:true})); return true;");
+    await sleep(1600);
+    check("播放回放", await cdp.eval("return __e2e.clickText('button','播放');"));
+    await sleep(1800);
+    check("回放帧已推进", await cdp.eval("return /[2-9]\\d* \\/ \\d+ 帧/.test(document.body.textContent);"));
+    check("暂停回放", await cdp.eval("return __e2e.clickText('button','暂停');"));
+    await sleep(400);
+    check("切换数据统计", await cdp.eval("return __e2e.clickText('.tab','数据统计');"));
+    await sleep(1800);
+    check("统计显示有效读数点与加权平均", await cdp.eval(
+      "const t=document.body.textContent; return t.includes('有效流量读数点') && t.includes('加权平均流量')"
+      + " && t.includes('采样点数（含离线空行）');"));
+    check("切回历史数据", await cdp.eval("return __e2e.clickText('.tab','历史数据');"));
+    await sleep(1200);
+    // 本节自建的布局复位，并刷新页面回到默认布局（后续 7.3g 与响应式检查依赖默认卡片）
+    await api("POST", "/api/water/dashboard/layout/reset");
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("本节测试布局已复位并回到监控页", await cdp.eval("return !!__e2e.q('.kpi-card');"));
+
+    console.log("== 7.3g 系统拓扑卡 / 一键场景卡 ==");
+    check("返回实时监控", await cdp.eval(
+      "return __e2e.clickText('.tab','实时监控') || __e2e.clickText('.chip','实时监控');"));
+    await sleep(1500);
+    const kpiBeforeNew = await cdp.eval("return __e2e.count('.kpi-card');");
+    check("进入编辑模式(拓扑/场景卡)", await cdp.eval("return __e2e.clickText('.dash-editbar .btn-ghost','编辑卡片');"));
+    await sleep(500);
+    for (const label of ["系统拓扑", "一键场景"]) {
+      await cdp.eval("return __e2e.clickText('.dash-editbar .btn-ghost','+ 添加卡片');");
+      await sleep(400);
+      await cdp.eval("return __e2e.clickText('.wg-modal .tab','内置卡片');");
+      await sleep(300);
+      const added = await cdp.eval(`const it=[...document.querySelectorAll('.wg-cat-item')].find(e=>e.textContent.includes('${label}'));
+        if(!it) return false; const b=it.querySelector('button'); if(b.disabled) return false; b.click(); return true;`);
+      check(`添加${label}卡`, added);
+      await sleep(700);
+    }
+    check("拓扑卡 SVG 已渲染", await cdp.eval("return !!document.querySelector('svg.topo');"));
+    check("拓扑卡管路与节点齐全", await cdp.eval(
+      "return document.querySelectorAll('.topo-pipe').length === 2 && document.querySelectorAll('.topo-node').length === 3;"));
+    check("场景卡两个按钮就位", await cdp.eval(
+      "const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('一键场景'));"
+      + "return !!c && c.textContent.includes('启动循环') && c.textContent.includes('急停全部');"));
+    // 只点「急停全部」（关闭类指令），绝不点「启动循环」（避免开泵）
+    await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('一键场景'));"
+      + "const b=[...c.querySelectorAll('button')].find(x=>x.textContent.includes('急停')); b.click(); return true;");
+    await sleep(3000);
+    const devOnlineNow = (await api("GET", "/api/water/system")).data.device_online;
+    const stopLogged = await (async () => {
+      const items = (await api("GET", "/api/water/logs?page=1&page_size=10")).data.items || [];
+      return items.some((l) => /pump_off|heater_off|device.custom/.test(l.action));
+    })();
+    if (devOnlineNow) {
+      check("急停已写操作日志", stopLogged);
+    } else {
+      // 设备离线且默认布局无自定义执行器时不会产生控制日志（属设计内降级）
+      warn("急停未产生控制日志（设备离线且无自定义执行器）", "");
+    }
+    check("场景卡显示执行结果", await cdp.eval(
+      "const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('一键场景')); return /已急停/.test(c.textContent);"));
+    for (const label of ["系统拓扑", "一键场景"]) {
+      await cdp.eval(`const item=[...document.querySelectorAll('.grid-stack-item')].find(e=>e.textContent.includes('${label}'));
+        if(item) item.querySelector('.wg-btn.danger').click(); return true;`);
+      await sleep(700);
+    }
+    check("新增卡片已删除", (await cdp.eval("return __e2e.count('.kpi-card');")) === kpiBeforeNew);
+    check("退出编辑模式(拓扑/场景卡)", await cdp.eval("return __e2e.clickText('.dash-editbar .btn-ghost','完成');"));
+    await sleep(400);
+    check("回到系统配置继续后续用例", await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
+    await sleep(1500);
+
+    console.log("== 7.3h 恒温闭环多路回路（卡片即来源） ==");
+    // 用"无害执行器"验证闭环：执行器卡的指令指向本机只读接口，不触碰真实加热继电器
+    const roUrl = `http://127.0.0.1:8000/api/water/realtime?token=${apiToken}`;
+    await api("POST", "/api/water/dashboard/layout", { layout: { version: 1, widgets: [
+      { id: "e2e-pid-sensor", type: "value", title: "E2E温度源", unit: "℃", decimals: 1,
+        source: { kind: "realtime", path: "heater_temp" }, grid: { x: 0, y: 0, w: 3, h: 2 } },
+      { id: "e2e-pid-guard", type: "tank", title: "E2E液位", unit: "%", decimals: 1,
+        source: { kind: "realtime", path: "tank.tanks.heater" }, grid: { x: 3, y: 0, w: 3, h: 2 } },
+      { id: "e2e-pid-act", type: "control", title: "E2E加热执行器",
+        cmd: { on: roUrl, off: roUrl }, source: { kind: "realtime", path: "pump_state" },
+        grid: { x: 6, y: 0, w: 3, h: 2 } },
+      { id: "e2e-pid-card", type: "builtin", builtin: "pid", title: "E2E闭环", catalogKey: "pid",
+        pid: { sensor_card: "e2e-pid-sensor", actuator_card: "e2e-pid-act",
+               guard_card: "e2e-pid-guard", guard_min: 0, target: 60,
+               kp: 16, ki: 0.3, kd: 25, enabled: false },
+        grid: { x: 0, y: 2, w: 4, h: 4 } }] } });
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    await sleep(2500);
+    check("闭环卡显示温度来源与执行器名称", await cdp.eval(
+      "const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+      + "return !!c && c.textContent.includes('E2E温度源') && c.textContent.includes('E2E加热执行器');"));
+    check("闭环初始为关闭状态", await cdp.eval(
+      "const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+      + "const t=c.querySelector('.toggle'); return !!t && !t.classList.contains('on');"));
+    // 配置对话框：三个下拉应能选到卡片（来源/执行器/防干烧条件）
+    check("进入编辑模式(闭环卡)", await cdp.eval("return __e2e.clickText('.dash-editbar .btn-ghost','编辑卡片');"));
+    await sleep(500);
+    await cdp.eval("const item=[...document.querySelectorAll('.grid-stack-item')].find(e=>e.textContent.includes('E2E闭环'));"
+      + "const b=[...item.querySelectorAll('.wg-btn')].find(x=>(x.getAttribute('title')||'').includes('配置')); b.click(); return true;");
+    await sleep(700);
+    check("闭环配置对话框含来源/执行器/联锁三项", await cdp.eval(
+      "const t=document.body.textContent; return t.includes('温度来源卡') && t.includes('加热执行器卡') && t.includes('防干烧条件卡');"));
+    check("来源下拉列出候选卡片", await cdp.eval(
+      "const sels=[...document.querySelectorAll('.wg-modal select')];"
+      + "const s=sels.find(x=>[...x.options].some(o=>o.textContent.includes('E2E温度源'))); return !!s;"));
+    // 改目标温度 → 保存 → 后端卡片配置应更新
+    await cdp.eval("const row=[...document.querySelectorAll('.wg-modal .wg-row')].find(r=>r.textContent.includes('目标温度'));"
+      + "const inp=row && row.querySelector('input[type=number]'); if(!inp) return false;"
+      + "const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+      + "s.call(inp,'55'); inp.dispatchEvent(new Event('input',{bubbles:true})); return true;");
+    check("保存闭环卡配置", await cdp.eval("return __e2e.clickText('.wg-modal .btn-primary','保存');"));
+    await sleep(1500);
+    const pidLayoutAfter = (await api("GET", "/api/water/dashboard/layout")).data.layout;
+    const pidCardAfter = (pidLayoutAfter.widgets || []).find((w) => w.id === "e2e-pid-card") || {};
+    check("闭环卡配置已写回布局（目标=55）", Number((pidCardAfter.pid || {}).target) === 55,
+          JSON.stringify(pidCardAfter.pid));
+    check("退出编辑模式(闭环卡)", await cdp.eval("return __e2e.clickText('.dash-editbar .btn-ghost','完成');"));
+    await sleep(800);
+    // 开启闭环：执行器是自定义指令（无害 GET），应写出 pid_actuator_on 日志
+    const logBeforePid = ((await api("GET", "/api/water/logs?page=1&page_size=5")).data.items || [])
+      .map((l) => l.ts + "|" + l.action);
+    await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+      + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    await sleep(3500);
+    const pidLogs = ((await api("GET", "/api/water/logs?page=1&page_size=20")).data.items || [])
+      .filter((l) => !logBeforePid.includes(l.ts + "|" + l.action));
+    check("开启闭环后按门限下发自定义执行器", pidLogs.some((l) => l.action === "pid_actuator_on"),
+          JSON.stringify(pidLogs.map((l) => l.action)));
+    const loopsNow = (await api("GET", "/api/water/pid/loops")).data.loops || [];
+    const thisLoop = loopsNow.find((l) => l.id === "e2e-pid-card") || {};
+    check("闭环回路状态可供卡片显示（含来源/执行器/实测）",
+          thisLoop.sensor_title === "E2E温度源" && thisLoop.actuator_title === "E2E加热执行器"
+          && thisLoop.enabled === true, JSON.stringify(thisLoop));
+    // 关掉闭环，避免测试结束后继续下发指令
+    await cdp.eval("const c=[...document.querySelectorAll('.kpi-card')].find(x=>x.textContent.includes('E2E闭环'));"
+      + "c.querySelector('.wg-ctl input, .toggle input').click(); return true;");
+    await sleep(2000);
+    check("闭环已关闭（测试收尾）",
+          ((await api("GET", "/api/water/pid/loops")).data.loops || [])
+            .some((l) => l.id === "e2e-pid-card" && l.enabled === false));
+    // 本节结束：复位布局并回到配置页（后续用例依赖默认布局）
+    await api("POST", "/api/water/dashboard/layout/reset");
+    await cdp.send("Page.navigate", { url: BASE + "/" });
+    await sleep(2600);
+    await cdp.eval(HELPERS + "; return true;");
+    check("闭环测试布局已复位并回到配置页",
+          await cdp.eval("return __e2e.clickText('.chip','系统配置');"));
+    await sleep(1200);
 
     console.log("== 7.4 账号管理 ==");
     check("切到账号管理标签", await cdp.eval("return __e2e.clickText('.tab','账号管理');"));

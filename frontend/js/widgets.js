@@ -96,6 +96,10 @@ window.Widgets = (() => {
     { key: "reset", title: "清零累计", type: "builtin", builtin: "reset",
       feature: "volume_reset", perm: "ctrl_light", grid: { w: 4, h: 2 } },
     { key: "device", title: "采集设备", type: "builtin", builtin: "device", grid: { w: 12, h: 3 } },
+    /* 竞赛加分/演示用内置卡：系统拓扑（状态可视化）与一键场景（启动/急停） */
+    { key: "topo", title: "系统拓扑", type: "builtin", builtin: "topo", grid: { w: 8, h: 6 } },
+    { key: "scene", title: "一键场景", type: "builtin", builtin: "scene",
+      perm: "ctrl_light", grid: { w: 4, h: 3 } },
   ];
 
   /* 目录条目 → 卡片配置（深拷贝，补 id 与 catalogKey） */
@@ -134,7 +138,28 @@ window.Widgets = (() => {
     "config.tank": "修改水槽容积",
     "config.dashboard": "修改仪表盘布局",
     "config.site": "修改站点文案",
+    "config.gateway": "配置外部设备",
+    "config.calib": "修改通道标定",
+    "config.timers": "修改定时任务",
+    "config.judge": "修改判定服务模板",
     "device.custom": "自定义指令",
+    "device.gateway": "外部设备线圈控制",
+    "link_card_on": "联动：卡片指令 开",
+    "link_card_off": "联动：卡片指令 关",
+    "link_pump_on": "联动：本机水泵 开",
+    "link_pump_off": "联动：本机水泵 关",
+    "link_heater_on": "联动：本机加热 开",
+    "link_heater_off": "联动：本机加热 关",
+    "link_quant_cancel": "联动：取消定量",
+    "link_fail": "联动：动作失败",
+    "timer_card_on": "定时：卡片指令 开",
+    "timer_card_off": "定时：卡片指令 关",
+    "timer_pump_on": "定时：本机水泵 开",
+    "timer_pump_off": "定时：本机水泵 关",
+    "timer_heater_on": "定时：本机加热 开",
+    "timer_heater_off": "定时：本机加热 关",
+    "timer_quant_cancel": "定时：取消定量",
+    "timer_fail": "定时：动作失败",
     "link_off_pump": "联动关水泵",
     "link_off_heater": "联动关加热",
     "link_cancel_target": "联动取消定量",
@@ -148,10 +173,11 @@ window.Widgets = (() => {
   };
   function actionLabel(a) { return ACTION_LABELS[a] || a; }
   /* 系统自动动作没有操作账号，用来源(source)区分 */
-  function isSystemLog(l) { return l.source === "auto" || l.source === "judge"; }
+  function isSystemLog(l) { return l.source === "auto" || l.source === "judge" || l.source === "timer"; }
   function operatorText(l) {
     if (l.source === "auto") return "系统 · 恒温闭环";
     if (l.source === "judge") return "系统 · 判定服务";
+    if (l.source === "timer") return "系统 · 定时任务";
     return l.operator || "—";
   }
 

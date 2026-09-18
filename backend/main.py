@@ -20,12 +20,16 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 import config
 import database
 import store
+import water_device
 from alarm import AlarmEngine
 from custom_channels import CustomChannelManager
 from api import router
 from auth import ensure_admin
 from judge_service import JudgeService
+from gateway import ModbusGateway
+from scheduler import TimerScheduler
 from pid_control import PID, heater_action
+from pid_loops import PidLoopManager
 from state import services
 from water_device import WaterPlant
 
@@ -50,29 +54,29 @@ def run_cycle() -> None:
         data["total_flow"] = data.get("total_liters")
 
     # 自定义传感器通道：按各自周期轮询 → 入库 → 值并入 data["custom"]（全链路）
-    services.custom.poll()
+    # 传入本轮快照：卡片声明的本机路径（如 device.rssi / tank.tanks.*）也在这里取样入库
+    data["tank"] = water_device.tank_snapshot(data)   # 与 API 快照同一份口径，供卡片路径引用
+    services.custom.poll(data)
     data["custom"] = services.custom.values()
 
-    # 恒温闭环控制(PID)：需设备同时支持温度与加热通道（任务六）
-    if config.pid_supported() and store.pid_enabled():
-        heater_temp = data.get("heater_temp")
-        if heater_temp is None:
-            # 加热槽温度无有效读数(设备离线/传感器异常)时跳过本轮闭环，避免 PID 收到空值
-            if DEBUG_ENABLE:
-                _log.warning("[CONTROL] 恒温闭环跳过：加热槽温度无有效读数")
-        else:
-            target = store.target_temp()
-            duty = services.pid.update(target, heater_temp, store.period())
-            act = heater_action(duty)
-            if act != plant.heater_state:
-                plant.heater_control(act)
-                name = "开启加热" if act == "on" else "关闭加热"
-                database.insert_control_log(f"heater_{act}", "success",
-                                            f"恒温闭环自动{name}(目标{target}℃,占空比{duty:.0f}%)",
-                                            operator=None, source="auto")
-                if DEBUG_ENABLE:
-                    _log.info("[CONTROL] 恒温闭环 → %s (heater_temp=%.2f target=%.1f duty=%.0f%%)",
-                              name, heater_temp, target, duty)
+    # 外部设备适配器（Modbus TCP / 串口服务器）：读数覆盖同名通道，custom:xxx 写入自定义通道
+    if services.gateway:
+        services.gateway.poll()
+        gvals = services.gateway.values()
+        if gvals:
+            custom = dict(data.get("custom") or {})
+            for key, value in gvals.items():
+                if key.startswith("custom:"):
+                    custom[key.split(":", 1)[1]] = value
+                else:
+                    data[key] = value
+            data["custom"] = custom
+            data["gateway"] = gvals
+
+    # 恒温闭环控制(PID)：一张「恒温闭环」卡 = 一路独立闭环（多水槽可并存）；
+    # 未配置闭环卡时走默认回路（加热槽温度 → 本机加热），与旧行为一致。
+    if services.pid_loops:
+        services.pid_loops.tick(data)
 
     # 数据入库(任务三：持久化)；设备不支持的通道写 NULL
     database.insert_water_sensor(
@@ -86,6 +90,9 @@ def run_cycle() -> None:
 
     # 告警检查(任务六异常告警)：仅检查设备实际支持的通道
     services.alarm.check(data)
+    # 定时任务：到点执行卡片动作（与联动同一套执行器与审计）
+    if services.timers:
+        services.timers.tick()
     # 报警联动：本机通道规则随 check 评估；自定义传感器源按各自周期在此轮询
     services.alarm.check_custom()
 
@@ -146,9 +153,12 @@ async def lifespan(app: FastAPI):
     services.plant = WaterPlant()
     services.alarm = AlarmEngine()
     services.alarm.plant = services.plant   # 报警联动动作的执行对象
+    services.timers = TimerScheduler(services.alarm)   # 定时任务（复用联动动作执行器）
     services.custom = CustomChannelManager()  # 自定义传感器通道（全链路）
     services.pid = PID(store.pid_kp(), store.pid_ki(), store.pid_kd())
+    services.pid_loops = PidLoopManager(services.plant)   # 多路恒温闭环（卡片即来源）
     services.judge = JudgeService()
+    services.gateway = ModbusGateway()   # 外部设备（Modbus/串口）接入适配器
     enabled = [k for k, v in config.DEVICE_FEATURES.items() if v]
     _log.info("采集设备: %s (超时%.1fs) 支持通道: %s", config.DEVICE_URL, config.DEVICE_TIMEOUT_S, ",".join(enabled))
     if not config.pid_supported():

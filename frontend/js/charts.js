@@ -128,11 +128,16 @@ window.Charts = (() => {
     if (registry[id]) registry[id].setOption(option, !!notMerge);
   }
 
+  /* 取已注册实例（增量更新或调试用；未初始化返回 null） */
+  function get(id) {
+    return registry[id] || null;
+  }
+
   function resizeAll() {
     Object.values(registry).forEach((c) => {
       try { c.resize(); } catch (e) { /* ignore */ }
     });
   }
 
-  return { init, set, resizeAll, lineSeries, barSeries, baseOption, barOption, pieOption, gaugeOption, axisStyle };
+  return { init, set, get, resizeAll, lineSeries, barSeries, baseOption, barOption, pieOption, gaugeOption, axisStyle };
 })();

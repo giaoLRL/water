@@ -11,6 +11,14 @@
  * 无数据一律显示 0 或 --，不做任何模拟。
  */
 
+/* 状态字符串 → 曲线数值：on=1 / off=0 / 其它（unknown、空）=null（曲线断开）。
+   水泵、加热这类开关量历史在 water_sensors 里存的是 on/off 字符串，画曲线时用它转换。 */
+function stateToNum(v) {
+  if (v === "on" || v === true || v === 1 || v === "1") return 1;
+  if (v === "off" || v === false || v === 0 || v === "0") return 0;
+  return null;
+}
+
 window.ViewWaterDash = {
   name: "WaterDashView",
   components: { WidgetShell: window.WidgetShell },
@@ -25,6 +33,10 @@ window.ViewWaterDash = {
       histRangeKey: "1h",
       histType: "all",
       histCustomId: "",        // 选中的自定义通道（历史曲线页，全链路）
+      histMeta: { raw: 0, sampled: false },   // 历史取样元信息（是否降采样）
+      // 历史回放（时间轴 + 按时间点取快照）
+      replayFrames: [], replayIndex: 0, replayPlaying: false, replayTimer: null, replayAt: {},
+      replayMeta: { raw: 0, sampled: false },
       customStats: {},         // 自定义通道统计 {id: {samples,avg,max,min}}
       customStart: "",
       customEnd: "",
@@ -48,12 +60,25 @@ window.ViewWaterDash = {
     online() { return !!this.realtime.sensor_online; },
     features() { return this.realtime.features || {}; },
     device() { return this.realtime.device || {}; },
+    /* 历史曲线的"唯一选中键"：自定义通道优先，否则用内置类型。
+       所有标签都只跟它比较，结构上保证同时最多一个选中（曾出现内置标签与自定义通道各亮一个的问题）。 */
+    activeHistKey() {
+      return this.histCustomId ? "c:" + this.histCustomId : this.histType;
+    },
     totalText() {
       const v = this.realtime.total_liters;
       return v === null || v === undefined ? "--" : Number(v).toFixed(3);
     },
     alarmPages() { return Math.max(1, Math.ceil(this.alarmTotal / this.alarmPageSize)); },
     logPages() { return Math.max(1, Math.ceil(this.logTotal / this.logPageSize)); },
+    /* 闭环卡配置用：可选温度来源卡（数值类）与执行器卡（控制类） */
+    sourceCardOptions() {
+      const ok = ["value", "spark", "line", "tank"];
+      return (this.widgets || []).filter((c) => ok.includes(c.type) && c.source);
+    },
+    controlCardOptions() {
+      return (this.widgets || []).filter((c) => c.type === "control");
+    },
     /* 内置卡片目录：按设备能力(feature)+权限(perm)+实时标志(flag)过滤，标记已添加；
        multi 卡（通用单水槽）不判重，可重复添加 */
     catalogList() {
@@ -89,6 +114,7 @@ window.ViewWaterDash = {
   },
   beforeUnmount() {
     if (this.timer) clearInterval(this.timer);
+    if (this.replayTimer) clearInterval(this.replayTimer);
     if (this._saveT) clearTimeout(this._saveT);
     if (this._grid) { try { this._grid.destroy(false); } catch (e) { /* ignore */ } this._grid = null; }
   },
@@ -125,6 +151,7 @@ window.ViewWaterDash = {
     async fetchHistory(key, start, end) {
       if (key && key.startsWith("c:")) {
         // 自定义通道（全链路）：时间范围沿用当前选择
+        this.histType = "";               // 与内置标签互斥（否则两组会各亮一个）
         this.histCustomId = key.slice(2);
       } else if (key) {
         this.histRangeKey = key;   // 保留 histCustomId：切时间范围仍看同一自定义通道
@@ -133,25 +160,162 @@ window.ViewWaterDash = {
       const e = end ? String(end).replace("T", " ") : this.rangeEnd();
       if (this.histCustomId) {
         try {
-          const d = await API.customHistory(this.histCustomId, s, e);
+          const d = await API.customHistory(this.histCustomId, s, e, 1500);
           this.histPoints = (d.points || []).map((p) => ({ ts: p.ts, cval: p.value }));
+          this.histMeta = { raw: d.raw_count || 0, sampled: !!d.sampled };
           this.renderChart();
         } catch (err) { /* silent */ }
         return;
       }
       try {
-        const d = await API.history(s, e);
+        const d = await API.history(s, e, 1500);
         this.histPoints = d.points || [];
+        this.histMeta = { raw: d.raw_count || 0, sampled: !!d.sampled };
         this.renderChart();
       } catch (err) { /* silent */ }
     },
     pickCustomChannel(id) {
+      this.histType = "";                 // 自定义通道与内置通道互斥：清掉内置标签的选中态
       this.histCustomId = id;
       this.fetchHistory(this.histRangeKey);
     },
     queryCustom() {
       if (!this.customStart || !this.customEnd) { alert("请选择自定义时间范围的开始和结束时间"); return; }
       this.fetchHistory("custom", this.customStart, this.customEnd);
+    },
+    /* ---------- CSV 导出（报表与 U 盘提交用） ---------- */
+    async exportHistory() {
+      const s = this.rangeStart(this.histRangeKey), e = this.rangeEnd();
+      const p = this.histCustomId
+        ? { kind: "custom", channel_id: this.histCustomId, start: s, end: e }
+        : { kind: "sensors", start: s, end: e };
+      try {
+        const r = await API.exportCsv(p);
+        if (r && r.total && r.rows < r.total) {
+          alert(`已导出最新 ${r.rows} 条（区间共 ${r.total} 条）。\n如需完整数据请缩小时间范围后分次导出。`);
+        }
+      } catch (err) { alert(err.message); }
+    },
+    exportAlarms() {
+      API.exportCsv({ kind: "alarms" }).catch((err) => alert(err.message));
+    },
+    exportLogs() {
+      API.exportCsv({ kind: "logs", category: this.logCategory }).catch((err) => alert(err.message));
+    },
+    /* ---------- 历史回放：取帧序列 → 滑块/播放 → 按时间点取快照 ---------- */
+    async loadReplay() {
+      const s = this.rangeStart(this.histRangeKey), e = this.rangeEnd();
+      try {
+        const d = await API.replayFrames(s, e, 120);
+        this.replayFrames = d.frames || [];
+        this.replayMeta = { raw: d.raw_count || 0, sampled: !!d.sampled };
+        this.replayIndex = 0;
+        if (!this.replayFrames.length) { alert("该时间范围内没有数据"); return; }
+        await this.replayTo(0);
+        await this.$nextTick();
+        const idx = this.replayPointIndex();
+        if (idx >= 0) this.followReplay(idx, true);   // 初始视口收敛到游标附近，播放时才有"跟随"效果
+      } catch (err) { alert(err.message); }
+    },
+    async replayTo(i) {
+      if (!this.replayFrames.length) return;
+      const idx = Math.max(0, Math.min(this.replayFrames.length - 1, i));
+      this.replayIndex = idx;
+      const frame = this.replayFrames[idx] || {};
+      try {
+        const d = await API.replayAt(frame.ts);
+        this.replayAt = Object.assign({}, d.sensor || {}, { custom: d.custom || {} });
+      } catch (err) { this.replayAt = frame; }
+      this.updateGrowData();         // 生长式回放：曲线延长 + 游标移动 + 视口跟随
+    },
+    /* ---------- 曲线回放游标（markLine）与视口跟随 ---------- */
+    histChart() { return window.Charts ? window.Charts.get("water-hist-chart") : null; },
+    /* 当前回放时刻在曲线点里的最近索引（曲线 1500 点、回放 120 帧，游标吸附到最近点） */
+    replayPointIndex() {
+      if (!this.replayFrames.length || !(this.histPoints || []).length) return -1;
+      const ts = this.replayAt.ts || (this.replayFrames[this.replayIndex] || {}).ts;
+      if (!ts) return -1;
+      const pts = this.histPoints;
+      const ms = (v) => new Date(String(v).replace(/-/g, "/")).getTime();
+      const target = ms(ts);
+      let lo = 0, hi = pts.length - 1;
+      while (lo < hi) {                        // 二分找第一个 >= target 的点
+        const mid = (lo + hi) >> 1;
+        if (ms(pts[mid].ts) < target) lo = mid + 1; else hi = mid;
+      }
+      let best = lo, bestDiff = Infinity;
+      for (const i of [lo - 1, lo, lo + 1]) {
+        if (i < 0 || i >= pts.length) continue;
+        const diff = Math.abs(ms(pts[i].ts) - target);
+        if (diff < bestDiff) { bestDiff = diff; best = i; }
+      }
+      return best;
+    },
+    cursorMarkLine(idx) {
+      return {
+        symbol: ["none", "none"],
+        silent: true,
+        animation: false,
+        lineStyle: { color: "#fbbf24", width: 1.5 },
+        label: {
+          show: true, position: "insideEndTop", color: "#fbbf24", fontSize: 11,
+          formatter: () => "回放 " + (this.replayAt.ts || ""),
+        },
+        data: [{ xAxis: idx }],
+      };
+    },
+    /* 把当前游标写进图表配置（首次渲染时用） */
+    applyCursorToOption(option) {
+      const idx = this.replayPointIndex();
+      if (idx < 0 || !option.series || !option.series.length) return option;
+      option.series[0] = Object.assign({}, option.series[0], { markLine: this.cursorMarkLine(idx) });
+      return option;
+    },
+    /* 增量更新游标（不整图重绘） */
+    updateReplayCursor() {
+      const chart = this.histChart();
+      const idx = this.replayPointIndex();
+      if (!chart || idx < 0) return;
+      chart.setOption({ series: [{ markLine: this.cursorMarkLine(idx) }] });
+      this.followReplay(idx);
+    },
+    /* 视口跟随：游标移出当前窗口时把窗口滚过去。
+       窗口大小固定为总点数的约 15%（最少 10 点），这样拖动/播放时视口才会真正"滚动"。 */
+    followReplay(idx, force = false) {
+      const chart = this.histChart();
+      const total = (this.histPoints || []).length;
+      if (!chart || total <= 0) return;
+      const span = Math.max(10, Math.min(total - 1, Math.round(total * 0.15)));
+      const win = this._zoomWindow;
+      if (!force && win && idx >= win.start && idx <= win.end) return;   // 游标已在窗口内：不动
+      let s = idx - Math.floor(span / 2);
+      s = Math.max(0, Math.min(Math.max(0, total - 1 - span), s));
+      const e = Math.min(total - 1, s + span);
+      this._zoomWindow = { start: s, end: e };
+      chart.dispatchAction({ type: "dataZoom", startValue: s, endValue: e });
+    },
+    toggleReplay() {
+      if (this.replayPlaying) {
+        clearInterval(this.replayTimer);
+        this.replayTimer = null;
+        this.replayPlaying = false;
+        return;
+      }
+      if (!this.replayFrames.length) { this.loadReplay(); return; }
+      this.replayPlaying = true;
+      this.replayTimer = setInterval(() => {
+        if (this.replayIndex >= this.replayFrames.length - 1) {
+          clearInterval(this.replayTimer);
+          this.replayTimer = null;
+          this.replayPlaying = false;
+          return;
+        }
+        this.replayTo(this.replayIndex + 1);
+      }, 600);
+    },
+    fmtReplay(v, d) {
+      return (v === null || v === undefined || v === "" || isNaN(Number(v)))
+        ? "--" : Number(v).toFixed(d === undefined ? 2 : d);
     },
     pickHistType(t) {
       this.histType = t;
@@ -161,35 +325,19 @@ window.ViewWaterDash = {
     renderChart() {
       const el = document.getElementById("water-hist-chart");
       if (!el || !window.echarts) return;
+      this._zoomWindow = null;      // 重新渲染：视口跟随状态重置
       const pts = this.histPoints || [];
       const times = pts.map((p) => p.ts);
-      // 自定义通道曲线（全链路）：单序列 + 通道单位
-      if (this.histCustomId) {
-        const ch = (this.realtime.custom_channels || []).find((c) => c.id === this.histCustomId) || {};
-        window.Charts.init("water-hist-chart", {
-          ...window.Charts.baseOption(times, ch.unit || ""),
-          series: [window.Charts.lineSeries(ch.name || "自定义通道", pts.map((p) => p.cval), "#a78bfa")],
-        });
+      const spec = this.histSeriesSpecs();
+      const series = this.buildSeries(spec.specs);
+      if (spec.unit !== null) {                    // 单通道视图
+        window.Charts.init("water-hist-chart",
+          this.applyCursorToOption(this.histOption(times, spec.unit, series)));
         return;
       }
-      if (this.histType !== "all") {
-        const def = {
-          flow: ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0],
-          total: ["累计水量", "total_flow", "#2dd4bf", "L", 0],
-          stemp: ["储水槽温度", "storage_temp", "#fb923c", "℃", 1],
-          htemp: ["加热槽温度", "heater_temp", "#f87171", "℃", 1],
-          pressure: ["水压", "pressure", "#a78bfa", "kPa", 1],
-          light: ["光照", "light", "#facc15", "lx", 1],
-        }[this.histType] || ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0];
-        window.Charts.init("water-hist-chart", {
-          ...window.Charts.baseOption(times, def[3]),
-          series: [window.Charts.lineSeries(def[0], pts.map((p) => p[def[1]]), def[2])],
-        });
-        return;
-      }
-      window.Charts.init("water-hist-chart", {
+      window.Charts.init("water-hist-chart", this.applyCursorToOption({
         tooltip: { trigger: "axis", backgroundColor: "#1a222d", borderColor: "#2a3442", textStyle: { color: "#d7e0ea" } },
-        legend: { top: 0, textStyle: { color: "#7d8b99" } },
+        legend: { top: 0, textStyle: { color: "#7d8b99" }, data: spec.specs.map((s) => s.name) },
         grid: { left: 56, right: 60, top: 36, bottom: 60 },
         xAxis: { type: "category", data: times, boundaryGap: false, ...window.Charts.axisStyle },
         yAxis: [
@@ -200,10 +348,79 @@ window.ViewWaterDash = {
           { type: "inside" },
           { type: "slider", height: 16, bottom: 8, borderColor: "#262f3b", backgroundColor: "#151b24", fillerColor: "rgba(45,212,191,0.14)", handleStyle: { color: "#2dd4bf" }, textStyle: { color: "#7d8b99" } },
         ],
-        series: [
-          window.Charts.lineSeries("瞬时流量", pts.map((p) => p.flow_rate), "#38bdf8", 0),
-          window.Charts.lineSeries("累计水量", pts.map((p) => p.total_flow), "#2dd4bf", 1),
+        series,
+      }));
+      return;
+    },
+    /* 当前视图的序列规格：名称/颜色/坐标轴/全量数值（"全部"视图返回两个序列） */
+    histSeriesSpecs() {
+      const pts = this.histPoints || [];
+      if (this.histCustomId) {
+        const ch = (this.realtime.custom_channels || []).find((c) => c.id === this.histCustomId) || {};
+        return { unit: ch.unit || "", specs: [
+          { name: ch.name || "自定义通道", color: "#a78bfa", yAxisIndex: 0, values: pts.map((p) => p.cval) },
+        ] };
+      }
+      if (this.histType !== "all") {
+        const def = {
+          flow: ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0],
+          total: ["累计水量", "total_flow", "#2dd4bf", "L", 0],
+          stemp: ["储水槽温度", "storage_temp", "#fb923c", "℃", 1],
+          htemp: ["加热槽温度", "heater_temp", "#f87171", "℃", 1],
+          pressure: ["水压", "pressure", "#a78bfa", "kPa", 1],
+          light: ["光照", "light", "#facc15", "lx", 1],
+          // 状态类通道：on/off 映射为 1/0（unknown 断开），用于看"什么时候开过、开了多久"
+          pump: ["水泵状态", "pump_state", "#2dd4bf", "", 0, stateToNum],
+          heater: ["加热状态", "heater_state", "#f87171", "", 0, stateToNum],
+          target: ["定量目标", "pump_target", "#fbbf24", "L", 2],
+        }[this.histType] || ["瞬时流量", "flow_rate", "#38bdf8", "L/min", 0];
+        return { unit: def[3], specs: [
+          { name: def[0], color: def[2], yAxisIndex: 0,
+            values: pts.map((p) => (def[5] ? def[5](p[def[1]]) : p[def[1]])) },
+        ] };
+      }
+      return { unit: null, specs: [
+        { name: "瞬时流量", color: "#38bdf8", yAxisIndex: 0, values: pts.map((p) => p.flow_rate) },
+        { name: "累计水量", color: "#2dd4bf", yAxisIndex: 1, values: pts.map((p) => p.total_flow) },
+      ] };
+    },
+    /* 生长式回放：已回放部分画实线，未回放部分保留一条淡色"幽灵线"。
+       注意：幽灵序列**必须一开始就建好**——ECharts 增量 setOption 不会新增序列，
+       只更新数据；非回放态时把幽灵线透明度设为 0（不可见），结构保持不变。 */
+    buildSeries(specs) {
+      const cut = this.replayPointIndex();
+      const series = [];
+      for (const s of specs) {
+        const played = cut >= 0 ? s.values.slice(0, cut + 1) : s.values;
+        series.push(Object.assign(window.Charts.lineSeries(s.name, played, s.color, s.yAxisIndex), { z: 3 }));
+        const ghost = window.Charts.lineSeries(s.name + "（未回放）", s.values, s.color, s.yAxisIndex);
+        ghost.silent = true;
+        ghost.z = 1;
+        ghost.tooltip = { show: false };        // 幽灵线不参与 tooltip，避免读数混淆
+        ghost.lineStyle = { width: 1.5, color: s.color, opacity: cut >= 0 ? 0.18 : 0 };
+        ghost.areaStyle = { opacity: 0 };
+        series.push(ghost);
+      }
+      return series;
+    },
+    /* 回放推进时增量更新"已回放长度"（不重建配置，保留缩放与游标） */
+    updateGrowData() {
+      const chart = this.histChart();
+      if (!chart) return;
+      const specs = this.histSeriesSpecs().specs;
+      chart.setOption({ series: this.buildSeries(specs).map((s) => ({ data: s.data })) });
+      this.updateReplayCursor();
+    },
+    /* 单序列历史曲线的统一配置（带缩放条，回放视口跟随需要 dataZoom） */
+    histOption(times, yName, series) {
+      return Object.assign({}, window.Charts.baseOption(times, yName), {
+        grid: { left: 54, right: 20, top: 36, bottom: 60 },
+        dataZoom: [
+          { type: "inside" },
+          { type: "slider", height: 16, bottom: 8, borderColor: "#262f3b", backgroundColor: "#151b24",
+            fillerColor: "rgba(45,212,191,0.14)", handleStyle: { color: "#2dd4bf" }, textStyle: { color: "#7d8b99" } },
         ],
+        series,
       });
     },
     // ---------- 统计 ----------
@@ -308,10 +525,12 @@ window.ViewWaterDash = {
     },
     /* 序列化卡片：只保留配置字段，剔除运行时字段 */
     serialize(w) {
+      // 白名单序列化：新增卡片字段时必须同步加进来，否则保存布局会把它丢掉
+      // （恒温闭环卡片的 pid 配置曾因漏列而整块丢失）
       const o = { id: w.id, type: w.type, title: w.title, unit: w.unit, decimals: w.decimals,
                   color: w.color, foot: w.foot, builtin: w.builtin, catalogKey: w.catalogKey,
                   domId: w.domId, tank: w.tank, ctl: w.ctl, cmd: w.cmd,
-                  source: w.source, thresholds: w.thresholds, grid: w.grid };
+                  pid: w.pid, source: w.source, thresholds: w.thresholds, grid: w.grid };
       Object.keys(o).forEach((k) => o[k] === undefined && delete o[k]);
       return o;
     },
@@ -438,6 +657,11 @@ window.ViewWaterDash = {
                            url: src.kind === "custom" ? src.url : "",
                            path: src.path || "",
                            period: src.period || 5,
+                           pidSensor: (w.pid || {}).sensor_card || "",
+                           pidActuator: (w.pid || {}).actuator_card || "",
+                           pidGuard: (w.pid || {}).guard_card || "",
+                           pidGuardMin: (w.pid || {}).guard_min ?? 20,
+                           pidTarget: (w.pid || {}).target ?? 42,
                            cmdOn: (w.cmd || {}).on || "", cmdOff: (w.cmd || {}).off || "" } };
     },
     saveConfig() {
@@ -467,6 +691,30 @@ window.ViewWaterDash = {
         w._v = (w._v || 0) + 1;   // 触发组件重建，以新参数重启轮询
       }
       w.foot = f.foot;
+      if (w.builtin === "pid") {
+        // 闭环回路配置写在卡片上：来源卡 / 执行器卡 / 防干烧条件卡（+ 快照，卡片被删时兜底）
+        const find = (id) => (this.widgets || []).find((x) => x.id === id);
+        const snap = (id) => { const c = find(id); return c ? JSON.parse(JSON.stringify(c.source || {})) : {}; };
+        const pid = Object.assign({}, w.pid || {});
+        pid.sensor_card = f.pidSensor || "";
+        pid.sensor_source = snap(pid.sensor_card);
+        pid.actuator_card = f.pidActuator || "";
+        pid.guard_card = f.pidGuard || "";
+        pid.guard_source = snap(pid.guard_card);
+        pid.guard_min = f.pidGuardMin === "" || f.pidGuardMin == null ? null : Number(f.pidGuardMin);
+        if (f.pidTarget !== "" && f.pidTarget != null && !isNaN(Number(f.pidTarget))) {
+          pid.target = Number(f.pidTarget);
+        }
+        const ac = find(pid.actuator_card);
+        if (ac) {
+          const cmd = ac.cmd || {};
+          pid.actuator = (cmd.on || cmd.off)
+            ? { kind: "url", url_on: cmd.on || "", url_off: cmd.off || "", title: ac.title }
+            : { kind: ac.ctl === "pump" ? "pump" : "heater", title: ac.title };
+        }
+        w.pid = pid;
+        w._v = (w._v || 0) + 1;
+      }
       const keyed = w.thresholds && (w.thresholds.minKey || w.thresholds.maxKey);
       if (!keyed && ["value", "spark", "line"].includes(w.type)) {
         const has = (f.min !== "" && f.min != null) || (f.max !== "" && f.max != null);
@@ -513,7 +761,7 @@ window.ViewWaterDash = {
              :gs-min-w="2" :gs-min-h="1">
           <div class="grid-stack-item-content">
             <WidgetShell :widget="w" :realtime="realtime" :thresholds="thresholds"
-                         :editing="editing" :online="online"
+                         :editing="editing" :online="online" :widgets="widgets"
                          @remove="removeWidget" @config="openConfig"/>
           </div>
         </div>
@@ -535,18 +783,57 @@ window.ViewWaterDash = {
           <input type="datetime-local" v-model="customEnd">
           <button class="btn-ghost" @click="queryCustom">查询</button>
         </div>
-        <div class="tabs">
-          <span class="tab" :class="{ active: histType==='all' }" @click="pickHistType('all')">全部</span>
-          <span class="tab" :class="{ active: histType==='flow' }" @click="pickHistType('flow')">瞬时流量</span>
-          <span class="tab" :class="{ active: histType==='total' }" @click="pickHistType('total')">累计水量</span>
-          <span class="tab" v-if="features.temperature" :class="{ active: histType==='stemp' }" @click="pickHistType('stemp')">储水槽温度</span>
-          <span class="tab" v-if="features.temperature" :class="{ active: histType==='htemp' }" @click="pickHistType('htemp')">加热槽温度</span>
-          <span class="tab" v-if="features.pressure" :class="{ active: histType==='pressure' }" @click="pickHistType('pressure')">水压</span>
-          <span class="tab" v-if="features.light" :class="{ active: histType==='light' }" @click="pickHistType('light')">光照</span>
+        <div class="tabs hist-type-tabs">
+          <!-- 高亮统一由 activeHistKey 决定（自定义通道优先），保证同时只有一个选中 -->
+          <span class="tab" :class="{ active: activeHistKey==='all' }" @click="pickHistType('all')">全部</span>
+          <span class="tab" :class="{ active: activeHistKey==='flow' }" @click="pickHistType('flow')">瞬时流量</span>
+          <span class="tab" :class="{ active: activeHistKey==='total' }" @click="pickHistType('total')">累计水量</span>
+          <span class="tab" v-if="features.temperature" :class="{ active: activeHistKey==='stemp' }" @click="pickHistType('stemp')">储水槽温度</span>
+          <span class="tab" v-if="features.temperature" :class="{ active: activeHistKey==='htemp' }" @click="pickHistType('htemp')">加热槽温度</span>
+          <span class="tab" v-if="features.pressure" :class="{ active: activeHistKey==='pressure' }" @click="pickHistType('pressure')">水压</span>
+          <span class="tab" v-if="features.light" :class="{ active: activeHistKey==='light' }" @click="pickHistType('light')">光照</span>
+          <span class="tab" v-if="features.pump" :class="{ active: activeHistKey==='pump' }" @click="pickHistType('pump')">水泵状态</span>
+          <span class="tab" v-if="features.heater" :class="{ active: activeHistKey==='heater' }" @click="pickHistType('heater')">加热状态</span>
+          <span class="tab" v-if="features.pump_target" :class="{ active: activeHistKey==='target' }" @click="pickHistType('target')">定量目标</span>
           <span class="tab" v-for="c in (realtime.custom_channels || [])" :key="'c' + c.id"
-                :class="{ active: histCustomId === c.id }" @click="pickCustomChannel(c.id)">{{ c.name }}</span>
+                :class="{ active: activeHistKey === 'c:' + c.id }" @click="pickCustomChannel(c.id)">{{ c.name }}</span>
+        </div>
+        <div class="alarm-rule" style="margin:6px 0;">
+          <span class="desc">导出当前时间范围的原始数据（CSV，Excel 直接打开不乱码）</span>
+          <button class="btn-ghost" style="margin-left:auto;" @click="exportHistory">导出 CSV</button>
+        </div>
+        <div class="note" v-if="histMeta.sampled" style="margin:0 0 6px;">
+          区间共 {{ histMeta.raw }} 个采样点，图中等距显示 {{ histPoints.length }} 点（已降采样，曲线覆盖到最新数据）
         </div>
         <div class="chart" id="water-hist-chart"></div>
+
+        <!-- 历史回放：时间轴 + 按时间点取快照（只读展示，不控制设备） -->
+        <div class="alarm-rule" style="margin-top:10px;flex-wrap:wrap;align-items:center;">
+          <span class="desc">历史回放</span>
+          <button class="btn-ghost" @click="loadReplay">加载回放（当前时间范围）</button>
+          <button class="btn-ghost" :disabled="!replayFrames.length" @click="toggleReplay">
+            {{ replayPlaying ? '⏸ 暂停' : '▶ 播放' }}
+          </button>
+          <input type="range" min="0" :max="Math.max(0, replayFrames.length - 1)"
+                 :value="replayIndex" :disabled="!replayFrames.length"
+                 style="flex:1;min-width:160px;" @input="replayTo(Number($event.target.value))">
+          <span class="desc" v-if="replayFrames.length">
+            {{ replayIndex + 1 }} / {{ replayFrames.length }} 帧 · {{ (replayAt.ts || (replayFrames[replayIndex]||{}).ts || '') }}
+            <template v-if="replayMeta.sampled"> · 区间共 {{ replayMeta.raw }} 行（已降采样）</template>
+          </span>
+        </div>
+        <div class="grid-4" v-if="replayFrames.length">
+          <div class="metric"><div class="label">瞬时流量</div><div class="value">{{ fmtReplay(replayAt.flow_rate) }}<span class="unit">L/min</span></div></div>
+          <div class="metric"><div class="label">累计水量</div><div class="value">{{ fmtReplay(replayAt.total_flow, 3) }}<span class="unit">L</span></div></div>
+          <div class="metric"><div class="label">储水槽水温</div><div class="value">{{ fmtReplay(replayAt.storage_temp, 1) }}<span class="unit">℃</span></div></div>
+          <div class="metric"><div class="label">加热槽水温</div><div class="value">{{ fmtReplay(replayAt.heater_temp, 1) }}<span class="unit">℃</span></div></div>
+        </div>
+        <div class="grid-4" v-if="replayFrames.length">
+          <div class="metric"><div class="label">水压</div><div class="value">{{ fmtReplay(replayAt.pressure, 1) }}<span class="unit">kPa</span></div></div>
+          <div class="metric"><div class="label">光照</div><div class="value">{{ fmtReplay(replayAt.light, 1) }}<span class="unit">lx</span></div></div>
+          <div class="metric"><div class="label">水泵</div><div class="value">{{ replayAt.pump_state || '--' }}</div></div>
+          <div class="metric"><div class="label">加热</div><div class="value">{{ replayAt.heater_state || '--' }}</div></div>
+        </div>
       </div>
     </div>
 
@@ -558,9 +845,15 @@ window.ViewWaterDash = {
       </div>
       <div class="grid-4" style="margin-bottom:14px;">
         <div class="metric"><div class="label">平均流量</div><div class="value">{{ stats.avg_flow ?? '--' }}<span class="unit">L/min</span></div></div>
+        <div class="metric"><div class="label">加权平均流量</div><div class="value">{{ stats.avg_flow_weighted ?? '--' }}<span class="unit">L/min</span></div></div>
         <div class="metric"><div class="label">最高流量</div><div class="value">{{ stats.max_flow ?? '--' }}<span class="unit">L/min</span></div></div>
         <div class="metric"><div class="label">最低流量</div><div class="value">{{ stats.min_flow ?? '--' }}<span class="unit">L/min</span></div></div>
+      </div>
+      <div class="grid-4" style="margin-bottom:14px;">
         <div class="metric"><div class="label">区间用水量</div><div class="value">{{ stats.volume_used ?? '--' }}<span class="unit">L</span></div></div>
+        <div class="metric"><div class="label">采样点数（含离线空行）</div><div class="value">{{ stats.samples ?? 0 }}<span class="unit">条</span></div></div>
+        <div class="metric"><div class="label">有效流量读数点</div><div class="value">{{ (stats.valid_samples || {}).flow ?? '--' }}<span class="unit">条</span></div></div>
+        <div class="metric"><div class="label">有效温度读数点</div><div class="value">{{ (stats.valid_samples || {}).storage_temp ?? '--' }}<span class="unit">条</span></div></div>
       </div>
       <div class="grid-4" v-if="features.temperature || features.pressure" style="margin-bottom:14px;">
         <div class="metric" v-if="features.temperature"><div class="label">储水槽均温</div><div class="value">{{ stats.avg_storage_temp ?? '--' }}<span class="unit">℃</span></div></div>
@@ -587,12 +880,18 @@ window.ViewWaterDash = {
         <div class="metric"><div class="label">采样点数</div><div class="value">{{ stats.samples ?? 0 }}<span class="unit">条</span></div></div>
       </div>
       <div class="note">区间用水量 = 区间结束累计水量 − 区间起始累计水量；期间若执行过清零，该值按 0 计。</div>
+      <div class="note">
+        「采样点数」含设备离线期间写入的空行（无数据一律 NULL，不伪造）；「有效读数点」只统计该通道真正有读数的行。
+        「加权平均流量」按每个采样值持续的时间加权，采样间隔不均（设备离线时循环变慢）时比简单平均更准确。
+      </div>
     </div>
 
     <!-- 告警记录 -->
     <div v-show="tab === 'alarm'">
       <div class="section">
-        <h3>告警记录 <span class="desc">当前活跃 {{ alarmTotal }} 条</span></h3>
+        <h3>告警记录 <span class="desc">当前活跃 {{ alarmTotal }} 条</span>
+          <button class="btn-ghost" style="margin-left:auto;" @click="exportAlarms">导出 CSV</button>
+        </h3>
         <div style="overflow-x:auto;">
           <table>
             <thead><tr><th>时间</th><th>类型</th><th>数值</th><th>阈值</th><th>方向</th><th>状态</th></tr></thead>
@@ -636,6 +935,7 @@ window.ViewWaterDash = {
           <span class="desc" style="margin-left:auto;">
             系统自动动作（恒温闭环 / 判定服务）无操作账号，标注为「系统」
           </span>
+          <button class="btn-ghost" @click="exportLogs">导出 CSV</button>
         </div>
         <div style="overflow-x:auto;">
           <table>
@@ -770,6 +1070,41 @@ window.ViewWaterDash = {
               <div class="wg-row"><span>关指令</span><input v-model="dlg.form.cmdOff" placeholder="关 = GET URL，留空用内置通道"></div>
               <div class="wg-note">指令经后端代理 GET 下发（仅白名单主机）并写入操作日志；两条都留空则使用内置水泵/加热通道。</div>
             </template>
+          </template>
+          <!-- 恒温闭环卡：一张卡 = 一路独立闭环，指定温度来源卡 / 加热执行器卡 / 防干烧条件卡 -->
+          <template v-if="(widgets.find(x=>x.id===dlg.target)||{}).builtin === 'pid'">
+            <div class="wg-row">
+              <span>温度来源卡</span>
+              <select v-model="dlg.form.pidSensor" style="min-width:190px;">
+                <option value="">（未指定：按默认回路＝加热槽水温）</option>
+                <option v-for="c in sourceCardOptions" :key="'ps' + c.id" :value="c.id">{{ c.title }}</option>
+              </select>
+            </div>
+            <div class="wg-row">
+              <span>加热执行器卡</span>
+              <select v-model="dlg.form.pidActuator" style="min-width:190px;">
+                <option value="">（未指定：本机加热继电器）</option>
+                <option v-for="c in controlCardOptions" :key="'pa' + c.id" :value="c.id">{{ c.title }}</option>
+              </select>
+            </div>
+            <div class="wg-row">
+              <span>防干烧条件卡</span>
+              <select v-model="dlg.form.pidGuard" style="min-width:160px;">
+                <option value="">（不启用联锁）</option>
+                <option v-for="c in sourceCardOptions" :key="'pg' + c.id" :value="c.id">{{ c.title }}</option>
+              </select>
+              <span style="width:auto;">≥</span>
+              <input type="number" v-model.number="dlg.form.pidGuardMin" style="max-width:80px;">
+            </div>
+            <div class="wg-row">
+              <span>目标温度</span>
+              <input type="number" v-model.number="dlg.form.pidTarget" min="0" max="120" step="0.5" style="max-width:90px;">
+              <span style="width:auto;">℃</span>
+            </div>
+            <div class="wg-note">
+              一张闭环卡 = 一路独立 PID：温度来源卡提供实测值；加热执行器卡用于开关加热（内置加热/水泵卡，或带开/关指令 URL 的自定义控制卡）；
+              防干烧条件卡不满足时强制断开加热。多水槽各自控温就加多张闭环卡，互不影响。
+            </div>
           </template>
           <div class="wg-row" v-if="['value','spark','line'].includes(dlg.form.type) && !((widgets.find(x=>x.id===dlg.target)||{}).thresholds||{}).minKey">
             <span>告警阈值</span>

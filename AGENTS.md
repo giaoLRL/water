@@ -94,14 +94,24 @@ backend/
 ├── alarm.py                    # 告警引擎（按设备能力启用通道）
 ├── api.py                      # HTTP 业务接口
 ├── pid_control.py              # PID 算法（温度/加热通道已接入，恒温闭环可用，默认 WATER_PID_ENABLED=0 需界面/配置开启）
+├── pid_loops.py                # 恒温闭环回路管理器（一张闭环卡=一路独立 PID，可多路并存）
 ├── judge_service.py            # 判定服务客户端
 ├── store.py                    # 运行期动态配置（config 表 sys.* 前缀）
 ├── state.py                    # 全局运行时状态
+├── custom_channels.py          # 自定义传感器通道（由实时监控页卡片声明派生）
+├── gateway.py                  # 外部设备接入适配器（Modbus TCP / 串口服务器 / 本机串口）
+├── scheduler.py                # 定时任务调度（每天某时刻 / 每 N 秒执行卡片动作）
+├── calibration.py              # 通道标定（scale/offset，两点标定换算工程值）
 └── tests/
     ├── test_api.py             # 接口功能测试（需先启动后端）
-    └── test_level.py           # 液位通道契约单元测试（无模拟数据、无数据为 0，可独立运行）
+    ├── test_level.py           # 液位通道契约单元测试（无模拟数据、无数据为 0，可独立运行）
+    ├── modbus_sim.py           # Modbus 从站模拟器（外部设备接入自测，无需真实硬件）
+    └── mock_judge.py           # 模拟智能判定服务（上报/轮询/反馈联调）
 tests/
 └── e2e_web.js                  # 前端端到端测试（真实浏览器 + CDP，需先启动后端）
+scripts/
+├── start_*.ps1                 # 启动脚本
+└── make_submission.ps1         # 一键生成「技能赛提交文件」提交包（源码+文档+数据导出）
 ```
 
 ## 4. 数据模型（MySQL）
@@ -193,8 +203,13 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
 - 注意：后端重启后越限状态归零，已越限规则会重新触发一次（安全动作，可接受）；
   heater 动作与 PID 无互锁（加热建议用 PID）；规则建议 ≤10 条（同步执行，单动作超时 1.5s）。
 
-**自定义传感器通道（卡片即声明）**：实时监控页加一张「自定义接口」卡
-（source.kind=custom，含 URL/取值路径/轮询周期 2~300s），后端即按此轮询：
+**传感器通道（卡片即声明）**：实时监控页加的卡片就是声明，后端按两种来源派生通道：
+- **自定义接口卡**（source.kind=custom，含 URL/取值路径/轮询周期）→ 按周期 GET 该接口取值；
+- **本机快照卡**（source.kind=realtime 的数值卡/曲线卡/单水槽卡）→ 若其取值路径**不属于**
+  `water_sensors` 标准列（标准列：flow_rate/total_liters/storage_temp/heater_temp/pressure/
+  light/pump_state/heater_state/pump_target，这些已逐秒入库），则按周期从本轮采集快照取样入库，
+  通道 id 为 `card:<卡片id>`（于是「加一张卡＝历史/统计多一个指标」，如水槽卡 → 水位曲线）。
+派生后的共同行为：
 - 值有效 → 写入 realtime 快照（`realtime.custom.<卡片id>` 与 `realtime.custom_channels`
   元数据）并入库 `custom_sensor_data`（channel_id=卡片id）；
 - 历史曲线页出现对应标签（`/api/water/custom/history`），统计页出现指标卡
@@ -204,9 +219,79 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
   （不再有 `POST /api/water/custom/channels`、`/api/water/alarm/actuators`）。
 - 无数据不入库不做模拟；轮询在采集循环内同步执行（自定义卡建议 ≤10 张）。
 
+**历史曲线内置标签**：瞬时流量 / 累计水量 / 储水槽温度 / 加热槽温度 / 水压 / 光照
+（数值型），以及 **水泵状态 / 加热状态 / 定量目标**（状态型：`on/off` 在前端映射为 1/0，
+`unknown` 或空值断开曲线——便于"什么时候开过、开了多久"）；派生通道（含 `card:<id>` 水位等）
+自动追加为标签。数据来自 `water_sensors` 的对应列，不额外存储。
+**标签高亮只允许一个**：内置标签与"自定义/派生通道"标签比较的是**同一个唯一键 `activeHistKey`**
+（自定义通道优先，形式 `c:<通道id>`），因此点自定义通道后内置标签会自动取消选中。
+新增标签时必须沿用 `activeHistKey` 比较，不要再单独用 `histType`/`histCustomId` 判高亮
+（曾出现"内置标签 + 自定义通道各亮一个"的问题）；通道类型标签行类名为 `.hist-type-tabs`
+（E2E 据此做互斥断言，避免与时间范围标签行混淆）。
+
+**恒温闭环多路回路（v2：卡片即来源）**：**一张「恒温闭环」卡 = 一路独立 PID**，可多路并存（多水槽各自控温）。
+- 卡片字段 `pid`：`{sensor_card, sensor_source{kind,url,path,period}, actuator_card, actuator{kind,url_on,url_off},
+  guard_card, guard_source, guard_min, target, kp, ki, kd, enabled}`。
+  来源卡必须是数值类卡片（value/spark/line/tank）；执行器卡是控制开关卡（内置加热/水泵卡 → 本机通道，
+  带自定义开/关指令 URL 的卡 → 走白名单 GET）；`guard_card` 为可选的防干烧联锁（如液位卡 ≥ 阈值）。
+- 后端 `pid_loops.PidLoopManager` 从布局派生回路：每路一份独立 PID 状态（积分/上次误差/上次占空比）；
+  温度无有效读数 → 跳过本轮；联锁不满足 → 强制断开加热并给出原因；自定义指令型执行器按"本路上次下发状态"去抖
+  （没有回读，不能像内置通道那样比对设备状态，否则会每周期重复发指令）。
+- **未配置来源/执行器的老式闭环卡 = 旧版默认回路**（加热槽温度 → 本机加热，参数取 `sys.pid_*`），
+  旧接口 `/water/pid`、`/water/pid/mode`、`/water/target` 保持不变；新增
+  `GET /water/pid/loops`（view_monitor，回各路状态）与 `POST /water/pid/loops`（cfg_alarm，改某路 target/kp/ki/kd/enabled，
+  **写回卡片配置**并写 `config.pid` 日志）。
+- ⚠️ 卡片新增字段必须同步加入 `waterDashboard.serialize()` 的白名单，否则保存布局时会被丢弃
+  （闭环卡 `pid` 配置曾因此整块丢失，表现为"保存后回路变成默认回路、甚至去控本机加热"）。
+
 **真实数据原则**：设备不支持或离线时，接口返回 `None` 与 `features` 能力表；
 水位类字段按用户要求**无数据一律为 0**，但必须同时带 `source="none"` 或离线标志。
 **绝不生成任何模拟/演示值**；控制指令失败必须返回 40003，不得伪造成功。
+
+**现场适配能力（2026-09-18 增补，竞赛现场未知题目的兜底）**：
+- **CSV 导出**：`GET /api/water/export.csv?kind=sensors|alarms|logs|custom&start&end&channel_id&category&limit`，
+  带 UTF-8 BOM（Excel 直接打开不乱码），按类型校验 view_history / view_alarm / view_log 权限；
+  前端历史、告警、日志三页各有「导出 CSV」按钮。
+- **提交包**：`scripts/make_submission.ps1` 生成「技能赛提交文件」文件夹（源码+文档+数据导出+提交说明），
+  自动排除 .venv/.runtime/__pycache__/.git；脚本为 UTF-8 BOM 以避免 Windows PowerShell 5.1 乱码。
+- **组合条件与持续判定**（报警联动 v4）：规则可带 `extra[]`（≤5 条附加条件，全部满足才算越限）与
+  `hold`（连续满足 N 秒才触发，0=立即）；任一条件读数缺失则本轮跳过、不改状态。
+- **定时任务**：`GET/POST /api/water/timers`（cfg_alarm），mode=interval（every_sec≥5）或 daily（at HH:MM），
+  动作与联动同构（卡片）；到点执行写 `timer_*` 日志、`source="timer"`。
+- **通道标定**：`GET/POST /api/water/calibration`、`POST /api/water/calibration/two_point`（cfg_system）；
+  工程值 = 原始值 × scale + offset，应用于本机通道（water_device 读取后）与自定义通道（custom:<卡片id>）；
+  未标定（1/0）的通道不写入配置，保持零开销。
+- **外部设备接入**：`GET/POST /api/water/gateway`、`GET /api/water/gateway/test?id=`、`GET /api/water/gateway/coil?id=&addr=&state=on|off`；
+  模式 `tcp`（Modbus TCP/MBAP）/ `rtu_tcp`（串口服务器透明传输）/ `rtu_serial`（需 pyserial）；
+  采集项 `{key,func,addr,count,type,scale,offset,target}`，target 为本机通道键或 `custom:<卡片id>`（会入库，历史/统计/联动可用）；
+  读数**覆盖同名本机通道**（现场接的就是它），失败在 `/api/water/gateway` 的 errors 里给原因；线圈写入可直接作为控制卡指令 URL。
+- **判定服务模板化**：`GET/POST /api/water/judge/template`（url + headers + report/poll/feedback 三段 {path, body}），
+  body 内 `{{字段}}` 用实时快照替换、`{{data_json}}` 展开整份快照；未配置段落回退内置报文；
+  地址优先取 `sys.judge_url`，其次 config.JUDGE_URL。
+- **历史回放**：`GET /api/water/replay?ts=`（按时间点取快照，含各自定义通道该时刻最近值）与
+  `GET /api/water/replay/frames?start&end&limit=`（等距降采样帧）；前端历史页回放条支持滑块与播放。
+  **生长式回放 + 曲线联动**（2026-09-18 增强）：曲线只画到当前回放时刻（已回放段实线，
+  其后的"未来"段用同色半透明幽灵线保留整段轮廓，透明度 0.18；幽灵序列不进图例、不参与 tooltip；
+  非回放态时幽灵线透明度 0 —— 注意 ECharts 增量 setOption 不能新增序列，幽灵序列必须在首次渲染时成对创建）；
+  播放/拖动时曲线随之生长，同时曲线上有**回放游标**（ECharts markLine，
+ 吸附到最近的曲线点，标签显示当前时刻），并**视口跟随**——缩放窗口固定为总点数约 15%
+  （最少 10 点），游标移出窗口才滚动（在窗口内不动，避免频繁重绘打断观察）；
+  切换时间范围/通道类型时游标与视口状态重置。曲线单序列视图也带 dataZoom，否则无法跟随。
+  游标位置通过 `window.Charts.get(id).getOption().series[0].markLine` 可读取（E2E 据此断言）。
+- **历史取样与统计口径（2026-09-18 修正）**：
+  - 图表接口 `/water/history`、`/water/custom/history` 的 `limit` 是**图上最大点数**：
+    区间再长也覆盖到最新数据，超出时**等距降采样**（保留首尾、末点必为区间最新一条），
+    并返回 `raw_count`（区间原始行数）与 `sampled`（是否降采样）；前端显示「已降采样」提示。
+    **禁止再用 `ORDER BY ts ASC LIMIT`**（那样会丢弃最新数据，长区间曲线会停在几小时前）。
+  - 回放 `/water/replay/frames` 同样覆盖整区间并返回 `frames/raw_count/sampled`。
+  - CSV 导出上限 20 万条（1Hz 下约 55 小时），超限时保留**最新**数据；响应头
+    `X-Exported-Rows` / `X-Total-Rows` 供前端提示是否被截断。
+  - 统计 `/water/stats`：`samples` 含设备离线期间写入的空行，`valid_samples.{flow,storage_temp,
+    heater_temp,pressure,light}` 才是各通道有效读数点；`avg_flow_weighted` 为按持续时间加权的
+    平均流量（采样间隔不均时比 `avg_flow` 准确），间隔 >60s 的离线空档不计入。
+- **拓扑卡与场景卡**（前端 builtin）：`topo` 系统拓扑（节点状态绑定实时值、有流量时管路流动动画、
+  无传感器槽位标注）；`scene` 一键场景（启动循环＝开泵；急停＝关泵/关加热/取消定量 + 依次关闭布局内所有
+  配了自定义指令的控制卡），两者均二次确认并写操作日志。
 
 ## 6. AI 编码行为准则
 
@@ -237,6 +322,17 @@ reset（清零累计）/ device（设备健康），逻辑自包含于 widgetShe
 - [ ] 报警联动可在系统配置页编辑，**触发源与动作都从实时监控页的卡片里选**（内置卡/后加的自定义卡），保存即生效并写入 config.link 日志；越限沿执行 link_* 动作日志，恢复沿执行可选恢复动作
 - [ ] 自定义传感器通道：实时监控页加「自定义接口」卡即完成声明，realtime 快照含读数、历史曲线/统计页出现对应标签、联动触发源可选；删卡即停止采集；越限/恢复写告警记录（custom:<规则id>）
 - [ ] 系统配置页不再出现「执行器档案」「自定义传感器通道」区块，后端无 `/api/water/alarm/actuators`、`/api/water/custom/channels` 端点
+- [ ] CSV 导出：历史/告警/日志三页各有「导出 CSV」，文件带 UTF-8 BOM 与中文表头，按类型校验权限（`/api/water/export.csv`）
+- [ ] 提交包脚本：`scripts/make_submission.ps1` 能在目标位置生成「技能赛提交文件」（源码+文档+数据导出+提交说明），不删除目标已有内容
+- [ ] 报警联动支持组合条件与持续判定：`extra[]` 全部满足 + `hold` 连续 N 秒才触发；读数缺失时跳过不改状态
+- [ ] 定时任务：interval/daily 两种模式可保存回读，到点执行卡片动作并写 `timer_*` 日志（source=timer）
+- [ ] 通道标定：两点标定算出 scale/offset 并生效，工程值进入实时快照/入库/告警；未标定通道不受影响
+- [ ] 外部设备接入：Modbus TCP 与串口服务器(RTU over TCP) 两种模式均可配置并试读，线圈写入可作为控制卡指令
+- [ ] 判定服务报文模板：可配置地址/请求头/三段报文，未配置段落回退内置报文，非法地址或路径被拒 40002
+- [ ] 历史回放：按时间点取快照 + 帧序列，前端滑块/播放可用
+- [ ] 拓扑卡与场景卡：topo 节点状态随实时值变化；scene 急停可一键关闭本机执行器与全部自定义执行器（均二次确认并写日志）
+- [ ] 恒温闭环多路：一张闭环卡 = 一路独立 PID（来源卡 + 执行器卡 + 可选防干烧联锁卡），参数写回卡片配置；未配置的老式闭环卡仍按默认回路（加热槽温度→本机加热）运行
+- [ ] 闭环安全：温度无有效读数时跳过本轮；联锁不满足时强制断开加热并给出原因；自定义指令型执行器不重复下发
 - [ ] 全站无模拟数据：无数据的水位恒显示 0，设备离线时两槽水位归 0 并提示离线
 - [ ] 操作日志记录操作人（人工为账号名，自动动作为「系统 · 恒温闭环 / 判定服务」），支持分类筛选
 - [ ] 系统配置与账号管理类操作均已入日志，且不含密码明文

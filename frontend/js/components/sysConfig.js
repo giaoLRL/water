@@ -15,6 +15,13 @@ window.ViewSysConfig = {
       // 报警联动（v3 卡片即来源）：触发源与动作都直接选自实时监控页的卡片
       links: [],
       cards: [],               // 实时监控页的卡片（内置 + 自建），联动选择项的唯一来源
+      // 外部设备接入（Modbus/串口）
+      gateways: [], gatewayValues: {}, gatewayErrors: {},
+      // 定时任务
+      timers: [],
+      // 通道标定
+      calib: {}, calibChannels: [], calibCustom: [],
+      tp: { target: "", raw1: "", eng1: "", raw2: "", eng2: "" },
       // 账号
       users: [],
       roles: [],
@@ -69,6 +76,22 @@ window.ViewSysConfig = {
       if (this.perm("cfg_alarm")) {
         try { this.links = (await API.alarmLinksGet()).links || []; } catch (e) { /* silent */ }
       }
+      // 外部设备接入 / 定时任务 / 通道标定（现场换硬件时在这里改，无需改代码）
+      try {
+        const gw = await API.gatewayGet();
+        this.gateways = gw.gateways || [];
+        this.gatewayValues = gw.values || {};
+        this.gatewayErrors = gw.errors || {};
+      } catch (e) { /* silent */ }
+      if (this.perm("cfg_alarm")) {
+        try { this.timers = (await API.timersGet()).timers || []; } catch (e) { /* silent */ }
+      }
+      try {
+        const cal = await API.calibrationGet();
+        this.calib = cal.calibration || {};
+        this.calibChannels = cal.channels || [];
+        this.calibCustom = cal.custom || [];
+      } catch (e) { /* silent */ }
       try { this.siteCopy = Object.assign(this.siteCopy, await API.siteGet()); }
       catch (e) { /* silent */ }
       const caps = this.system.tank_capacities;
@@ -159,6 +182,24 @@ window.ViewSysConfig = {
       const card = this.cardById(a.card);
       if (card) Object.assign(a, this.actionOf(card, a.state));
     },
+    /* 附加条件（组合判定：全部满足才算越限） */
+    addExtra(rule, e) {
+      const card = this.cardById(e.target.value);
+      if (!card) { e.target.value = ""; return; }
+      if (!rule.extra) rule.extra = [];
+      if (rule.extra.length >= 5) { alert("附加条件最多 5 条"); e.target.value = ""; return; }
+      rule.extra.push({ card: card.id, source: this.sourceOf(card), direction: "above", threshold: 0 });
+      e.target.value = "";
+    },
+    delExtra(rule, j) { rule.extra.splice(j, 1); },
+    syncExtra(ex) {
+      const card = this.cardById(ex.card);
+      if (card) ex.source = this.sourceOf(card);
+    },
+    extraText(ex) {
+      const dir = ex.direction === "above" ? ">" : "<";
+      return `${this.cardTitle(ex.card)} ${dir} ${ex.threshold}`;
+    },
     // 联动规则
     addLink() {
       const src = this.sourceCards[0];
@@ -169,6 +210,7 @@ window.ViewSysConfig = {
         source_card: src ? src.id : "",
         source: this.sourceOf(src),
         threshold: 0, direction: "above",
+        hold: 0, extra: [],
         actions: tgt ? [this.actionOf(tgt, "off")] : [],
         recover: { actions: [] },
       });
@@ -196,6 +238,20 @@ window.ViewSysConfig = {
         }
         if (isNaN(Number(l.threshold))) { alert(`规则[${l.name || l.id}] 阈值必须为数值`); return; }
         if (l.direction !== "above" && l.direction !== "below") { alert(`规则[${l.name || l.id}] 触发方向非法`); return; }
+        if (l.hold !== undefined && (isNaN(Number(l.hold)) || Number(l.hold) < 0)) {
+          alert(`规则[${l.name || l.id}] 持续秒数必须是不小于 0 的数值`); return;
+        }
+        for (const ex of (l.extra || [])) {
+          const ec = this.cardById(ex.card);
+          if (!ec) { alert(`规则[${l.name || l.id}] 的附加条件卡片不存在，请重新选择`); return; }
+          Object.assign(ex, { source: this.sourceOf(ec) });
+          if (isNaN(Number(ex.threshold))) {
+            alert(`规则[${l.name || l.id}] 附加条件[${this.cardTitle(ec.id)}] 阈值必须为数值`); return;
+          }
+          if (ex.direction !== "above" && ex.direction !== "below") {
+            alert(`规则[${l.name || l.id}] 附加条件[${this.cardTitle(ec.id)}] 方向非法`); return;
+          }
+        }
         const acts = [...(l.actions || []), ...((l.recover || {}).actions || [])];
         if (!acts.length) { alert(`规则[${l.name || l.id}] 至少配置一个动作`); return; }
         for (const a of acts) {
@@ -213,6 +269,144 @@ window.ViewSysConfig = {
         alert("报警联动已保存");
       } catch (e) { alert(e.message); }
     },
+    // ---------- 外部设备接入（Modbus TCP / 串口服务器） ----------
+    addGateway() {
+      this.gateways.push({ id: "g" + Date.now().toString(36), name: "外部设备", mode: "rtu_tcp",
+                           host: "192.168.1.50", port: 8899, unit: 1, period: 5,
+                           enabled: true, polls: [] });
+    },
+    delGateway(i) {
+      if (!confirm("删除该外部设备配置？其采集项与联动动作会失去数据来源。")) return;
+      this.gateways.splice(i, 1);
+    },
+    addPoll(ep) {
+      if (!ep.polls) ep.polls = [];
+      ep.polls.push({ key: "p" + (ep.polls.length + 1), func: 3, addr: 0, count: 1,
+                      type: "u16", scale: 1, offset: 0, target: "flow_rate" });
+    },
+    delPoll(ep, j) { ep.polls.splice(j, 1); },
+    pollTargets() {
+      const base = [
+        { key: "flow_rate", label: "瞬时流量" }, { key: "total_flow", label: "累计水量" },
+        { key: "storage_temp", label: "储水槽水温" }, { key: "heater_temp", label: "加热槽水温" },
+        { key: "pressure", label: "水压" }, { key: "light", label: "光照" },
+        { key: "level_heater", label: "加热槽水位" },
+      ];
+      const custom = (this.calibCustom || []).map((c) => ({ key: c.key, label: c.name + "（自定义）" }));
+      return base.concat(custom);
+    },
+    gatewayReading(ep) {
+      const hits = [];
+      for (const p of (ep.polls || [])) {
+        const v = this.gatewayValues[p.target];
+        if (v !== undefined && v !== null) hits.push(`${p.target}=${Number(v).toFixed(3)}`);
+      }
+      return hits.join(" ");
+    },
+    async saveGateways() {
+      for (const ep of this.gateways) {
+        if (!String(ep.name || "").trim()) { alert("设备名称不能为空"); return; }
+        if ((ep.mode === "tcp" || ep.mode === "rtu_tcp") && !String(ep.host || "").trim()) {
+          alert(`设备[${ep.name}] 必须填写 IP/主机`); return;
+        }
+        if (ep.mode === "rtu_serial" && !String(ep.device || "").trim()) {
+          alert(`设备[${ep.name}] 串口模式必须填写串口号（如 COM3）`); return;
+        }
+        for (const p of (ep.polls || [])) {
+          if (!p.target) { alert(`设备[${ep.name}] 的采集项必须选择目标通道`); return; }
+        }
+      }
+      try {
+        const d = await API.gatewaySet(JSON.parse(JSON.stringify(this.gateways)));
+        this.gateways = d.gateways || [];
+        alert("外部设备配置已保存（采集循环已按新配置轮询）");
+      } catch (e) { alert(e.message); }
+    },
+    async testGateway(ep) {
+      try {
+        const d = await API.gatewayTest(ep.id);
+        alert("试读成功：\n" + JSON.stringify(d.values, null, 2));
+      } catch (e) { alert("试读失败：" + e.message); }
+    },
+
+    // ---------- 定时任务（简单 cron 式） ----------
+    addTimer() {
+      const tgt = this.targetCards[0];
+      this.timers.push({ id: "tm" + Date.now().toString(36), name: "定时任务", enabled: true,
+                         mode: "daily", at: "08:00", every_sec: 600,
+                         actions: tgt ? [this.actionOf(tgt, "off")] : [] });
+    },
+    delTimer(i) {
+      if (!confirm("删除该定时任务？")) return;
+      this.timers.splice(i, 1);
+    },
+    modeText(t) {
+      return t.mode === "daily" ? ("每天 " + (t.at || "--"))
+        : ("每 " + (t.every_sec || 0) + " 秒");
+    },
+    async saveTimers() {
+      for (const t of this.timers) {
+        if (t.mode === "interval" && !(Number(t.every_sec) >= 5)) {
+          alert(`任务[${t.name || t.id}] 间隔须 ≥5 秒`); return;
+        }
+        if (t.mode === "daily" && !/^\d{2}:\d{2}$/.test(String(t.at || ""))) {
+          alert(`任务[${t.name || t.id}] 执行时刻格式须为 HH:MM`); return;
+        }
+        const acts = t.actions || [];
+        if (!acts.length) { alert(`任务[${t.name || t.id}] 至少配置一个动作`); return; }
+        for (const a of acts) {
+          const c = this.cardById(a.card);
+          if (!c) { alert(`任务[${t.name || t.id}] 的动作卡片不存在，请重新选择`); return; }
+          Object.assign(a, this.actionOf(c, a.state));
+        }
+      }
+      try {
+        await API.timersSet(JSON.parse(JSON.stringify(this.timers)));
+        this.timers = (await API.timersGet()).timers || [];
+        alert("定时任务已保存（到点自动执行并写操作日志）");
+      } catch (e) { alert(e.message); }
+    },
+
+    // ---------- 通道标定（scale/offset 与两点标定） ----------
+    calibItem(key) {
+      if (!this.calib[key]) this.calib[key] = { scale: 1, offset: 0, unit: "", note: "" };
+      return this.calib[key];
+    },
+    chanLabel(key) {
+      const map = { flow_rate: "瞬时流量", total_flow: "累计水量", storage_temp: "储水槽水温",
+                    heater_temp: "加热槽水温", pressure: "水压", light: "光照",
+                    level_heater: "加热槽水位", level_storage: "储水槽水位" };
+      const c = (this.calibCustom || []).find((x) => x.key === key);
+      return map[key] || (c ? c.name : key);
+    },
+    async saveCalib() {
+      const out = {};
+      for (const [k, v] of Object.entries(this.calib)) {
+        const scale = Number(v.scale === "" || v.scale === null ? 1 : v.scale);
+        const offset = Number(v.offset || 0);
+        if (isNaN(scale) || isNaN(offset)) { alert(`通道[${this.chanLabel(k)}] 系数/偏移必须为数值`); return; }
+        if (scale === 1 && offset === 0) continue;      // 未标定的通道不落库（保持零开销）
+        out[k] = { scale, offset, unit: v.unit || "", note: v.note || "" };
+      }
+      try {
+        const d = await API.calibrationSet(out);
+        this.calib = d.calibration || {};
+        alert("通道标定已保存（实时快照/入库/告警均按新系数换算）");
+      } catch (e) { alert(e.message); }
+    },
+    async calcTwoPoint() {
+      const p = this.tp;
+      if (!p.target) { alert("请选择要标定的通道"); return; }
+      try {
+        const d = await API.calibrationTwoPoint({ raw1: Number(p.raw1), eng1: Number(p.eng1),
+                                                  raw2: Number(p.raw2), eng2: Number(p.eng2) });
+        const item = this.calibItem(p.target);
+        item.scale = d.scale;
+        item.offset = d.offset;
+        alert(`已计算：scale=${d.scale}，offset=${d.offset}（记得点「保存标定」）`);
+      } catch (e) { alert(e.message); }
+    },
+
     // ---------- 界面文案 ----------
     async saveSite() {
       try {
@@ -400,13 +594,177 @@ window.ViewSysConfig = {
       </div>
     </div>
 
-    <!-- 报警联动（v3 卡片即来源）：触发源与动作都直接选自实时监控页的卡片 -->
+    <!-- 外部设备接入（Modbus TCP / 串口服务器）：现场换传感器或继电器板只改这里 -->
+    <div class="section" v-show="tab==='alarm'" style="margin-top:14px;">
+      <h3>外部设备接入 <span class="desc">Modbus TCP / 串口服务器（RS485）；现场只填 IP、从站号、寄存器地址与换算系数</span></h3>
+      <div v-for="(ep, i) in gateways" :key="ep.id" class="link-rule">
+        <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+          <input v-model="ep.name" placeholder="设备名(如 流量计)" style="width:130px;" :disabled="!perm('cfg_system')">
+          <select v-model="ep.mode" :disabled="!perm('cfg_system')" title="接入方式">
+            <option value="rtu_tcp">串口服务器(RTU over TCP)</option>
+            <option value="tcp">Modbus TCP(502)</option>
+            <option value="rtu_serial">本机串口(需 pyserial)</option>
+          </select>
+          <template v-if="ep.mode !== 'rtu_serial'">
+            <input v-model="ep.host" placeholder="IP/主机" style="width:130px;" :disabled="!perm('cfg_system')">
+            <input type="number" v-model.number="ep.port" placeholder="端口" style="width:80px;" :disabled="!perm('cfg_system')">
+          </template>
+          <template v-else>
+            <input v-model="ep.device" placeholder="串口号 COM3" style="width:110px;" :disabled="!perm('cfg_system')">
+            <input type="number" v-model.number="ep.baud" placeholder="波特率" style="width:95px;" :disabled="!perm('cfg_system')">
+          </template>
+          <label class="rule-item" style="flex:none;gap:4px;">从站号
+            <input type="number" v-model.number="ep.unit" min="1" max="247" style="width:60px;" :disabled="!perm('cfg_system')">
+          </label>
+          <label class="rule-item" style="flex:none;gap:4px;">周期
+            <input type="number" v-model.number="ep.period" min="1" style="width:60px;" :disabled="!perm('cfg_system')">秒
+          </label>
+          <label class="rule-item" style="flex:none;gap:4px;">启用
+            <input type="checkbox" v-model="ep.enabled" :disabled="!perm('cfg_system')">
+          </label>
+          <button class="btn-ghost" :disabled="!perm('cfg_system')" @click="testGateway(ep)">试读一次</button>
+          <button class="btn-ghost danger" :disabled="!perm('cfg_system')" @click="delGateway(i)">删除</button>
+        </div>
+        <div v-for="(p, j) in (ep.polls || [])" :key="'p' + j" class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+          <span class="desc">采集项</span>
+          <select v-model="p.target" :disabled="!perm('cfg_system')" title="映射到哪个通道">
+            <option v-for="t in pollTargets()" :key="t.key" :value="t.key">{{ t.label }}</option>
+          </select>
+          <select v-model.number="p.func" :disabled="!perm('cfg_system')" title="功能码">
+            <option :value="3">03 读保持寄存器</option><option :value="4">04 读输入寄存器</option>
+            <option :value="1">01 读线圈</option><option :value="2">02 读离散输入</option>
+          </select>
+          <label class="rule-item" style="flex:none;gap:4px;">地址
+            <input type="number" v-model.number="p.addr" style="width:70px;" :disabled="!perm('cfg_system')">
+          </label>
+          <label class="rule-item" style="flex:none;gap:4px;">数量
+            <input type="number" v-model.number="p.count" min="1" style="width:60px;" :disabled="!perm('cfg_system')">
+          </label>
+          <select v-model="p.type" :disabled="!perm('cfg_system')" title="数据类型与字节序">
+            <option value="u16">u16</option><option value="s16">s16</option>
+            <option value="u32">u32</option><option value="u32_swap">u32(交换字)</option>
+            <option value="f32">f32</option><option value="f32_swap">f32(交换字)</option>
+          </select>
+          <label class="rule-item" style="flex:none;gap:4px;">×系数
+            <input type="number" v-model.number="p.scale" step="any" style="width:80px;" :disabled="!perm('cfg_system')">
+          </label>
+          <label class="rule-item" style="flex:none;gap:4px;">+偏移
+            <input type="number" v-model.number="p.offset" step="any" style="width:80px;" :disabled="!perm('cfg_system')">
+          </label>
+          <button class="btn-ghost danger" :disabled="!perm('cfg_system')" @click="delPoll(ep, j)">删除</button>
+        </div>
+        <div class="alarm-rule" style="margin-top:4px;">
+          <button class="btn-ghost" :disabled="!perm('cfg_system')" @click="addPoll(ep)">+ 采集项</button>
+          <span class="desc" v-if="gatewayReading(ep)">最近读数：{{ gatewayReading(ep) }}</span>
+          <span class="desc kpi-warn" v-if="gatewayErrors[ep.id]">错误：{{ gatewayErrors[ep.id] }}</span>
+        </div>
+      </div>
+      <div class="alarm-rule" style="margin-top:6px;">
+        <button class="btn-ghost" :disabled="!perm('cfg_system')" @click="addGateway">+ 添加外部设备</button>
+        <button class="btn-primary" :disabled="!perm('cfg_system')" @click="saveGateways">保存外部设备</button>
+        <span class="desc">485 继电器板可直接当控制卡：指令 URL 填 /api/water/gateway/coil?id=设备id&amp;addr=0&amp;state=on|off&amp;token=令牌</span>
+      </div>
+    </div>
+
+    <!-- 定时任务（简单 cron）：每天某时刻 / 每 N 秒执行卡片动作 -->
+    <div class="section" v-show="tab==='alarm'" style="margin-top:14px;">
+      <h3>定时任务 <span class="desc">每天某时刻或每 N 秒执行"卡片动作"（与报警联动同一套执行器，写操作日志）</span></h3>
+      <div v-for="(t, i) in timers" :key="t.id" class="link-rule">
+        <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+          <input v-model="t.name" placeholder="任务名(如 每天换水)" style="width:160px;" :disabled="!perm('cfg_alarm')">
+          <select v-model="t.mode" :disabled="!perm('cfg_alarm')">
+            <option value="daily">每天定时</option><option value="interval">固定间隔</option>
+          </select>
+          <template v-if="t.mode === 'daily'">
+            <input v-model="t.at" placeholder="HH:MM" style="width:80px;" :disabled="!perm('cfg_alarm')">
+          </template>
+          <template v-else>
+            <label class="rule-item" style="flex:none;gap:4px;">每
+              <input type="number" v-model.number="t.every_sec" min="5" style="width:80px;" :disabled="!perm('cfg_alarm')">秒
+            </label>
+          </template>
+          <label class="rule-item" style="flex:none;gap:4px;">启用
+            <input type="checkbox" v-model="t.enabled" :disabled="!perm('cfg_alarm')">
+          </label>
+          <span class="desc" v-if="t.next_run">下次：{{ t.next_run }}</span>
+          <button class="btn-ghost danger" :disabled="!perm('cfg_alarm')" @click="delTimer(i)">删除任务</button>
+        </div>
+        <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+          <span class="desc">执行动作：</span>
+          <span v-for="(a, j) in t.actions" :key="'ta' + j" class="badge ok" style="align-items:center;gap:5px;">
+            {{ actionText(a) }}
+            <select v-model="a.card" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option v-for="c in targetCards" :key="c.id" :value="c.id">{{ c.title || c.id }}</option>
+            </select>
+            <select v-if="a.kind !== 'quant'" v-model="a.state" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncAction(a)">
+              <option value="off">关</option><option value="on">开</option>
+            </select>
+            <button class="btn-ghost" style="padding:0 5px;font-size:11px;" :disabled="!perm('cfg_alarm')" @click="delAction(t.actions, j)">×</button>
+          </span>
+          <select :disabled="!perm('cfg_alarm') || !targetCards.length" @change="addAction(t.actions, $event)">
+            <option value="">+ 添加动作</option>
+            <option v-for="c in targetCards" :key="'tt' + c.id" :value="c.id">{{ c.title || c.id }}</option>
+          </select>
+        </div>
+      </div>
+      <div class="alarm-rule" style="margin-top:6px;">
+        <button class="btn-ghost" :disabled="!perm('cfg_alarm')" @click="addTimer">+ 添加定时任务</button>
+        <button class="btn-primary" :disabled="!perm('cfg_alarm')" @click="saveTimers">保存定时任务</button>
+      </div>
+    </div>
+
+    <!-- 通道标定（scale/offset 与两点标定）：换传感器后按原始值换算为工程值 -->
+    <div class="section" v-show="tab==='alarm'" style="margin-top:14px;">
+      <h3>通道标定 <span class="desc">工程值 = 原始值 × 系数 + 偏移；换传感器后在此换算，未标定的通道保持原值</span></h3>
+      <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+        <span class="desc">两点标定：</span>
+        <select v-model="tp.target" style="min-width:150px;" :disabled="!perm('cfg_system')">
+          <option value="">选择通道</option>
+          <option v-for="k in calibChannels" :key="k" :value="k">{{ chanLabel(k) }}</option>
+          <option v-for="c in calibCustom" :key="c.key" :value="c.key">{{ c.name }}（自定义）</option>
+        </select>
+        <input type="number" v-model="tp.raw1" placeholder="原始值1" style="width:90px;" :disabled="!perm('cfg_system')">
+        <input type="number" v-model="tp.eng1" placeholder="工程值1" style="width:90px;" :disabled="!perm('cfg_system')">
+        <input type="number" v-model="tp.raw2" placeholder="原始值2" style="width:90px;" :disabled="!perm('cfg_system')">
+        <input type="number" v-model="tp.eng2" placeholder="工程值2" style="width:90px;" :disabled="!perm('cfg_system')">
+        <button class="btn-ghost" :disabled="!perm('cfg_system')" @click="calcTwoPoint">计算系数</button>
+        <span class="desc">例如：量筒法标流量（100 脉冲→1.0 L，200 脉冲→2.0 L）</span>
+      </div>
+      <div v-for="k in calibChannels" :key="k" class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+        <span style="width:120px;">{{ chanLabel(k) }}</span>
+        <label class="rule-item" style="flex:none;gap:4px;">×系数
+          <input type="number" v-model.number="calibItem(k).scale" step="any" style="width:90px;" :disabled="!perm('cfg_system')">
+        </label>
+        <label class="rule-item" style="flex:none;gap:4px;">+偏移
+          <input type="number" v-model.number="calibItem(k).offset" step="any" style="width:90px;" :disabled="!perm('cfg_system')">
+        </label>
+        <input v-model="calibItem(k).unit" placeholder="单位" style="width:70px;" :disabled="!perm('cfg_system')">
+        <input v-model="calibItem(k).note" placeholder="备注(如 脉冲计K值)" style="width:180px;" :disabled="!perm('cfg_system')">
+      </div>
+      <div v-for="c in calibCustom" :key="c.key" class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+        <span style="width:120px;">{{ c.name }}</span>
+        <label class="rule-item" style="flex:none;gap:4px;">×系数
+          <input type="number" v-model.number="calibItem(c.key).scale" step="any" style="width:90px;" :disabled="!perm('cfg_system')">
+        </label>
+        <label class="rule-item" style="flex:none;gap:4px;">+偏移
+          <input type="number" v-model.number="calibItem(c.key).offset" step="any" style="width:90px;" :disabled="!perm('cfg_system')">
+        </label>
+        <input v-model="calibItem(c.key).unit" placeholder="单位" style="width:70px;" :disabled="!perm('cfg_system')">
+        <input v-model="calibItem(c.key).note" placeholder="备注" style="width:180px;" :disabled="!perm('cfg_system')">
+      </div>
+      <div class="alarm-rule" style="margin-top:6px;">
+        <button class="btn-primary" :disabled="!perm('cfg_system')" @click="saveCalib">保存标定</button>
+        <span class="desc">保存后实时快照、入库、告警、历史统计全部按新系数换算；系数=1 且偏移=0 的通道不写入配置</span>
+      </div>
+    </div>
+
+    <!-- 报警联动（v4 卡片即来源 + 组合条件）：触发源与动作选卡片，支持多条件与持续判定 -->
     <div class="section" v-show="tab==='alarm'" style="margin-top:14px;">
       <h3>报警联动 <span class="desc">触发源与动作都选自实时监控页的卡片 · 越限沿触发，回正常沿可选恢复</span></h3>
 
       <!-- 联动规则 -->
       <div class="alarm-rule" style="font-weight:600;margin-top:16px;">联动规则
-        <span class="desc" style="font-weight:400;">每条规则自带阈值：选一张实时监控页的卡片作触发源，越限时执行选中的卡片动作</span>
+        <span class="desc" style="font-weight:400;">选卡片作触发源；可加附加条件（全部满足才触发）与持续秒数；越限时执行选中的卡片动作</span>
       </div>
       <div v-for="(l, i) in links" :key="l.id" class="link-rule">
         <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
@@ -422,6 +780,24 @@ window.ViewSysConfig = {
           <button class="btn-ghost danger" :disabled="!perm('cfg_alarm')" @click="delLink(i)">删除规则</button>
         </div>
         <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
+          <span class="desc">附加条件（全部满足才触发）：</span>
+          <span v-for="(ex, k) in (l.extra || [])" :key="'x' + k" class="badge" style="align-items:center;gap:5px;">
+            {{ extraText(ex) }}
+            <select v-model="ex.card" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;" @change="syncExtra(ex)">
+              <option v-for="c in sourceCards" :key="c.id" :value="c.id">{{ c.title || c.id }}</option>
+            </select>
+            <select v-model="ex.direction" :disabled="!perm('cfg_alarm')" style="padding:0 4px;font-size:11px;">
+              <option value="above">超上限</option><option value="below">低于下限</option>
+            </select>
+            <input type="number" v-model.number="ex.threshold" style="width:70px;font-size:11px;" :disabled="!perm('cfg_alarm')">
+            <button class="btn-ghost" style="padding:0 5px;font-size:11px;" :disabled="!perm('cfg_alarm')" @click="delExtra(l, k)">×</button>
+          </span>
+          <select :disabled="!perm('cfg_alarm') || !sourceCards.length" @change="addExtra(l, $event)">
+            <option value="">+ 添加条件</option>
+            <option v-for="c in sourceCards" :key="'ex' + c.id" :value="c.id">{{ c.title || c.id }}</option>
+          </select>
+        </div>
+        <div class="alarm-rule" style="flex-wrap:wrap;align-items:center;">
           <label class="rule-item" style="flex:none;gap:4px;">
             <select v-model="l.direction" :disabled="!perm('cfg_alarm')" title="触发方向">
               <option value="above">超上限</option>
@@ -430,6 +806,9 @@ window.ViewSysConfig = {
           </label>
           <label class="rule-item" style="flex:none;gap:4px;">阈值
             <input type="number" v-model.number="l.threshold" style="width:90px;" :disabled="!perm('cfg_alarm')">
+          </label>
+          <label class="rule-item" style="flex:none;gap:4px;">持续
+            <input type="number" v-model.number="l.hold" min="0" max="3600" style="width:70px;" :disabled="!perm('cfg_alarm')">秒
           </label>
           <span class="desc">越限时执行：</span>
           <span v-for="(a, j) in l.actions" :key="'a'+j" class="badge ok" style="align-items:center;gap:5px;">

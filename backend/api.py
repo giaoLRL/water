@@ -3,19 +3,25 @@
 统一返回 {"code":0,"msg":"ok","data":...}；前端通过 /api/* 调用，
 接口文档启动后访问 /docs 自动生成。
 """
+import csv
+import io
 import json
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, Field
 
 import auth
+import calibration
 import config
 import database
+import judge_service
 import store
+import water_device
 from alarm import LINK_DIRECTIONS, LINK_SOURCE_KINDS, LINK_TARGET_KINDS
+from gateway import FUNCS, MODES, MODE_RTU_TCP, MODE_TCP, REG_TYPES
 from state import services
 
 router = APIRouter(prefix="/api")
@@ -87,6 +93,16 @@ class IngestRequest(BaseModel):
     light: float | None = None
 
 
+def _custom_values() -> dict:
+    """自定义通道有效值：卡片声明的通道 + 外部设备（Modbus/串口）映射的 custom:xxx 合并。"""
+    values = dict(services.custom.values()) if services.custom else {}
+    if services.gateway:
+        for key, value in services.gateway.values().items():
+            if key.startswith("custom:"):
+                values[key.split(":", 1)[1]] = value
+    return values
+
+
 def _validate_range(start: str | None, end: str | None) -> None:
     if not start or not end:
         raise ValueError("缺少 start/end 参数")
@@ -104,47 +120,16 @@ def _unsupported(feature: str, label: str) -> dict:
     return err(40003, f"当前采集设备不支持{label}（固件未提供该通道，见 config.DEVICE_FEATURES）")
 
 
-def _tank_info(tank: str, data: dict) -> dict:
-    """单个水槽的水位信息。
-
-    液位来自该水槽的独立液位通道：
-      已接入(DEVICE_FEATURES["level_<tank>"]=True) → 真实读数，source="device"；
-      未接入                                        → 恒为 0，      source="none"（界面标注「无传感器」）。
-    无数据一律按 0 展示，不使用任何模拟值（用户要求：清除模拟数据，没有数据就保持 0）。
-    "估算水量" = 液位% × 该水槽容积，仅作展示参考，不是计量值。
-    """
-    available = bool(config.DEVICE_FEATURES.get(f"level_{tank}"))
-    percent = data.get(f"level_{tank}") if available else None
-    if percent is None:
-        percent = 0.0
-    percent = max(0.0, min(100.0, float(percent)))
-    capacity = store.tank_capacity(tank)
-    height = (config.TANK_HEIGHT_CM_STORAGE if tank == "storage"
-              else config.TANK_HEIGHT_CM_HEATER)
-    return {
-        "key": tank,
-        "label": config.TANK_LABELS.get(tank, tank),
-        "percent": round(percent, 2),
-        "source": "device" if available else "none",
-        "capacity": round(capacity, 3),
-        "volume": round(capacity * percent / 100.0, 3),   # 估算水量(L)，非计量值
-        "height_cm": round(height * percent / 100.0, 1),
-    }
-
-
 def _level_info() -> dict:
     """双水槽水位信息（供前端 SVG 动画使用）。
 
     any_unavailable：存在未接入传感器的槽位（该槽水位恒为 0，界面标注「无传感器」）。
     设备是否在线由 snapshot 的 sensor_online 单独给出，前端据此显示「离线」。
+    逻辑与采集循环共用 water_device.tank_snapshot（单一来源，避免两处口径不一致）。
     """
     plant = services.plant
     data = plant.status() if plant else {}
-    tanks = {tank: _tank_info(tank, data) for tank in config.TANKS}
-    return {
-        "tanks": tanks,
-        "any_unavailable": any(t["source"] != "device" for t in tanks.values()),
-    }
+    return water_device.tank_snapshot(data)
 
 
 def _snapshot() -> dict:
@@ -188,9 +173,13 @@ def _snapshot() -> dict:
         "active_alarms": alarms,
         "alarm_count": len(alarms),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        # 自定义传感器通道（全链路：声明+最近读数，卡片取值路径 custom.<id>）
+        # 自定义传感器通道（全链路：卡片声明+最近读数，卡片取值路径 custom.<id>）
+        # 外部设备（Modbus/串口）映射到 custom:xxx 的读数一并合并，前端与联动拿到的都是有效值
         "custom_channels": services.custom.channels() if services.custom else [],
-        "custom": services.custom.values() if services.custom else {},
+        "custom": _custom_values(),
+        # 外部设备接入（Modbus/串口）：最近读数与设备清单
+        "gateway": services.gateway.values() if services.gateway else {},
+        "gateways": services.gateway.endpoints() if services.gateway else [],
     }
 
 
@@ -212,7 +201,8 @@ def history(
         _validate_range(start, end)
     except ValueError as exc:
         return err(40002, str(exc))
-    return ok({"points": database.query_water_history(start, end, limit)})
+    # limit 现在是"图上最大点数"：区间无论多长都会覆盖到最新数据，超长区间自动等距降采样
+    return ok(database.query_water_history_chart(start, end, limit))
 
 
 # ---------- 执行器控制 ----------
@@ -348,6 +338,60 @@ def ingest(body: IngestRequest, _: dict = Depends(auth.require_perm("view_monito
 
 
 # ---------- 恒温PID(任务六) ----------
+# 闭环回路（v2 卡片即来源）：一张「恒温闭环」卡 = 一路独立 PID，可多路并存（多水槽）。
+@router.get("/water/pid/loops")
+def pid_loops_get(_: dict = Depends(auth.require_perm("view_monitor"))):
+    """各恒温闭环回路的运行状态（来源卡/执行器卡/目标/实测/占空比/错误原因）。"""
+    loops = services.pid_loops.loops() if services.pid_loops else []
+    # 回退说明：没有任何闭环卡时后端跑"默认回路"（加热槽温度 → 本机加热）
+    return ok({"loops": loops, "using_default": not loops,
+               "default_enabled": bool(store.pid_enabled()),
+               "target_temp": store.target_temp()})
+
+
+@router.post("/water/pid/loops")
+def pid_loops_set(body: dict, user: dict = Depends(auth.require_perm("cfg_alarm"))):
+    """更新某闭环回路的运行参数（目标温度 / Kp / Ki / Kd / 启用）——写回卡片配置。
+
+    回路本身（用哪张温度卡、哪张执行器卡、可选的防干烧前置条件卡）在卡片配置里选。
+    """
+    if not services.pid_loops:
+        return err(40003, "恒温闭环服务未启动")
+    loop_id = str(body.get("id", "")).strip()
+    if not loop_id:
+        return err(40002, "必须指定回路 id（即闭环卡的卡片 id）")
+    params: dict = {}
+    try:
+        if body.get("target") is not None:
+            target = float(body["target"])
+            if not (0 <= target <= 120):
+                return err(40002, "目标温度须在 0~120 ℃")
+            params["target"] = round(target, 2)
+        for key in ("kp", "ki", "kd"):
+            if body.get(key) is not None:
+                value = float(body[key])
+                if not (0 <= value <= 1000):
+                    return err(40002, f"{key} 须在 0~1000")
+                params[key] = round(value, 3)
+    except (TypeError, ValueError):
+        return err(40002, "目标温度与 Kp/Ki/Kd 必须为数值")
+    if body.get("enabled") is not None:
+        params["enabled"] = bool(body["enabled"])
+    if not params:
+        return err(40002, "没有需要更新的参数")
+    try:
+        loop = services.pid_loops.set_loop_params(loop_id, params)
+    except KeyError:
+        return err(40004, f"闭环回路不存在: {loop_id}（请确认该卡片仍在实时监控页）")
+    except ValueError as exc:
+        return err(40002, str(exc))
+    database.insert_control_log("config.pid", "success",
+                                f"更新恒温闭环[{loop.get('name') or loop_id}]参数: "
+                                + ", ".join(f"{k}={v}" for k, v in params.items()),
+                                operator=user.get("username") or None, source="manual")
+    return ok({"loop": loop})
+
+
 # 恒温闭环需设备同时提供温度采集与加热控制；两项能力均在 config.DEVICE_FEATURES 声明，
 # 任一缺失时以下接口统一返回不可用（40003）。
 @router.post("/water/target")
@@ -558,6 +602,34 @@ def alarm_links_set(body: dict, user: dict = Depends(auth.require_perm("cfg_alar
                 return err(40002, f"规则[{rid}] 阈值必须为有效数值")
             if r.get("direction") not in LINK_DIRECTIONS:
                 return err(40002, f"非法联动方向: {r.get('direction')}")
+            try:
+                hold = float(r.get("hold") or 0)
+            except (TypeError, ValueError):
+                return err(40002, f"规则[{rid}] 持续秒数必须为数值")
+            if hold < 0 or hold > 3600:
+                return err(40002, f"规则[{rid}] 持续秒数须在 0~3600")
+            extras = r.get("extra") or []
+            if not isinstance(extras, list):
+                return err(40002, "附加条件必须为数组")
+            if len(extras) > 5:
+                return err(40002, "附加条件最多 5 条（同步评估，过多会拖慢采集循环）")
+            for idx, ex in enumerate(extras):
+                label = f"规则[{rid}] 附加条件{idx + 1}"
+                if not isinstance(ex, dict) or not str(ex.get("card", "")).strip():
+                    return err(40002, f"{label} 必须选择实时监控页面上的卡片")
+                esrc = ex.get("source")
+                if not isinstance(esrc, dict) or esrc.get("kind") not in LINK_SOURCE_KINDS:
+                    return err(40002, f"{label} 触发源类型非法")
+                if not str(esrc.get("path", "")).strip():
+                    return err(40002, f"{label} 必须填写取值路径")
+                if esrc["kind"] == "custom":
+                    _validate_link_url(esrc.get("url"), f"{label} 接口 URL")
+                if ex.get("direction") not in LINK_DIRECTIONS:
+                    return err(40002, f"{label} 方向非法")
+                try:
+                    float(ex.get("threshold"))
+                except (TypeError, ValueError):
+                    return err(40002, f"{label} 阈值必须为数值")
             _validate_link_actions(r.get("actions"))
             recover = r.get("recover") or {}
             if recover.get("actions"):
@@ -583,7 +655,7 @@ def custom_history(channel_id: str = Query(...),
         _validate_range(start, end)
     except ValueError as exc:
         return err(40002, str(exc))
-    return ok({"points": database.query_custom_history(channel_id, start, end, limit)})
+    return ok(database.query_custom_history_chart(channel_id, start, end, limit))
 
 
 @router.get("/water/custom/stats")
@@ -595,6 +667,320 @@ def custom_stats(channel_id: str = Query(...),
     except ValueError as exc:
         return err(40002, str(exc))
     return ok(database.custom_sensor_stats(channel_id, start, end))
+
+
+# ---------- 历史回放（时间轴 + 按时间点取快照） ----------
+@router.get("/water/replay")
+def replay_at(ts: str = Query(..., description="目标时刻 yyyy-MM-dd HH:mm:ss"),
+              _: dict = Depends(auth.require_perm("view_history"))):
+    """回放某个时间点的系统快照：传感数据 + 各自定义通道该时刻最近值。"""
+    try:
+        datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return err(40002, f"时间格式错误: {ts}")
+    row = database.query_sensor_at(ts)
+    custom = {}
+    for ch in (services.custom.channels() if services.custom else []):
+        custom[ch["id"]] = database.query_custom_at(ch["id"], ts)
+    gw = {}
+    if services.gateway:
+        for key in (services.gateway.values() or {}):
+            if key.startswith("custom:"):
+                cid = key.split(":", 1)[1]
+                gw[cid] = database.query_custom_at(cid, ts)
+    for key, value in gw.items():
+        if custom.get(key) is None and value is not None:
+            custom[key] = value
+    return ok({"ts": ts, "sensor": row, "custom": custom})
+
+
+@router.get("/water/replay/frames")
+def replay_frames(start: str = Query(...), end: str = Query(...),
+                  limit: int = Query(default=120, ge=2, le=600),
+                  _: dict = Depends(auth.require_perm("view_history"))):
+    """回放时间轴：区间内等距抽取若干帧（前端滑块/播放用）。"""
+    try:
+        _validate_range(start, end)
+    except ValueError as exc:
+        return err(40002, str(exc))
+    # 帧序列覆盖整个区间（超长区间会等距降采样，保证含最新一帧）
+    return ok(database.query_history_frames(start, end, limit))
+
+
+# ---------- 通道标定（scale/offset 与两点标定） ----------
+@router.get("/water/calibration")
+def calibration_get(_: dict = Depends(auth.require_perm("view_device"))):
+    """读取标定配置与本机可标定通道清单（现场换传感器后按需换算）。"""
+    cal = calibration.load()
+    custom = [{"key": c["id"], "name": c.get("name") or c["id"], "unit": c.get("unit") or ""}
+              for c in (services.custom.channels() if services.custom else [])]
+    return ok({"calibration": cal, "channels": list(calibration.CHANNELS), "custom": custom})
+
+
+@router.post("/water/calibration")
+def calibration_set(body: dict, user: dict = Depends(auth.require_perm("cfg_system"))):
+    """保存标定：{calibration: {通道键: {scale, offset, unit, note}}}；未列出的通道恢复原值。"""
+    cal = body.get("calibration")
+    if not isinstance(cal, dict):
+        return err(40002, "calibration 必须为对象")
+    for key, item in cal.items():
+        if not isinstance(item, dict):
+            return err(40002, f"通道[{key}] 标定格式错误")
+        try:
+            scale = float(item.get("scale") if item.get("scale") is not None else 1)
+            offset = float(item.get("offset") or 0)
+        except (TypeError, ValueError):
+            return err(40002, f"通道[{key}] 系数/偏移必须为数值")
+        if not (-1_000_000 <= scale <= 1_000_000) or not (-1_000_000 <= offset <= 1_000_000):
+            return err(40002, f"通道[{key}] 系数/偏移超出合理范围")
+    store.set_json("channel_cal", cal)
+    calibration.reload()
+    database.insert_control_log("config.calib", "success", f"保存通道标定 {len(cal)} 项",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"calibration": cal})
+
+
+@router.post("/water/calibration/two_point")
+def calibration_two_point(body: dict, _: dict = Depends(auth.require_perm("cfg_system"))):
+    """两点标定：给两对「原始值 → 工程值」，返回 scale/offset（前端标定页调用）。"""
+    try:
+        result = calibration.two_point(body.get("raw1"), body.get("eng1"),
+                                       body.get("raw2"), body.get("eng2"))
+    except (TypeError, ValueError) as exc:
+        return err(40002, f"两点标定失败: {exc}")
+    return ok(result)
+
+
+# ---------- 定时任务（简单 cron 式：每天某时刻 / 每 N 秒执行卡片动作） ----------
+@router.get("/water/timers")
+def timers_get(_: dict = Depends(auth.require_perm("cfg_alarm"))):
+    if not services.timers:
+        return ok({"timers": []})
+    items = []
+    for t in services.timers.timers():
+        item = dict(t)
+        item["next_run"] = services.timers.next_run(t)
+        items.append(item)
+    return ok({"timers": items})
+
+
+@router.post("/water/timers")
+def timers_set(body: dict, user: dict = Depends(auth.require_perm("cfg_alarm"))):
+    """保存定时任务：interval（每 N 秒）或 daily（每天 HH:MM），动作与联动同构（卡片）。"""
+    timers = body.get("timers")
+    if not isinstance(timers, list):
+        return err(40002, "timers 必须为数组")
+    seen: set[str] = set()
+    for t in timers:
+        if not isinstance(t, dict):
+            return err(40002, "定时任务格式错误")
+        tid = str(t.get("id", "")).strip()
+        if not tid or tid in seen:
+            return err(40002, "每个定时任务必须有唯一 id")
+        seen.add(tid)
+        mode = t.get("mode")
+        if mode not in ("interval", "daily"):
+            return err(40002, f"任务[{tid}] 模式非法（interval / daily）")
+        if mode == "interval":
+            try:
+                every = float(t.get("every_sec") or 600)
+            except (TypeError, ValueError):
+                return err(40002, f"任务[{tid}] 间隔必须为数值")
+            if every < 5 or every > 86400:
+                return err(40002, f"任务[{tid}] 间隔须在 5~86400 秒")
+        else:
+            at = str(t.get("at") or "")
+            if len(at) != 5 or at[2] != ":" or not (at[:2].isdigit() and at[3:].isdigit()):
+                return err(40002, f"任务[{tid}] 执行时刻须为 HH:MM")
+            if not (0 <= int(at[:2]) <= 23 and 0 <= int(at[3:]) <= 59):
+                return err(40002, f"任务[{tid}] 执行时刻超出范围")
+        try:
+            _validate_link_actions(t.get("actions"))
+        except ValueError as exc:
+            return err(40002, f"任务[{tid}] {exc}")
+    store.set_json("timers", timers)
+    if services.timers:
+        services.timers.reload()
+    database.insert_control_log("config.timers", "success", f"保存定时任务 {len(timers)} 条",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"timers": timers})
+
+
+# ---------- 外部设备接入（Modbus TCP / 串口服务器，现场只改这里） ----------
+@router.get("/water/gateway")
+def gateway_get(_: dict = Depends(auth.require_perm("view_device"))):
+    return ok({"gateways": services.gateway.endpoints() if services.gateway else [],
+               "values": services.gateway.values() if services.gateway else {},
+               "errors": services.gateway.errors() if services.gateway else {}})
+
+
+@router.post("/water/gateway")
+def gateway_set(body: dict, user: dict = Depends(auth.require_perm("cfg_system"))):
+    """保存外部设备接入配置：Modbus TCP（502）/ 串口服务器透明传输 / 本机串口。
+
+    现场换传感器或执行器时，只需在这里填 IP、从站号、寄存器地址与换算系数。
+    """
+    gateways = body.get("gateways")
+    if not isinstance(gateways, list):
+        return err(40002, "gateways 必须为数组")
+    seen: set[str] = set()
+    for ep in gateways:
+        if not isinstance(ep, dict):
+            return err(40002, "外部设备配置格式错误")
+        eid = str(ep.get("id", "")).strip()
+        if not eid or eid in seen:
+            return err(40002, "每台外部设备必须有唯一 id")
+        seen.add(eid)
+        mode = ep.get("mode")
+        if mode not in MODES:
+            return err(40002, f"设备[{eid}] 模式非法（tcp / rtu_tcp / rtu_serial）")
+        if mode in (MODE_TCP, MODE_RTU_TCP):
+            if not str(ep.get("host", "")).strip():
+                return err(40002, f"设备[{eid}] 必须填写 IP/主机")
+            try:
+                port = int(ep.get("port") or 502)
+            except (TypeError, ValueError):
+                return err(40002, f"设备[{eid}] 端口必须为数值")
+            if not (1 <= port <= 65535):
+                return err(40002, f"设备[{eid}] 端口超出范围")
+        elif not str(ep.get("device", "")).strip():
+            return err(40002, f"设备[{eid}] 串口模式必须填写串口号（如 COM3）")
+        try:
+            unit = int(ep.get("unit") or 1)
+        except (TypeError, ValueError):
+            return err(40002, f"设备[{eid}] 从站号必须为数值")
+        if not (1 <= unit <= 247):
+            return err(40002, f"设备[{eid}] 从站号须在 1~247")
+        for item in ep.get("polls") or []:
+            if not isinstance(item, dict) or not str(item.get("target", "")).strip():
+                return err(40002, f"设备[{eid}] 采集项必须指定目标通道")
+            if int(item.get("func") or 3) not in FUNCS:
+                return err(40002, f"设备[{eid}] 采集项功能码非法")
+            if (item.get("type") or "u16") not in REG_TYPES:
+                return err(40002, f"设备[{eid}] 采集项数据类型非法")
+            try:
+                int(item.get("addr") or 0)
+                int(item.get("count") or 1)
+                float(item.get("scale") if item.get("scale") is not None else 1)
+                float(item.get("offset") or 0)
+            except (TypeError, ValueError):
+                return err(40002, f"设备[{eid}] 采集项地址/数量/系数必须为数值")
+    store.set_json("gateways", gateways)
+    if services.gateway:
+        services.gateway.reload()
+    database.insert_control_log("config.gateway", "success",
+                                f"保存外部设备接入 {len(gateways)} 台",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"gateways": gateways})
+
+
+@router.get("/water/gateway/test")
+def gateway_test(id: str = Query(..., description="外部设备 id"),
+                 _: dict = Depends(auth.require_perm("cfg_system"))):
+    """现场「试读一次」：立即按当前配置读一台设备，返回读数或失败原因。"""
+    if not services.gateway:
+        return err(40003, "适配器未启动")
+    ep = next((e for e in services.gateway.endpoints() if e.get("id") == id), None)
+    if not ep:
+        return err(40004, f"外部设备不存在: {id}")
+    try:
+        return ok({"values": services.gateway.read_endpoint(ep)})
+    except Exception as exc:  # noqa: BLE001
+        return err(40003, f"读取失败: {exc}")
+
+
+@router.get("/water/gateway/coil")
+def gateway_coil(id: str = Query(...), addr: int = Query(..., ge=0),
+                 state: str = Query(..., pattern="^(on|off)$"),
+                 user: dict = Depends(auth.require_perm("ctrl_light"))):
+    """写线圈（485 继电器板）：可直接作为控制卡片的开/关指令 URL 使用。"""
+    if not services.gateway:
+        return err(40003, "适配器未启动")
+    try:
+        result = services.gateway.write_coil(id, addr, state == "on")
+    except Exception as exc:  # noqa: BLE001
+        database.insert_control_log("device.gateway", "failed", f"外部设备线圈写入失败: {exc}",
+                                    operator=user.get("username") or None, source="manual")
+        return err(40003, f"写入失败: {exc}")
+    database.insert_control_log("device.gateway", "success",
+                                f"外部设备[{id}] 线圈 {addr} → {state.upper()}",
+                                operator=user.get("username") or None, source="manual")
+    return ok(result)
+
+
+# ---------- 数据导出（CSV：赛题报表与 U 盘提交用） ----------
+# 每类数据用各自的读取权限；文件带 UTF-8 BOM，Excel 双击不乱码。
+_EXPORT_PERM = {"sensors": "view_history", "custom": "view_history",
+                "alarms": "view_alarm", "logs": "view_log"}
+_EXPORT_HEADERS = {
+    "sensors": ["时间", "瞬时流量(L/min)", "累计水量(L)", "定量目标(L)", "水泵状态",
+                "储水槽水温(℃)", "加热槽水温(℃)", "水压(kPa)", "加热状态", "光照(lx)"],
+    "alarms": ["时间", "类型", "数值", "阈值", "方向", "消息", "状态"],
+    "logs": ["时间", "动作", "结果", "详情", "操作人", "来源"],
+    "custom": ["时间", "数值"],
+}
+_EXPORT_FIELDS = {
+    "sensors": ["ts", "flow_rate", "total_flow", "pump_target", "pump_state",
+                "storage_temp", "heater_temp", "pressure", "heater_state", "light"],
+    "alarms": ["ts", "type", "value", "threshold", "direction", "message", "status"],
+    "logs": ["ts", "action", "result", "detail", "operator", "source"],
+    "custom": ["ts", "value"],
+}
+
+
+@router.get("/water/export.csv")
+def export_csv(
+    kind: str = Query(default="sensors", pattern="^(sensors|alarms|logs|custom)$"),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    channel_id: str | None = Query(default=None),
+    category: str | None = Query(default=None, pattern="^(device|config|account)$"),
+    limit: int = Query(default=200000, ge=1, le=200000,
+                       description="导出条数上限；超限时保留最新的数据（1Hz 下 20 万条约 55 小时）"),
+    user: dict = Depends(auth.get_current_user),
+):
+    """导出 CSV。kind=sensors(传感数据)/alarms(告警)/logs(操作日志)/custom(自定义通道)。
+
+    时间范围缺省为最近 24 小时；custom 必须给 channel_id。
+    """
+    need = _EXPORT_PERM[kind]
+    if need not in (user.get("perms") or []):
+        return err(40301, f"缺少权限: {need}")
+    if kind == "custom" and not channel_id:
+        return err(40002, "导出自定义通道数据必须指定 channel_id")
+    if not end:
+        end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not start:
+        start = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _validate_range(start, end)
+    except ValueError as exc:
+        return err(40002, str(exc))
+
+    if kind == "sensors":
+        rows = database.query_water_history(start, end, limit)
+    elif kind == "custom":
+        rows = database.query_custom_history(channel_id, start, end, limit)
+    elif kind == "alarms":
+        rows, _total = database.query_alarms(start, end, None, None, 1, limit)
+    else:
+        rows, _total = database.query_control_log(start, end, 1, limit, category)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_EXPORT_HEADERS[kind])
+    for row in rows:
+        writer.writerow(["" if row.get(f) is None else row.get(f) for f in _EXPORT_FIELDS[kind]])
+    body = "\ufeff" + buf.getvalue()          # BOM：Excel 识别 UTF-8
+    name = f"water_{kind}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # 告知前端实际导出条数与区间总条数（超限时保留的是最新数据，前端据此提示）
+    total = database.count_water_history(start, end) if kind == "sensors" else len(rows)
+    return Response(content=body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"',
+                             "Cache-Control": "no-store",
+                             "X-Exported-Rows": str(len(rows)),
+                             "X-Total-Rows": str(total),
+                             "Access-Control-Expose-Headers": "X-Exported-Rows, X-Total-Rows"})
 
 
 @router.get("/water/alarms")
@@ -642,6 +1028,44 @@ def judge_enable(body: dict, _: dict = Depends(auth.require_perm("cfg_system")))
     return ok({"enabled": bool(store.judge_enabled())})
 
 
+@router.get("/water/judge/template")
+def judge_template_get(_: dict = Depends(auth.require_perm("view_device"))):
+    """读取判定服务地址与报文模板（现场按组委会规范填，免改代码）。"""
+    return ok({"url": judge_service.judge_url(), "template": judge_service.load_template(),
+               "default_url": config.JUDGE_URL, "device_id": config.JUDGE_DEVICE_ID})
+
+
+@router.post("/water/judge/template")
+def judge_template_set(body: dict, user: dict = Depends(auth.require_perm("cfg_system"))):
+    """保存判定服务地址与报文模板：url / headers / report / poll / feedback。"""
+    url = str(body.get("url", "") or "").strip()
+    tpl = body.get("template") or {}
+    if url and not url.startswith(("http://", "https://")):
+        return err(40002, "判定服务地址需以 http:// 或 https:// 开头")
+    if not isinstance(tpl, dict):
+        return err(40002, "template 必须为对象")
+    if tpl.get("headers") is not None and not isinstance(tpl["headers"], dict):
+        return err(40002, "headers 必须为对象")
+    for kind in ("report", "poll", "feedback"):
+        section = tpl.get(kind)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            return err(40002, f"{kind} 段必须为对象")
+        path = str(section.get("path", "") or "")
+        if path and not path.startswith("/"):
+            return err(40002, f"{kind}.path 需以 / 开头（如 /api/report）")
+        body_tpl = section.get("body")
+        if body_tpl is not None and not isinstance(body_tpl, (dict, list)):
+            return err(40002, f"{kind}.body 必须为对象或数组")
+    store.set("judge_url", url)
+    store.set_json("judge_template", tpl)
+    database.insert_control_log("config.judge", "success",
+                                f"保存判定服务模板（{'启用模板' if tpl else '清空模板'}）",
+                                operator=user.get("username") or None, source="manual")
+    return ok({"url": judge_service.judge_url(), "template": judge_service.load_template()})
+
+
 # ---------- 系统状态 ----------
 @router.get("/water/system")
 def system_status(_: dict = Depends(auth.require_perm("view_device"))):
@@ -680,6 +1104,8 @@ def _reload_card_consumers() -> None:
         services.custom.reload()
     if services.alarm:
         services.alarm.reload_links()
+    if services.pid_loops:
+        services.pid_loops.reload()      # 闭环回路也由卡片派生（增删/改配置后重新加载）
 
 
 @router.get("/water/dashboard/layout")

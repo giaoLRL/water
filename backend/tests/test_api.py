@@ -88,6 +88,16 @@ def now_fmt(offset_minutes: int = 0) -> str:
     return (datetime.now() + timedelta(minutes=offset_minutes)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def request_text(path: str, token: str | None = None) -> tuple[str, str, dict]:
+    """取原始响应体（CSV 导出验证用），返回 (文本, Content-Type, 响应头)。"""
+    headers = {}
+    if token or TOKEN:
+        headers["Authorization"] = "Bearer " + (token or TOKEN)
+    req = urllib.request.Request(BASE + path, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read().decode("utf-8"), resp.headers.get("Content-Type", ""), dict(resp.headers)
+
+
 def main() -> None:
     global TOKEN
     print("== 0. 账号与权限 ==")
@@ -320,7 +330,7 @@ def main() -> None:
     items = r["data"]["items"]
     check("日志含 operator 字段", all("operator" in it for it in items), str(items[:1]))
     check("日志含 source 字段", all("source" in it for it in items), str(items[:1]))
-    check("source 取值合法", all(it["source"] in ("manual", "auto", "judge") for it in items),
+    check("source 取值合法", all(it["source"] in ("manual", "auto", "judge", "timer") for it in items),
           str(sorted({it["source"] for it in items})))
     admin_ops = [it for it in items if it.get("operator") == "admin"]
     check("本次测试的人工操作已记录操作账号 admin", len(admin_ops) > 0,
@@ -405,13 +415,16 @@ def main() -> None:
     # 指令/数据 URL 全部指向本机只读接口，绝不触发真实水泵
     RO = f"{BASE}/api/water/realtime?token={TOKEN}"
     test_layout = {"version": 1, "widgets": [
-        {"id": "e2e-custom", "type": "value", "title": "E2E自定义卡", "unit": "L/min",
-         "decimals": 2, "source": {"kind": "custom", "url": RO, "path": "data.flow_rate", "period": 2},
+        {"id": "e2e-custom", "type": "value", "title": "E2E自定义卡", "unit": "s",
+         "decimals": 2, "source": {"kind": "custom", "url": RO, "path": "data.period", "period": 2},
          "grid": {"x": 0, "y": 0, "w": 3, "h": 2}},
         {"id": "e2e-ctl", "type": "control", "title": "E2E控制卡",
          "cmd": {"on": RO, "off": RO},
          "source": {"kind": "realtime", "path": "pump_state"},
          "grid": {"x": 3, "y": 0, "w": 3, "h": 2}},
+        {"id": "e2e-tank", "type": "tank", "title": "E2E水槽", "unit": "%", "decimals": 1,
+         "source": {"kind": "realtime", "path": "tank.tanks.heater"},
+         "grid": {"x": 6, "y": 0, "w": 3, "h": 2}},
         {"id": "e2e-flow", "type": "value", "title": "E2E流量卡", "unit": "L/min", "decimals": 2,
          "source": {"kind": "realtime", "path": "flow_rate"},
          "grid": {"x": 6, "y": 0, "w": 3, "h": 2}},
@@ -490,6 +503,13 @@ def main() -> None:
     check("realtime 快照含卡片派生的自定义通道",
           any(c.get("id") == "e2e-custom" for c in chans), str(chans))
     check("自定义通道已轮询到读数", vals.get("e2e-custom") is not None, str(vals))
+    # 本机快照卡（非标准列路径）也会自动派生通道：卡片即指标
+    check("本机快照卡自动派生为通道（card:<卡片id>）",
+          any(c.get("id") == "card:e2e-tank" for c in chans), str(chans))
+    check("派生通道已取样入库", vals.get("card:e2e-tank") is not None, str(vals))
+    qs = urllib.parse.urlencode({"channel_id": "card:e2e-tank", "start": now_fmt(-5), "end": now_fmt(5)})
+    r = request("GET", f"/api/water/custom/history?{qs}")
+    check("派生通道历史可查询", r["code"] == 0 and isinstance(r["data"]["points"], list), str(r)[:140])
     qs = urllib.parse.urlencode({"channel_id": "e2e-custom", "start": now_fmt(-5), "end": now_fmt(5)})
     r = request("GET", f"/api/water/custom/history?{qs}")
     check("自定义通道历史可查询", r["code"] == 0 and isinstance(r["data"]["points"], list), str(r))
@@ -510,6 +530,267 @@ def main() -> None:
         request("POST", "/api/water/dashboard/layout/reset")
     r = request("GET", "/api/water/dashboard/layout")
     check("联动测试布局已还原", r["code"] == 0 and r["data"]["layout"] == layout_before_links, str(r))
+
+    print("== 9.5 新增能力（导出/定时/标定/外部设备/判定模板/回放/持续判定） ==")
+    request("POST", "/api/water/judge/enable", {"enabled": 0})
+    layout_before_new = request("GET", "/api/water/dashboard/layout")["data"]["layout"]
+    RO2 = f"{BASE}/api/water/realtime?token={TOKEN}"
+    new_layout = {"version": 1, "widgets": [
+        {"id": "e2e-cap", "type": "value", "title": "E2E持续源", "unit": "s", "decimals": 1,
+         "source": {"kind": "custom", "url": RO2, "path": "data.period", "period": 2},
+         "grid": {"x": 0, "y": 0, "w": 3, "h": 2}},
+        {"id": "e2e-ctl2", "type": "control", "title": "E2E定时动作",
+         "cmd": {"on": RO2, "off": RO2},
+         "source": {"kind": "realtime", "path": "pump_state"},
+         "grid": {"x": 3, "y": 0, "w": 3, "h": 2}}]}
+    request("POST", "/api/water/dashboard/layout", {"layout": new_layout})
+
+    # ---- CSV 导出 ----
+    text, ctype, exp_head = request_text("/api/water/export.csv?kind=sensors")
+    check("传感数据 CSV 导出（UTF-8 BOM + 中文表头）",
+          text.startswith("\ufeff") and "瞬时流量" in text.splitlines()[0], ctype)
+    check("CSV 导出响应头带条数信息（X-Exported-Rows / X-Total-Rows）",
+          "x-exported-rows" in exp_head and "x-total-rows" in exp_head, str(list(exp_head)[:8]))
+    text, _, _ = request_text("/api/water/export.csv?kind=logs&category=config")
+    check("操作日志 CSV 导出", text.startswith("\ufeff") and "操作人" in text.splitlines()[0])
+    text, _, _ = request_text("/api/water/export.csv?kind=alarms")
+    check("告警 CSV 导出", text.startswith("\ufeff") and "阈值" in text.splitlines()[0])
+    r = request("GET", "/api/water/export.csv?kind=custom")
+    check("自定义通道导出缺 channel_id 被拒 40002", r["code"] == 40002, str(r))
+    r = request("GET", "/api/water/export.csv?kind=nope")
+    check("非法导出类型被拒 40002", r["code"] == 40002, str(r))
+
+    # ---- 定时任务 ----
+    r = request("POST", "/api/water/timers", {"timers": [
+        {"id": "t1", "name": "E2E定时", "enabled": True, "mode": "interval", "every_sec": 5,
+         "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}]}]})
+    check("保存定时任务成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/timers")
+    check("定时任务回读含下次执行时间",
+          r["code"] == 0 and bool(r["data"]["timers"][0].get("next_run")), str(r))
+    for bad, name in (
+        ({"id": "b1", "mode": "interval", "every_sec": 1,
+          "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}]}, "间隔 <5s"),
+        ({"id": "b2", "mode": "daily", "at": "25:00",
+          "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}]}, "时刻越界"),
+        ({"id": "b3", "mode": "daily", "at": "08:00", "actions": []}, "空动作列表"),
+    ):
+        r = request("POST", "/api/water/timers", {"timers": [bad]})
+        check(f"非法定时任务被拒 40002（{name}）", r["code"] == 40002, str(r))
+    time.sleep(12)   # 等 5 秒间隔的任务至少执行一次（设备离线时采集循环会因超时变慢）
+    items = request("GET", "/api/water/logs?page=1&page_size=20")["data"]["items"]
+    check("定时任务到点执行并写日志（timer_*）",
+          any(str(i["action"]).startswith("timer_") for i in items),
+          str([i["action"] for i in items][:8]))
+
+    # ---- 通道标定 ----
+    r = request("POST", "/api/water/calibration/two_point",
+                {"raw1": 100, "eng1": 10, "raw2": 200, "eng2": 25})
+    check("两点标定计算正确（scale=0.15 offset=-5）",
+          r["code"] == 0 and abs(r["data"]["scale"] - 0.15) < 1e-9 and abs(r["data"]["offset"] + 5) < 1e-9, str(r))
+    r = request("POST", "/api/water/calibration",
+                {"calibration": {"pressure": {"scale": 2, "offset": 1, "unit": "kPa"}}})
+    check("保存通道标定成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/calibration")
+    check("标定回读一致",
+          abs((r["data"]["calibration"].get("pressure") or {}).get("scale", 0) - 2) < 1e-9, str(r))
+    r = request("POST", "/api/water/calibration",
+                {"calibration": {"pressure": {"scale": "abc"}}})
+    check("非法标定系数被拒 40002", r["code"] == 40002, str(r))
+
+    # ---- 外部设备接入（Modbus/串口） ----
+    r = request("POST", "/api/water/gateway", {"gateways": [
+        {"id": "g1", "name": "E2E流量计", "mode": "rtu_tcp", "host": "127.0.0.1", "port": 15021,
+         "unit": 1, "period": 2, "enabled": True,
+         "polls": [{"key": "f", "func": 3, "addr": 0, "count": 1, "type": "u16",
+                    "scale": 0.1, "offset": 0, "target": "custom:e2e-gw"}]}]})
+    check("保存外部设备配置成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/gateway")
+    check("外部设备回读一致", r["code"] == 0 and r["data"]["gateways"][0]["mode"] == "rtu_tcp", str(r))
+    r = request("GET", "/api/water/gateway/test?id=g1")
+    check("试读接口可用（无真实从站时返回失败原因）",
+          r["code"] in (0, 40003, 40004), str(r)[:120])
+    for bad, name in (
+        ({"id": "b1", "mode": "tcp", "host": "", "port": 502}, "缺 IP"),
+        ({"id": "b2", "mode": "tcp", "host": "127.0.0.1", "port": 502, "unit": 999}, "从站号越界"),
+        ({"id": "b3", "mode": "nope", "host": "127.0.0.1", "port": 502}, "模式非法"),
+    ):
+        r = request("POST", "/api/water/gateway", {"gateways": [bad]})
+        check(f"非法外部设备被拒 40002（{name}）", r["code"] == 40002, str(r))
+
+    # ---- 判定服务报文模板 ----
+    r = request("POST", "/api/water/judge/template", {
+        "url": "http://127.0.0.1:9100",
+        "template": {"report": {"path": "/api/report",
+                                "body": {"dev": "{{device_id}}", "t": "{{flow_rate}}"}}}})
+    check("保存判定服务地址与模板成功", r["code"] == 0, str(r))
+    r = request("GET", "/api/water/judge/template")
+    check("判定模板回读一致",
+          str(r["data"]["url"]).endswith(":9100") and r["data"]["template"]["report"]["path"] == "/api/report", str(r))
+    r = request("POST", "/api/water/judge/template", {"url": "ftp://x", "template": {}})
+    check("非法判定地址被拒 40002", r["code"] == 40002, str(r))
+    r = request("POST", "/api/water/judge/template", {"url": "http://127.0.0.1:9100",
+                                                     "template": {"report": {"path": "no-slash"}}})
+    check("模板路径缺前导斜杠被拒 40002", r["code"] == 40002, str(r))
+
+    # ---- 历史回放 ----
+    r = request("GET", "/api/water/replay?ts=" + urllib.parse.quote(now_fmt(-1)))
+    check("回放按时间点取快照", r["code"] == 0 and "sensor" in r["data"], str(r)[:120])
+    r = request("GET", "/api/water/replay?ts=bad-time")
+    check("非法回放时间被拒 40002", r["code"] == 40002, str(r))
+    r = request("GET", "/api/water/replay/frames?start=" + urllib.parse.quote(now_fmt(-30))
+                + "&end=" + urllib.parse.quote(now_fmt(0)) + "&limit=20")
+    check("回放帧序列可用", r["code"] == 0 and 2 <= len(r["data"]["frames"]) <= 20, str(r)[:120])
+
+    # ---- 组合条件 + 持续判定（真实触发） ----
+    r = request("POST", "/api/water/alarm/links", {"links": [
+        {"id": "hold1", "name": "E2E组合条件", "enabled": True, "source_card": "e2e-cap",
+         "source": {"kind": "custom", "url": RO2, "path": "data.period", "period": 2},
+         "threshold": 0.5, "direction": "above", "hold": 3,
+         "extra": [{"card": "e2e-cap", "source": {"kind": "custom", "url": RO2,
+                                                  "path": "data.period", "period": 2},
+                    "direction": "above", "threshold": 0}],
+         "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}],
+         "recover": {"actions": []}}]})
+    check("组合条件+持续判定规则可保存", r["code"] == 0, str(r))
+    for bad, name in (
+        ({"id": "h1", "source_card": "e2e-cap", "source": {"kind": "custom", "url": RO2, "path": "data.period"},
+          "threshold": 1, "direction": "above", "hold": -1,
+          "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}]}, "负持续秒数"),
+        ({"id": "h2", "source_card": "e2e-cap", "source": {"kind": "custom", "url": RO2, "path": "data.period"},
+          "threshold": 1, "direction": "above",
+          "extra": [{"card": "", "source": {"kind": "realtime", "path": "pressure"},
+                     "direction": "above", "threshold": 1}],
+          "actions": [{"card": "e2e-ctl2", "state": "off", "kind": "url", "url": RO2}]}, "附加条件缺卡片"),
+    ):
+        r = request("POST", "/api/water/alarm/links", {"links": [bad]})
+        check(f"非法组合规则被拒 40002（{name}）", r["code"] == 40002, str(r))
+    time.sleep(5)    # 等自定义通道首次轮询，随后计时 hold=3 秒
+    time.sleep(5)
+    items = request("GET", "/api/water/logs?page=1&page_size=20")["data"]["items"]
+    check("读数为真时按 hold 触发一次动作",
+          any(i["action"] == "link_card_off" for i in items), str([i["action"] for i in items][:8]))
+
+    # ---- 还原 ----
+    request("POST", "/api/water/alarm/links", {"links": []})
+    request("POST", "/api/water/timers", {"timers": []})
+    request("POST", "/api/water/calibration", {"calibration": {}})
+    request("POST", "/api/water/gateway", {"gateways": []})
+    request("POST", "/api/water/judge/template", {"url": "", "template": {}})
+    if layout_before_new:
+        request("POST", "/api/water/dashboard/layout", {"layout": layout_before_new})
+    else:
+        request("POST", "/api/water/dashboard/layout/reset")
+    check("新增能力测试后已还原",
+          request("GET", "/api/water/timers")["data"]["timers"] == []
+          and request("GET", "/api/water/gateway")["data"]["gateways"] == [])
+
+    print("== 9.6 历史数据修正（取样方向 / 降采样 / 统计口径） ==")
+    s24 = now_fmt(-24 * 60)
+    e0 = now_fmt(0)
+    q24 = "start=" + urllib.parse.quote(s24) + "&end=" + urllib.parse.quote(e0)
+    r = request("GET", f"/api/water/history?{q24}&limit=1500")
+    pts = r["data"]["points"]
+    check("历史曲线覆盖到最新数据（末点接近当前时间）",
+          bool(pts) and pts[-1]["ts"] >= now_fmt(-30),
+          f"末点={pts[-1]['ts'] if pts else '-'} 当前={e0}")
+    check("历史接口返回取样元信息 raw_count / sampled",
+          "raw_count" in r["data"] and "sampled" in r["data"], str(list(r["data"].keys())))
+    check("长区间自动等距降采样且点数受控",
+          r["data"]["sampled"] is True and 0 < len(pts) <= 1500,
+          f"点数={len(pts)} raw={r['data']['raw_count']}")
+    # 降采样保真：小点数取样与全量取样的首尾必须一致（说明覆盖了整个区间，没有丢最新数据）
+    q6 = "start=" + urllib.parse.quote(now_fmt(-6 * 60)) + "&end=" + urllib.parse.quote(e0)
+    full_pts = request("GET", f"/api/water/history?{q6}&limit=50000")["data"]["points"]
+    samp_pts = request("GET", f"/api/water/history?{q6}&limit=100")["data"]["points"]
+    check("降采样保留首尾（覆盖整个区间）",
+          bool(full_pts) and bool(samp_pts)
+          and samp_pts[0]["ts"] == full_pts[0]["ts"] and samp_pts[-1]["ts"] == full_pts[-1]["ts"],
+          f"full={full_pts[0]['ts'] if full_pts else '-'}..{full_pts[-1]['ts'] if full_pts else '-'} / "
+          f"samp={samp_pts[0]['ts'] if samp_pts else '-'}..{samp_pts[-1]['ts'] if samp_pts else '-'}")
+
+    r = request("GET", f"/api/water/replay/frames?{q24}&limit=60")
+    fr = r["data"]["frames"]
+    check("回放帧覆盖到区间末尾（含最新帧）",
+          bool(fr) and fr[-1]["ts"] >= now_fmt(-30), f"末帧={fr[-1]['ts'] if fr else '-'}")
+    check("回放返回降采样元信息",
+          r["data"]["sampled"] is True and r["data"]["raw_count"] >= len(fr), str(r["data"]["raw_count"]))
+
+    st = request("GET", f"/api/water/stats?{q24}")["data"]
+    check("统计区分总行数与有效读数点",
+          st["samples"] >= st["valid_samples"]["flow"] > 0,
+          f"samples={st['samples']} valid={st['valid_samples']['flow']}")
+    check("统计含时间加权平均流量字段", "avg_flow_weighted" in st, str(list(st.keys())[:10]))
+
+    print("== 9.7 恒温闭环多路回路（卡片即来源） ==")
+    layout_before_pid = request("GET", "/api/water/dashboard/layout")["data"]["layout"]
+    RO3 = f"{BASE}/api/water/realtime?token={TOKEN}"
+    # 温度源用"自定义接口卡"指向本机只读接口（与现场设备在线与否无关，结果确定）
+    pid_layout = {"version": 1, "widgets": [
+        {"id": "p-sensor", "type": "value", "title": "P温度源", "unit": "℃", "decimals": 1,
+         "source": {"kind": "custom", "url": RO3, "path": "data.period", "period": 2},
+         "grid": {"x": 0, "y": 0, "w": 3, "h": 2}},
+        {"id": "p-guard", "type": "tank", "title": "P液位", "unit": "%", "decimals": 1,
+         "source": {"kind": "realtime", "path": "tank.tanks.heater"}, "grid": {"x": 3, "y": 0, "w": 3, "h": 2}},
+        {"id": "p-act", "type": "control", "title": "P执行器", "cmd": {"on": RO3, "off": RO3},
+         "source": {"kind": "realtime", "path": "pump_state"}, "grid": {"x": 6, "y": 0, "w": 3, "h": 2}},
+        {"id": "p-pid", "type": "builtin", "builtin": "pid", "title": "P闭环",
+         "pid": {"sensor_card": "p-sensor", "actuator_card": "p-act", "guard_card": "p-guard",
+                 "guard_min": 0, "target": 60, "kp": 16, "ki": 0.3, "kd": 25, "enabled": False},
+         "grid": {"x": 0, "y": 2, "w": 4, "h": 4}}]}
+    r = request("POST", "/api/water/dashboard/layout", {"layout": pid_layout})
+    check("闭环测试布局已保存", r["code"] == 0, str(r))
+    time.sleep(4)
+    loops = request("GET", "/api/water/pid/loops")["data"]["loops"]
+    loop = next((l for l in loops if l["id"] == "p-pid"), {})
+    check("闭环卡派生为独立回路（含来源卡与执行器卡名称）",
+          loop.get("sensor_title") == "P温度源" and loop.get("actuator_title") == "P执行器",
+          json.dumps(loop, ensure_ascii=False)[:200])
+    check("回路初始为关闭（卡片配置 enabled=false）", loop.get("enabled") is False, str(loop.get("enabled")))
+    r = request("POST", "/api/water/pid/loops", {"id": "p-pid", "target": 55, "kp": 20, "enabled": True})
+    check("更新回路参数成功", r["code"] == 0 and float(r["data"]["loop"].get("target")) == 55, str(r)[:160])
+    pid_card = next((w for w in request("GET", "/api/water/dashboard/layout")["data"]["layout"]["widgets"]
+                     if w["id"] == "p-pid"), {})
+    check("参数写回卡片配置（卡片即来源）",
+          float((pid_card.get("pid") or {}).get("target")) == 55
+          and float((pid_card.get("pid") or {}).get("kp")) == 20, json.dumps(pid_card.get("pid"), ensure_ascii=False)[:160])
+    for bad, name in (
+        ({"target": 10}, "缺回路 id"),
+        ({"id": "no-such", "target": 10}, "回路不存在"),
+        ({"id": "p-pid", "target": 999}, "目标温度越界"),
+        ({"id": "p-pid", "kp": "abc"}, "Kp 非数值"),
+    ):
+        r = request("POST", "/api/water/pid/loops", bad)
+        expect = 40004 if name == "回路不存在" else 40002
+        check(f"非法闭环更新被拒 {expect}（{name}）", r["code"] == expect, str(r))
+    # 防干烧联锁：把条件卡阈值调高 → 应强制断开加热并给出原因
+    pid_layout["widgets"][3]["pid"]["guard_min"] = 100
+    pid_layout["widgets"][3]["pid"]["target"] = 60
+    pid_layout["widgets"][3]["pid"]["enabled"] = True
+    request("POST", "/api/water/dashboard/layout", {"layout": pid_layout})
+    time.sleep(4)
+    loop2 = next((l for l in request("GET", "/api/water/pid/loops")["data"]["loops"] if l["id"] == "p-pid"), {})
+    check("防干烧联锁生效（条件不满足时强制断开并说明原因）",
+          loop2.get("guard_ok") is False and "前置条件" in str(loop2.get("error")), json.dumps(loop2, ensure_ascii=False)[:200])
+    # 放开联锁 → 实测(1.0)低于目标(60) → 应下发开启指令并写 pid_actuator_on 日志
+    pid_layout["widgets"][3]["pid"]["guard_min"] = 0
+    request("POST", "/api/water/dashboard/layout", {"layout": pid_layout})
+    time.sleep(4)
+    loop3 = next((l for l in request("GET", "/api/water/pid/loops")["data"]["loops"] if l["id"] == "p-pid"), {})
+    check("联锁满足时按 PID 下发（执行器=自定义指令）",
+          loop3.get("action") == "on" and loop3.get("guard_ok") is True, json.dumps(loop3, ensure_ascii=False)[:200])
+    items = request("GET", "/api/water/logs?page=1&page_size=20")["data"]["items"]
+    check("闭环动作写入操作日志（pid_actuator_*，来源=auto）",
+          any(i["action"].startswith("pid_actuator_") and i["source"] == "auto" for i in items),
+          str([i["action"] for i in items][:8]))
+    # 关闭回路，避免测试结束后继续下发
+    request("POST", "/api/water/pid/loops", {"id": "p-pid", "enabled": False})
+    if layout_before_pid:
+        request("POST", "/api/water/dashboard/layout", {"layout": layout_before_pid})
+    else:
+        request("POST", "/api/water/dashboard/layout/reset")
+    check("闭环测试布局已还原",
+          all(w["id"] != "p-pid" for w in (request("GET", "/api/water/dashboard/layout")["data"]["layout"] or {"widgets": []})["widgets"]))
 
     print("== 10. 账号清理 ==")
     me = request("GET", "/api/auth/users")

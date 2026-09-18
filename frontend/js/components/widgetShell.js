@@ -18,6 +18,7 @@ window.WidgetShell = {
     thresholds: { type: Object, default: () => ({}) },
     editing: { type: Boolean, default: false },
     online: { type: Boolean, default: false },
+    widgets: { type: Array, default: () => [] },   // 全部卡片（场景卡批量下发用）
   },
   emits: ["remove", "config"],
   data() {
@@ -25,7 +26,9 @@ window.WidgetShell = {
       customJson: null, customErr: "", series: [], busy: false,
       // ---- 内置操作卡状态 ----
       targetInput: 0, targetBusy: false, resetBusy: false,
+      sceneBusy: false, sceneMsg: "",
       pid: { target_temp: 42, pid_enabled: false, kp: 16, ki: 0.3, kd: 25 }, pidBusy: false,
+      pidLoop: null,
       recentLogs: [],
     };
   },
@@ -134,6 +137,29 @@ window.WidgetShell = {
       if (!f.heater) names.push("加热模块");
       return names;
     },
+    // ---- 系统拓扑卡：节点状态全部来自实时快照（无数据一律显示 --） ----
+    topo() {
+      const rt = this.realtime || {};
+      const tanks = (rt.tank && rt.tank.tanks) || {};
+      const num = (v) => (v === null || v === undefined || v === "" || isNaN(Number(v)) ? null : Number(v));
+      const flow = num(rt.flow_rate);
+      return {
+        pump: rt.pump_state === "on",
+        heater: rt.heater_state === "on",
+        flow,
+        flowing: flow !== null && flow > 0.05,
+        pressure: num(rt.pressure),
+        sTemp: num(rt.storage_temp),
+        hTemp: num(rt.heater_temp),
+        sLevel: num((tanks.storage || {}).percent),
+        hLevel: num((tanks.heater || {}).percent),
+        sNone: (tanks.storage || {}).source === "none",
+      };
+    },
+    // ---- 一键场景卡：可批量关闭的控制卡（配了自定义指令 URL 的） ----
+    sceneTargets() {
+      return (this.widgets || []).filter((c) => c && c.type === "control" && c.cmd && (c.cmd.on || c.cmd.off));
+    },
   },
   watch: {
     /* realtime 每 2s 整体刷新：每次到达都推一个趋势点（值不变也推，保证曲线连续）；
@@ -149,20 +175,50 @@ window.WidgetShell = {
   beforeUnmount() {
     if (this._timer) clearInterval(this._timer);
     if (this._recentT) clearInterval(this._recentT);
+    if (this._pidT) clearInterval(this._pidT);
   },
   methods: {
     perm(p) { return window.Auth ? window.Auth.has(p) : false; },
+    /* 拓扑卡格式化：无数据一律 --，不做任何模拟 */
+    fmt(v, d) {
+      return (v === null || v === undefined || v === "" || isNaN(Number(v)))
+        ? "--" : Number(v).toFixed(d || 0);
+    },
+    pct(v) {
+      return (v === null || v === undefined || v === "" || isNaN(Number(v)))
+        ? "--" : Number(v).toFixed(1) + "%";
+    },
     /* 内置操作卡数据拉取：pid 参数一次拉取；最近操作 10s 轮询 */
     initOps() {
       const b = this.w.builtin;
-      if (b === "pid" && this.perm("cfg_alarm")) {
-        API.pidGet().then((d) => Object.assign(this.pid, d)).catch(() => { /* silent */ });
+      if (b === "pid") {
+        // 一张闭环卡 = 一路独立回路：状态从 /water/pid/loops 按卡片 id 取
+        this.fetchPidLoop();
+        this._pidT = setInterval(() => this.fetchPidLoop(), 3000);
       }
       if (b === "recent" && this.perm("view_log")) {
         this.fetchRecent();
         this._recentT = setInterval(() => this.fetchRecent(), 10000);
       }
       if (b === "quant") this.syncTargetInput();
+    },
+    /* 读取本卡的闭环回路状态（未派生时退回旧接口，兼容未保存布局的场景） */
+    async fetchPidLoop() {
+      try {
+        const d = await API.pidLoops();
+        const loop = (d.loops || []).find((l) => l.id === this.w.id);
+        this.pidLoop = loop || null;
+        if (loop) {
+          if (loop.enabled !== null && loop.enabled !== undefined) this.pid.pid_enabled = !!loop.enabled;
+          if (loop.target !== null && loop.target !== undefined) this.pid.target_temp = loop.target;
+          if (loop.kp !== null && loop.kp !== undefined) this.pid.kp = loop.kp;
+          if (loop.ki !== null && loop.ki !== undefined) this.pid.ki = loop.ki;
+          if (loop.kd !== null && loop.kd !== undefined) this.pid.kd = loop.kd;
+          return;
+        }
+        const legacy = await API.pidGet();
+        Object.assign(this.pid, legacy);
+      } catch (e) { /* silent */ }
     },
     /* 定量输入框只在用户未聚焦时同步，避免覆盖正在输入的内容 */
     syncTargetInput() {
@@ -266,11 +322,51 @@ window.WidgetShell = {
       } catch (e) { alert(e.message); }
       finally { this.targetBusy = false; }
     },
+    /* ---------- 一键场景卡：启动循环 / 急停（一次调用多个动作） ---------- */
+    async sceneStart() {
+      if (!this.canCtl) { alert("无控制权限（需「设备控制」权限）"); return; }
+      if (!this.online) { alert("设备离线，无法启动循环"); return; }
+      if (!confirm("启动循环：开启本机水泵？请确认水槽有水、管路已接好。")) return;
+      this.sceneBusy = true;
+      try {
+        const d = await API.pump("on");
+        Object.assign(this.realtime, d);
+        this.sceneMsg = "已启动循环（水泵 ON）";
+      } catch (e) { alert(e.message); }
+      finally { this.sceneBusy = false; }
+    },
+    async sceneStop() {
+      if (!this.canCtl) { alert("无控制权限（需「设备控制」权限）"); return; }
+      if (!confirm("急停：关闭水泵、关闭加热、取消定量，并关闭所有自定义执行器？")) return;
+      this.sceneBusy = true;
+      const done = [], failed = [];
+      try {
+        if (this.online) {
+          for (const item of [["水泵", () => API.pump("off")], ["加热", () => API.heater("off")]]) {
+            try { const d = await item[1](); Object.assign(this.realtime, d); done.push(item[0]); }
+            catch (e) { failed.push(item[0]); }
+          }
+          try { await API.pumpTargetSet(0); done.push("取消定量"); }
+          catch (e) { failed.push("取消定量"); }
+        } else {
+          failed.push("本机执行器（设备离线）");
+        }
+        // 布局里所有配了自定义指令的控制卡：逐一执行「关」
+        for (const c of this.sceneTargets) {
+          const url = (c.cmd || {}).off;
+          if (!url) continue;
+          try { await API.dashboardProxy(url, true); done.push(c.title || c.id); }
+          catch (e) { failed.push(c.title || c.id); }
+        }
+        this.sceneMsg = "已急停：" + (done.length ? done.join("、") : "无可执行目标")
+          + (failed.length ? "；未成功：" + failed.join("、") : "");
+      } finally { this.sceneBusy = false; }
+    },
     async togglePid(e) {
       this.pidBusy = true;
       try {
-        const d = await API.pidMode(e.target.checked ? 1 : 0);
-        this.pid.pid_enabled = d.pid_enabled;
+        await API.pidLoopSet({ id: this.w.id, enabled: e.target.checked });
+        await this.fetchPidLoop();
       } catch (err) {
         e.target.checked = this.pid.pid_enabled;
         alert(err.message);
@@ -278,12 +374,12 @@ window.WidgetShell = {
     },
     async savePidTarget() {
       const v = Number(this.pid.target_temp);
-      if (isNaN(v) || v < 0 || v > 90) { alert("请输入 0~90 之间的目标温度(℃)"); return; }
+      if (isNaN(v) || v < 0 || v > 120) { alert("请输入 0~120 之间的目标温度(℃)"); return; }
       this.pidBusy = true;
       try {
-        const d = await API.setTarget(v);
-        this.pid.target_temp = d.target_temp;
-        alert(`目标温度已设为 ${d.target_temp} ℃`);
+        await API.pidLoopSet({ id: this.w.id, target: v });
+        await this.fetchPidLoop();
+        alert(`目标温度已设为 ${v} ℃（仅作用于本张闭环卡）`);
       } catch (e) { alert(e.message); }
       finally { this.pidBusy = false; }
     },
@@ -293,7 +389,11 @@ window.WidgetShell = {
         if (isNaN(v) || v < 0) { alert(`请填写有效的 PID 参数 ${k}`); return; }
       }
       this.pidBusy = true;
-      try { await API.pidSet(p); alert("PID 参数已保存"); }
+      try {
+        await API.pidLoopSet(Object.assign({ id: this.w.id }, p));
+        await this.fetchPidLoop();
+        alert("PID 参数已保存（仅作用于本张闭环卡）");
+      }
       catch (e) { alert(e.message); }
       finally { this.pidBusy = false; }
     },
@@ -317,8 +417,61 @@ window.WidgetShell = {
       <button class="wg-btn danger" @click="$emit('remove', w)" title="删除卡片">✕</button>
     </div>
 
+    <!-- 内置：系统拓扑图卡（节点状态全部绑定实时值，无数据不伪造） -->
+    <template v-if="w.type === 'builtin' && w.builtin === 'topo'">
+      <div class="kpi-label">{{ w.title }}
+        <span class="dot" :class="online ? 'green' : 'red'"></span>
+      </div>
+      <svg class="topo" viewBox="0 0 640 270" preserveAspectRatio="xMidYMid meet">
+        <!-- 管路：有流量时流动动画 -->
+        <path class="topo-pipe" :class="{ flowing: topo.flowing }" d="M150 200 H470" />
+        <path class="topo-pipe" :class="{ flowing: topo.flowing }" d="M540 70 V40 H90 V70" />
+        <!-- 储水槽（无传感器时明确标注） -->
+        <rect class="topo-tank" x="30" y="70" width="120" height="140" rx="8" />
+        <rect class="topo-water" x="33" width="114"
+              :y="207 - (topo.sLevel || 0) * 1.34" :height="(topo.sLevel || 0) * 1.34" />
+        <text class="topo-name" x="90" y="62">储水槽</text>
+        <text class="topo-val" x="90" y="238">{{ topo.sNone ? '无传感器' : pct(topo.sLevel) }}</text>
+        <text class="topo-sub" x="90" y="256">{{ fmt(topo.sTemp, 1) }} ℃</text>
+        <!-- 加热槽 + 加热棒 -->
+        <rect class="topo-tank" x="470" y="70" width="140" height="140" rx="8" />
+        <rect class="topo-water" x="473" width="134"
+              :y="207 - (topo.hLevel || 0) * 1.34" :height="(topo.hLevel || 0) * 1.34" />
+        <line class="topo-heater" :class="{ on: topo.heater }" x1="505" y1="188" x2="575" y2="188" />
+        <text class="topo-name" x="540" y="62">加热槽</text>
+        <text class="topo-val" x="540" y="238">{{ pct(topo.hLevel) }}</text>
+        <text class="topo-sub" x="540" y="256">{{ fmt(topo.hTemp, 1) }} ℃ · 加热{{ topo.heater ? '开' : '关' }}</text>
+        <!-- 泵 / 流量 / 压力 三个节点 -->
+        <circle class="topo-node" :class="{ on: topo.pump }" cx="205" cy="200" r="20" />
+        <text class="topo-node-label" x="205" y="200">泵</text>
+        <text class="topo-val" x="205" y="166">水泵{{ topo.pump ? '开' : '关' }}</text>
+        <rect class="topo-node" :class="{ on: topo.flowing }" x="245" y="180" width="80" height="40" rx="8" />
+        <text class="topo-node-label" x="285" y="200">流量</text>
+        <text class="topo-val" x="285" y="166">{{ fmt(topo.flow, 1) }} L/min</text>
+        <circle class="topo-node" :class="{ on: topo.pressure !== null }" cx="370" cy="200" r="20" />
+        <text class="topo-node-label" x="370" y="200">压</text>
+        <text class="topo-val" x="370" y="166">{{ fmt(topo.pressure, 1) }} kPa</text>
+      </svg>
+    </template>
+
+    <!-- 内置：一键场景卡（启动循环 / 急停全部，均二次确认） -->
+    <template v-else-if="w.type === 'builtin' && w.builtin === 'scene'">
+      <div class="op-card">
+        <div class="op-title">{{ w.title }}</div>
+        <div class="scene-btns">
+          <button class="btn-primary" :disabled="sceneBusy || !online || !canCtl" @click="sceneStart">启动循环</button>
+          <button class="btn-ghost danger" :disabled="sceneBusy || !canCtl" @click="sceneStop">急停全部</button>
+        </div>
+        <div class="op-foot">
+          启动＝开本机水泵；急停＝关水泵 / 关加热 / 取消定量<template v-if="sceneTargets.length">，并依次关闭 {{ sceneTargets.length }} 个自定义执行器</template>。均写操作日志。
+        </div>
+        <div class="kpi-foot" v-if="sceneMsg">{{ sceneMsg }}</div>
+        <div class="kpi-foot kpi-warn" v-if="!canCtl">无控制权限（需「设备控制」权限）</div>
+      </div>
+    </template>
+
     <!-- 内置：采集设备链路卡 -->
-    <template v-if="w.type === 'builtin' && w.builtin === 'device'">
+    <template v-else-if="w.type === 'builtin' && w.builtin === 'device'">
       <div class="kpi-label">{{ w.title }}<span class="dot" :class="online ? 'green' : 'red'"></span></div>
       <div class="kpi-kv"><span>地址</span><b>{{ ipText }}</b></div>
       <div class="kpi-kv"><span>信号</span><b>{{ rssiText }}</b></div>
@@ -375,7 +528,26 @@ window.WidgetShell = {
           <input type="number" v-model.number="pid.kd" min="0" step="0.1" style="width:56px;" title="微分系数 Kd">
           <button class="btn-ghost" :disabled="pidBusy || !online || !perm('cfg_alarm')" @click="savePidParams">存参数</button>
         </div>
-        <div class="op-foot">{{ pid.pid_enabled ? '闭环运行中：按加热槽水温自动开关加热' : '闭环已关闭；开启后按加热槽水温自动开关加热(目标±1℃)' }}</div>
+        <!-- 一路闭环 = 一张卡：显示本卡的来源卡 / 执行器卡 / 实测 / 占空比 / 联锁状态 -->
+        <div class="op-foot" v-if="pidLoop">
+          来源：{{ pidLoop.sensor_title || '未指定' }} → 执行器：{{ pidLoop.actuator_title || '未指定' }}
+          <template v-if="pidLoop.measured !== null && pidLoop.measured !== undefined">
+            · 实测 {{ fmt(pidLoop.measured, 1) }} ℃ · 占空比 {{ fmt(pidLoop.duty, 0) }}%
+          </template>
+        </div>
+        <div class="kpi-foot kpi-warn" v-if="pidLoop && pidLoop.legacy">
+          未指定来源/执行器卡，当前按默认回路运行（加热槽水温 → 本机加热）；在「配置」里可改。
+        </div>
+        <div class="kpi-foot kpi-warn" v-if="pidLoop && pidLoop.guard_card && !pidLoop.guard_ok">
+          防干烧联锁：{{ pidLoop.guard_title || '前置条件卡' }} 未满足，已强制断开加热
+        </div>
+        <div class="op-foot" v-if="!pidLoop">
+          {{ pid.pid_enabled ? '闭环运行中' : '闭环已关闭' }}：按加热槽水温自动开关加热（默认回路）
+        </div>
+        <div class="kpi-foot kpi-warn" v-if="pidLoop && pidLoop.error">{{ pidLoop.error }}</div>
+        <div class="op-foot" v-if="pidLoop && pidLoop.guard_card">
+          联锁：{{ pidLoop.guard_title || '前置条件卡' }} ≥ {{ pidLoop.guard_min ?? '--' }}
+        </div>
         <div class="kpi-foot kpi-warn" v-if="!perm('cfg_alarm')">无配置权限（需「告警阈值」权限）</div>
         <div class="kpi-foot kpi-warn" v-else-if="!online">设备离线，操作不可用</div>
       </div>

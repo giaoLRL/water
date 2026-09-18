@@ -44,6 +44,40 @@ window.API = (() => {
     return s ? "?" + s : "";
   }
 
+  /* 文件下载：带 Authorization 拉取二进制并触发浏览器保存。
+     后端权限不足时仍返回统一 JSON（HTTP 200），这里按 content-type 区分后抛错。 */
+  async function download(path) {
+    const headers = {};
+    if (window.Auth && window.Auth.token) headers["Authorization"] = "Bearer " + window.Auth.token;
+    let resp;
+    try {
+      resp = await fetch(BASE + path, { headers });
+    } catch (e) {
+      throw new Error("导出失败：网络请求错误");
+    }
+    const ctype = resp.headers.get("content-type") || "";
+    if (ctype.indexOf("application/json") !== -1) {
+      const j = await resp.json().catch(() => ({}));
+      throw new Error(j.msg || "导出失败");
+    }
+    const blob = await resp.blob();
+    const cd = resp.headers.get("content-disposition") || "";
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : "export.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    // 后端通过响应头告知实际导出条数与区间总条数（超限时保留最新数据）
+    return {
+      rows: Number(resp.headers.get("x-exported-rows") || 0),
+      total: Number(resp.headers.get("x-total-rows") || 0),
+      filename: a.download,
+    };
+  }
+
   return {
     // 账号
     login: (username, password) => req("POST", "/api/auth/login", { username, password }),
@@ -60,8 +94,10 @@ window.API = (() => {
 
     // 水循环业务
     realtime: () => req("GET", "/api/water/realtime"),
-    history: (start, end) =>
-      req("GET", `/api/water/history?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
+    /* limit = 图上最大点数：区间再长也覆盖到最新数据，超出时后端等距降采样 */
+    history: (start, end, limit) =>
+      req("GET", `/api/water/history?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+        + (limit ? `&limit=${limit}` : "")),
     stats: (start, end) =>
       req("GET", `/api/water/stats?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
     pump: (action) => req("POST", "/api/water/pump", { action }),
@@ -98,8 +134,31 @@ window.API = (() => {
     alarmLinksGet: () => req("GET", "/api/water/alarm/links"),
     alarmLinksSet: (links) => req("POST", "/api/water/alarm/links", { links }),
     // 自定义传感器通道历史/统计（通道由实时监控页的卡片派生）
-    customHistory: (channelId, start, end) => req("GET", "/api/water/custom/history" + qs({ channel_id: channelId, start, end })),
+    customHistory: (channelId, start, end, limit) =>
+      req("GET", "/api/water/custom/history" + qs({ channel_id: channelId, start, end, limit })),
     customStats: (channelId, start, end) => req("GET", "/api/water/custom/stats" + qs({ channel_id: channelId, start, end })),
+    // CSV 导出（报表 / U 盘提交）：kind=sensors|alarms|logs|custom
+    exportCsv: (params) => download("/api/water/export.csv" + qs(params)),
+    // 外部设备接入（Modbus TCP / 串口服务器）
+    gatewayGet: () => req("GET", "/api/water/gateway"),
+    gatewaySet: (gateways) => req("POST", "/api/water/gateway", { gateways }),
+    gatewayTest: (id) => req("GET", "/api/water/gateway/test" + qs({ id })),
+    // 定时任务（简单 cron 式）
+    timersGet: () => req("GET", "/api/water/timers"),
+    timersSet: (timers) => req("POST", "/api/water/timers", { timers }),
+    // 通道标定（scale/offset 与两点标定）
+    calibrationGet: () => req("GET", "/api/water/calibration"),
+    calibrationSet: (calibration) => req("POST", "/api/water/calibration", { calibration }),
+    calibrationTwoPoint: (body) => req("POST", "/api/water/calibration/two_point", body),
+    // 判定服务地址与报文模板
+    judgeTemplateGet: () => req("GET", "/api/water/judge/template"),
+    judgeTemplateSet: (url, template) => req("POST", "/api/water/judge/template", { url, template }),
+    // 恒温闭环回路（一张闭环卡 = 一路独立 PID）
+    pidLoops: () => req("GET", "/api/water/pid/loops"),
+    pidLoopSet: (body) => req("POST", "/api/water/pid/loops", body),
+    // 历史回放（时间轴 + 按时间点取快照）
+    replayAt: (ts) => req("GET", "/api/water/replay" + qs({ ts })),
+    replayFrames: (start, end, limit) => req("GET", "/api/water/replay/frames" + qs({ start, end, limit })),
     // 站点文案（浏览器标题/顶栏标题/副标题；GET 无需登录）
     siteGet: () => req("GET", "/api/water/site"),
     siteSet: (site) => req("POST", "/api/water/site", site),

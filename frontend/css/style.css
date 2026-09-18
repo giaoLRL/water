@@ -1107,6 +1107,26 @@ td { font-variant-numeric: tabular-nums; }
 }
 
 /* --- 响应式：窄屏适配（网格由 gridstack 按宽度自行压缩） --- */
+/* --- 系统拓扑卡：节点状态绑定实时值，管路有流量时流动 --- */
+.topo { width: 100%; height: calc(100% - 20px); min-height: 140px; }
+.topo-pipe { fill: none; stroke: #2a3442; stroke-width: 7; stroke-linecap: round; }
+.topo-pipe.flowing { stroke: #2dd4bf; stroke-dasharray: 12 9; animation: topo-flow 0.9s linear infinite; }
+@keyframes topo-flow { to { stroke-dashoffset: -21; } }
+.topo-tank { fill: rgba(56, 189, 248, 0.05); stroke: #2a3442; stroke-width: 2; }
+.topo-water { fill: rgba(56, 189, 248, 0.32); }
+.topo-node { fill: #1a222d; stroke: #2a3442; stroke-width: 2; }
+.topo-node.on { fill: rgba(45, 212, 191, 0.22); stroke: #2dd4bf; }
+.topo-heater { stroke: #2a3442; stroke-width: 7; stroke-linecap: round; }
+.topo-heater.on { stroke: #f87171; }
+.topo-name { fill: #7d8b99; font-size: 13px; text-anchor: middle; }
+.topo-val { fill: #d7e0ea; font-size: 13px; text-anchor: middle; font-weight: 600; }
+.topo-sub { fill: #7d8b99; font-size: 11px; text-anchor: middle; }
+.topo-node-label { fill: #d7e0ea; font-size: 12px; text-anchor: middle; dominant-baseline: middle; }
+
+/* --- 一键场景卡 --- */
+.scene-btns { display: flex; gap: 8px; margin: 8px 0 6px; }
+.scene-btns .btn-primary, .scene-btns .btn-ghost { flex: 1; }
+
 @media (max-width: 700px) {
   .op-log li { grid-template-columns: 42px minmax(0, 1fr); }
   .op-log .op-what { grid-column: 2; }

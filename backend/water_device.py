@@ -23,12 +23,51 @@ import threading
 import time
 
 import config
+import calibration
 from esp32_client import DeviceError, Esp32Client
 
 
 def _clamp(percent: float) -> float:
     """把液位百分比限制在 0~100。"""
     return max(0.0, min(100.0, float(percent)))
+
+
+def tank_info(tank: str, data: dict) -> dict:
+    """单个水槽的水位信息（API 快照与采集循环共用同一份逻辑）。
+
+    液位来自该水槽的独立液位通道：
+      已接入(DEVICE_FEATURES["level_<tank>"]=True) → 真实读数，source="device"；
+      未接入                                       → 恒为 0，     source="none"（界面标注「无传感器」）。
+    无数据一律按 0 展示，不使用任何模拟值。"估算水量" = 液位% × 该水槽容积，仅作展示参考。
+    """
+    import store  # 局部导入：避免 database/config 循环依赖
+
+    available = bool(config.DEVICE_FEATURES.get(f"level_{tank}"))
+    percent = data.get(f"level_{tank}") if available else None
+    if percent is None:
+        percent = 0.0
+    percent = _clamp(percent)
+    capacity = store.tank_capacity(tank)
+    height = (config.TANK_HEIGHT_CM_STORAGE if tank == "storage"
+              else config.TANK_HEIGHT_CM_HEATER)
+    return {
+        "key": tank,
+        "label": config.TANK_LABELS.get(tank, tank),
+        "percent": round(percent, 2),
+        "source": "device" if available else "none",
+        "capacity": round(capacity, 3),
+        "volume": round(capacity * percent / 100.0, 3),   # 估算水量(L)，非计量值
+        "height_cm": round(height * percent / 100.0, 1),
+    }
+
+
+def tank_snapshot(data: dict) -> dict:
+    """双水槽水位结构（供前端 SVG/水槽卡与卡片路径 tank.tanks.* 使用）。"""
+    tanks = {tank: tank_info(tank, data) for tank in config.TANKS}
+    return {
+        "tanks": tanks,
+        "any_unavailable": any(t["source"] != "device" for t in tanks.values()),
+    }
 
 
 class WaterPlant:
@@ -145,6 +184,13 @@ class WaterPlant:
             heater = payload.get("heater")
             if isinstance(heater, bool):
                 self.heater_state = "on" if heater else "off"
+        # 通道标定：现场换传感器后按 scale/offset 换算为工程值（未标定的通道保持原值）
+        self.flow_rate = calibration.apply("flow_rate", self.flow_rate)
+        self.total_liters = calibration.apply("total_liters", self.total_liters)
+        self.storage_temp = calibration.apply("storage_temp", self.storage_temp)
+        self.heater_temp = calibration.apply("heater_temp", self.heater_temp)
+        self.pressure = calibration.apply("pressure", self.pressure)
+        self.light = calibration.apply("light", self.light)
         # 流量读取成功即视为在线
         self.sensor_online = True
         self.last_error = ""
